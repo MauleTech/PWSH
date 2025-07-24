@@ -5,7 +5,7 @@ Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
 $SiteConfigs = @()
 $SiteConfigs = (Invoke-WebRequest -uri "http://download.ambitionsgroup.com/Sites/ITS247Agent/SiteAgentConfigs.csv" -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
 
-$DetectedIP = (Invoke-WebRequest -uri "http://ip.ambitionsgroup.com/" -UseBasicParsing).Content
+$DetectedIP = (Invoke-WebRequest -uri "https://icanhazip.com" -UseBasicParsing).Content
 $searchterm = '*' + $DetectedIP + '*'
 $DetectedSite = $SiteConfigs.Where({ $PSItem.ExtIPs -like $searchterm })
 If ($DetectedSite.Choco) {
@@ -64,10 +64,10 @@ If (Get-Command choco.exe -ErrorAction SilentlyContinue) {
 		if (-not (Get-PSRepository -Name ACGProGet -ErrorAction SilentlyContinue)) {
 			Register-PSRepository -Name ACGProGet -SourceLocation https://choco.ambitionsgroup.com/nuget/chocolatey-group/ -PublishLocation https://choco.ambitionsgroup.com/nuget/chocolatey-group/ -PackageManagementProvider nuget -InstallationPolicy Trusted
 		}
-		Save-Package chocolatey -Source ACGProGet -Path "$Env:SystemDrive\Ambitions\Chocolatey" -Force
-		& (Get-ChildItem -Path "$Env:SystemDrive\Ambitions\Chocolatey" -Recurse -Force | Where-Object { $_.Name -match "chocolateyinstall.ps1" }).PSPath
+		Save-Package chocolatey -Source ACGProGet -Path "$ITFolder\Chocolatey" -Force
+		& (Get-ChildItem -Path "$ITFolder\Chocolatey" -Recurse -Force | Where-Object { $_.Name -match "chocolateyinstall.ps1" }).PSPath
 		Get-PSRepository -Name ACGProGet | Unregister-PSRepository
-		Remove-Item -path "$Env:SystemDrive\Ambitions\Chocolatey" -Recurse -Force
+		Remove-Item -path "$ITFolder\Chocolatey" -Recurse -Force
 		Get-Command choco.exe -ErrorAction Stop
 	}
 	finally {

@@ -713,7 +713,7 @@ Write-Host "Checking for NDDC Utility"
 
 Write-Host "Downloading the NDDC Utility"
 	$NddcURL = "https://s3.amazonaws.com/networkdetective/download/NetworkDetectiveDataCollector.exe"
-	$NddcFolder = $ENV:SystemDrive + '\Ambitions\NddcAuto'
+	$NddcFolder = $ITFolder + '\NddcAuto'
 	$null = (New-Item -ItemType Directory -Force -Path $NddcFolder)
 	$NddcDownloadPath = $NddcFolder + '\NetworkDetectiveDataCollector.zip'
 	$Nddcexe = $NddcFolder + '\nddc.exe'
@@ -754,11 +754,11 @@ Write-Host "Running NDDC"
 	$ExportedFile = $($outputfolder + "\" + $nddcountbase + ".ndf")
 
 # Check for credentials
-	$SshKeyPath = $ENV:SystemDrive + '\Ambitions\.ssh\nddc.id_rsa'
+	$SshKeyPath = $ITFolder + '\.ssh\nddc.id_rsa'
 	If (-not (Test-Path $SshKeyPath)) {
-		Write-Error "ERROR: .SSH Key not found at \Ambitions\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
+		Write-Error "ERROR: .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
 		Write-Host "Send to Teams"
-		$Message = "ERROR: .SSH Key not found at \Ambitions\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
+		$Message = "ERROR: .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
 		$server = "$env:computername"
 		$color = 'ff0000'
 		Send-To-Teams
@@ -766,23 +766,23 @@ Write-Host "Running NDDC"
 	Write-Host "Logging the attempt"
 		$date = Get-Date
 		$date = $date.ToShortDateString()
-		Add-Content "$ITFolder\NDDC Auto Scan Log.txt" "$date | .SSH Key not found at \Ambitions\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
+		Add-Content "$ITFolder\NDDC Auto Scan Log.txt" "$date | .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
 	} Else {
 	
 	# Set local file path, SFTP path, and the backup location path which I assume is an SMB path
 		$UploadID = $($PCInfo.CsDomain) + "_" + $($PCInfo.CsName)
-		$SftpPath = "/home/dh_wu6qvp/nddc.ambitionsgroup.com/Uploads/" + $UploadID
-		$SftpLink = "sftp://ftp.nddc.ambitionsgroup.com/Uploads/" + $UploadID
+		$SftpPath = "/home/dh_wu6qvp/<nddc.upload.server>/Uploads/" + $UploadID
+		$SftpLink = "sftp://ftp.<nddc.upload.server>/Uploads/" + $UploadID
 
 	# Set the IP of the SFTP server
-		$SftpIp = 'ftp.nddc.ambitionsgroup.com'
+		$SftpIp = 'ftp.<nddc.upload.server>'
 		# Set the credentials
 		$User = 'dh_wu6qvp'
 		$Password = New-Object System.Security.SecureString
 		$Credential = New-Object System.Management.Automation.PSCredential ('dh_wu6qvp', $Password)
 
 	Write-Host "Establishing the SFTP connection"
-		Get-SSHTrustedHost -HostName "ftp.nddc.ambitionsgroup.com" | Remove-SSHTrustedHost #Clears previously stored keys. They change over time with Dreamhost.
+		Get-SSHTrustedHost -HostName "ftp.<nddc.upload.server>" | Remove-SSHTrustedHost #Clears previously stored keys. They change over time with Dreamhost.
 		$ThisSession = New-SFTPSession -KeyFile $SshKeyPath -ComputerName $SftpIp -Credential $Credential -AcceptKey
 
 	Write-Host "Uploading the file to the SFTP path"

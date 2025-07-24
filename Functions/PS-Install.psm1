@@ -44,7 +44,7 @@ Function Install-Action1 {
 		$MSIUrl = 'https://app.action1.com/agent/'
 		$GUID = ($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID
 		$InstallURL = $MSIUrl + $GUID + "/Windows/Action1agent($Code).msi"
-		$Action1Installer = Get-FileDownload -URL $InstallURL -SaveToFolder $Env:SystemDrive\Ambitions\Action1Patches
+		$Action1Installer = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\Action1Patches
 		$msiPath = $Action1Installer[1]
 		$arguments = "/i `"$msiPath`" /quiet /norestart"
 		$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
@@ -290,7 +290,7 @@ Function Install-UmbrellaDns {
         param($SiteCode, $Code, $Silent)
         
         try {
-            # Download and execute Ambitions script
+            # Download and import IT scripts
             irm ps.acgs.io | iex
             
             # Run appropriate installation command
@@ -355,8 +355,8 @@ Function Install-UmbrellaDNSasJob {
 	.Description
 		Determines the site code from IP or manually, then downloads and installs the appropriate config file for the site.
 	.Exampleget-
-		Install-UmbrellaDNS -Code ACG
-		Installs the agent for the site Ambitions Consulting Group. Will prompt for silent install confirmation.
+		Install-UmbrellaDNS -Code XMPL
+		Installs the agent for the site Example Org. Will prompt for silent install confirmation.
 	.Notes
 		For a list of site codes, go to:
 		https://github.com/MauleTech/PWSH/blob/49d3876af3f2548ca106fb731cb0bf4def21a007/Scripts/Umbrella/UDNS-Client-Mapping.csv
@@ -386,7 +386,7 @@ Function Install-UmbrellaDNSasJob {
 	If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
 		Write-Host "Downloading the Umbrella Root Cert"
 		$url = 'https://download.ambitionsgroup.com/Software/Cisco_Umbrella_Root_CA.cer'
-		$certFolder = $ENV:SystemDrive + '\Ambitions\UmbrellaClient\'
+		$certFolder = $ITFolder + '\UmbrellaClient\'
 		$certFilePath = $certFolder + 'Cisco_Umbrella_Root_CA.cer'
 		Remove-Item $certFilePath -ea SilentlyContinue
 		$null = (New-Item -ItemType Directory -Force -Path $certFolder)
@@ -468,8 +468,8 @@ Function Install-UmbrellaDNSasJob {
 				
 				# Download the VPN installer and configuration files to the Ambitions folder on the system drive
 				# Get-FileDownload is a custom function that downloads files and returns an array with status and file path
-				$CityVpnExeDownload = Get-FileDownload -URL $CityVpnExeURL -SaveToFolder $Env:SystemDrive\Ambitions\
-				$CityVpnConfigDownload = Get-FileDownload -URL $CityVpnConfigURL -SaveToFolder $Env:SystemDrive\Ambitions\
+				$CityVpnExeDownload = Get-FileDownload -URL $CityVpnExeURL -SaveToFolder $ITFolder\
+				$CityVpnConfigDownload = Get-FileDownload -URL $CityVpnConfigURL -SaveToFolder $ITFolder\
 				
 				# Remove any existing Umbrella DNS installation that might conflict with the VPN client
 				Uninstall-UmbrellaDNS
@@ -487,7 +487,7 @@ Function Install-UmbrellaDNSasJob {
 				& $ConfigSFX -y -o'C:\ProgramData\Cisco\Cisco Secure Client'
 			} Else {$SelectedSite.Site}
 			Write-Host Downloading the agent for $SelectedSite.Site
-			$msiFolder = $ENV:SystemDrive + '\Ambitions\UmbrellaClient\'
+			$msiFolder = $ITFolder + '\UmbrellaClient\'
 			#$Command = "msiexec /i " + $msiFilePath + " /qn " + $SelectedSite.Command
 
 			$null = (New-Item -ItemType Directory -Force -Path $msiFolder)
@@ -604,7 +604,7 @@ Function Install-UmbrellaDNSasJob {
 			}
 		} Else {
 			Write-Host "Attempting to determine location"
-			$DetectedIP = (Invoke-WebRequest -uri "http://ip.ambitionsgroup.com/" -UseBasicParsing).Content
+			$DetectedIP = (Invoke-WebRequest -uri "http://ip.acgs.io" -UseBasicParsing).Content
 			$searchterm = '*' + $DetectedIP + '*'
 			$DetectedSite = $SiteConfigs.Where( { $PSItem.ExtIPs -like $searchterm })
 			If ($DetectedSite) {
@@ -650,7 +650,7 @@ Function Install-UmbrellaDnsCert {
 	If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
 		Write-Host "Downloading the Umbrella Root Cert"
 		$url = 'https://download.ambitionsgroup.com/Software/Cisco_Umbrella_Root_CA.cer'
-		$certFolder = $ENV:SystemDrive + '\Ambitions\UmbrellaClient\'
+		$certFolder = $ITFolder + '\UmbrellaClient\'
 		$certFilePath = $certFolder + 'Cisco_Umbrella_Root_CA.cer'
 		Remove-Item $certFilePath -ea SilentlyContinue
 		$null = (New-Item -ItemType Directory -Force -Path $certFolder)
@@ -807,7 +807,7 @@ Function Install-WinGetApps {
 Function Install-WinRepairToolbox {
 	Write-Host "Downloading Windows Repair Toolbox"
 		$URL = 'https://windows-repair-toolbox.com/files/Windows_Repair_Toolbox.zip'
-		$DLFolder = $ENV:SystemDrive + '\Ambitions\Windows_Repair_Toolbox'
+		$DLFolder = $ITFolder + '\Windows_Repair_Toolbox'
 		$DLFilePath = $DLFolder + '\Windows_Repair_Toolbox.zip'
 		$null = (New-Item -ItemType Directory -Force -Path $DLFolder)
 		(New-Object System.Net.WebClient).DownloadFile($url, $DLFilePath)

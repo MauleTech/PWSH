@@ -32,7 +32,7 @@ $RootCertPath = "Cert:\LocalMachine\Root\C5091132E9ADF8AD3E33932AE60A5C8FA939E82
 If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
 	Write-Host "Downloading the Umbrella Root Cert"
 	$url = 'https://download.ambitionsgroup.com/Software/Cisco_Umbrella_Root_CA.cer'
-	$certFolder = $ENV:SystemDrive + '\Ambitions\UmbrellaClient\'
+	$certFolder = $ITFolder + '\UmbrellaClient\'
 	$certFilePath = $certFolder + 'Cisco_Umbrella_Root_CA.cer'
 	Remove-Item $certFilePath -ea SilentlyContinue
 	$null = (New-Item -ItemType Directory -Force -Path $certFolder)
@@ -66,7 +66,7 @@ If ($NewIsInstalled) {
 		Write-Host
 		Write-Host ================ Umbrella DNS Agent Installation ================
 		Write-Host Downloading the agent for $SelectedSite.Site
-		$msiFolder = $ENV:SystemDrive + '\Ambitions\UmbrellaClient\'
+		$msiFolder = $ITFolder + '\UmbrellaClient\'
 		#$Command = "msiexec /i " + $msiFilePath + " /qn " + $SelectedSite.Command
 
 		$null = (New-Item -ItemType Directory -Force -Path $msiFolder)
@@ -184,7 +184,7 @@ If ($NewIsInstalled) {
 		}
 	} Else {
 		Write-Host "Attempting to determine location"
-		$DetectedIP = (Invoke-WebRequest -uri "http://ip.ambitionsgroup.com/" -UseBasicParsing).Content
+		$DetectedIP = (Invoke-WebRequest -uri "https://icanhazip.com" -UseBasicParsing).Content
 		$searchterm = '*' + $DetectedIP + '*'
 		$DetectedSite = $SiteConfigs.Where( { $PSItem.ExtIPs -like $searchterm })
 		If ($DetectedSite) {

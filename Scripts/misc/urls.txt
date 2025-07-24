@@ -1,0 +1,2 @@
+To create a shortened URL:
+  curl -i https://git.io -F "url=https://github.com/..." -F "code=abc123"

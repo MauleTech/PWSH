@@ -1,0 +1,664 @@
+Function Convert-ComputerFleetReport {
+<#
+.SYNOPSIS
+    Creates a formatted Excel report from a system information CSV file with hardware and warranty details.
+
+.DESCRIPTION
+    This function processes a CSV file containing system inventory information, performs data cleanup,
+    checks for Dell/Alienware warranty information, and creates a formatted Excel report.
+    
+    The function performs the following operations:
+    - Removes unnecessary columns
+    - Moves the serial number column to the far right
+    - Removes duplicate entries based on device name
+    - For Dell/Alienware systems, retrieves warranty information
+    - Formats the data in Excel with conditional formatting based on warranty status
+    - Renames columns and cleans up text for better readability
+
+.PARAMETER InputFile
+    Path to the input CSV file containing system information data.
+
+.PARAMETER OutputFile
+    Path where the output Excel file will be saved. If not specified, the output will use the
+    same filename as the input but with a .xlsx extension.
+
+.EXAMPLE
+    Convert-ComputerFleetReport -InputFile "C:\Data\SystemInfo.csv"
+    
+    Processes the SystemInfo.csv file and creates SystemInfo.xlsx in the same folder with
+    formatted warranty information.
+
+.EXAMPLE
+    Convert-ComputerFleetReport -InputFile "C:\Data\SystemInfo.csv" -OutputFile "C:\Reports\FleetReport.xlsx"
+    
+    Processes the SystemInfo.csv file and saves the formatted report to the specified output path.
+
+.NOTES
+    Requires:
+    - The ImportExcel PowerShell module (will attempt to install if not present)
+    - The Get-DellWarranty function to be available in the environment
+    
+    Output formatting:
+    - Expired warranties: Red background
+    - Warranties expiring within a year: Yellow background
+    - Valid warranties with more than a year remaining: Green background
+    - Systems with no warranty information: Blue background
+    
+    Author: Ryan C Shoemaker
+    Last Updated: February 2025
+#>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$InputFile,
+        
+        [Parameter(Mandatory = $false, Position = 1)]
+        [string]$OutputFile = [System.IO.Path]::ChangeExtension($InputFile, ".xlsx")
+    )
+
+    # Columns to remove
+    $columnsToRemove = @(
+        "Device Type",
+        "Company Name",
+        "Company Friendly Name",
+        "Site Name",
+        "Site Friendly Name",
+        "OS Architecture",
+        "OS Language",
+        "IP Address",
+        "External IP Address",
+        "System Domain Role",
+        "Installed Date",
+        "Processor Type",
+        "Number Of Processors",
+        "Disk Manufacturer/Model",
+        "Disk Interface Type",
+        "Partitions",
+        "BIOS Version",
+        "BIOS Manufacturer",
+        "BIOS Serial No",
+        "Bios Product",
+        "Device Time Zone"
+    )
+
+    # Import the CSV
+    $data = Import-Csv -Path $InputFile
+
+    # Identify all column names in the CSV
+    $allColumns = $data[0].PSObject.Properties.Name
+
+    # Create a list of columns to keep (excluding both the ones to remove and Device Serial Number)
+    $columnsToKeep = $allColumns | Where-Object {
+        ($_ -notin $columnsToRemove) -and ($_ -ne "Device Serial Number")
+    }
+
+    # Add Device Serial Number as the last column
+    $newColumnOrder = $columnsToKeep + @("Device Serial Number")
+
+    # Process data to handle duplicates by "Name" property
+    $groupedData = $data | Group-Object -Property "Name"
+    $uniqueData = @()
+
+    foreach ($group in $groupedData) {
+        if ($group.Count -eq 1) {
+            # No duplicates, add the single entry
+            $uniqueData += $group.Group
+        } else {
+            # First, remove entries with "Disk Volume (GB)" of 0
+            $filteredEntries = $group.Group | Where-Object {
+                try {
+                    [double]$_."Disk Volume (GB)" -ne 0
+                } catch {
+                    $true # Keep entries where we can't convert to number
+                }
+            }
+            
+            # If all entries had 0 disk volume or we filtered everything out, keep original entries
+            if ($filteredEntries.Count -eq 0) {
+                $filteredEntries = $group.Group
+            }
+            
+            # If we still have duplicates, keep the one with the smallest disk volume
+            if ($filteredEntries.Count -gt 1) {
+                # Sort by disk volume (converted to number) and take the first (smallest)
+                $filteredEntries = $filteredEntries | Sort-Object -Property @{
+                    Expression = {
+                        try { [double]$_."Disk Volume (GB)" }
+                        catch { [double]::MaxValue } # If conversion fails, treat as maximum value
+                    }
+                } | Select-Object -First 1
+            }
+            
+            $uniqueData += $filteredEntries
+        }
+    }
+
+    # Add the new warranty columns to each entry
+    $uniqueData = $uniqueData | ForEach-Object {
+        $_ | Add-Member -NotePropertyName "OriginalShipDate" -NotePropertyValue "" -PassThru |
+              Add-Member -NotePropertyName "WarrantyStartDate" -NotePropertyValue "" -PassThru |
+              Add-Member -NotePropertyName "WarrantyEndDate" -NotePropertyValue "" -PassThru |
+              Add-Member -NotePropertyName "WarrantyExpired" -NotePropertyValue "" -PassThru |
+              Add-Member -NotePropertyName "WarrantySupportLevel" -NotePropertyValue ""
+        $_
+    }
+
+    # Get warranty information for Dell and Alienware systems
+    Write-Host "Getting warranty information for Dell and Alienware systems..."
+    $dellSystems = $uniqueData | Where-Object {
+        $_."Base Board Manufacturer" -match "Dell|Alienware" -and
+        -not [string]::IsNullOrWhiteSpace($_."Device Serial Number")
+    }
+
+    if ($dellSystems.Count -gt 0) {
+        Write-Host "Found $($dellSystems.Count) Dell/Alienware systems. Retrieving warranty information..."
+        foreach ($system in $dellSystems) {
+            try {
+                Write-Host "Processing warranty for system: $($system.Name) with Serial: $($system."Device Serial Number")"
+                $warrantyInfo = Get-DellWarranty -ServiceTags $system."Device Serial Number" -ReturnObject
+                
+                if ($warrantyInfo) {
+                    # Update the warranty fields in the original data
+                    $systemInData = $uniqueData | Where-Object { $_.Name -eq $system.Name }
+                    if ($systemInData) {
+                        $systemInData.OriginalShipDate = $warrantyInfo.OriginalShipDate
+                        $systemInData.WarrantyStartDate = $warrantyInfo.WarrantyStartDate
+                        $systemInData.WarrantyEndDate = $warrantyInfo.WarrantyEndDate
+                        $systemInData.WarrantyExpired = $warrantyInfo.WarrantyExpired
+                        $systemInData.WarrantySupportLevel = $warrantyInfo.WarrantySupportLevel
+                        
+                        Write-Host "Updated warranty information for $($system.Name)"
+                    }
+                } else {
+                    Write-Host "No warranty information found for $($system.Name)" -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "Error retrieving warranty information for $($system.Name): $_" -ForegroundColor Red
+            }
+        }
+    } else {
+        Write-Host "No Dell or Alienware systems found in the data."
+    }
+
+    # Remove OriginalShipDate and WarrantySupportLevel from the column order
+    $newColumnOrder = $newColumnOrder | Where-Object { $_ -ne "OriginalShipDate" -and $_ -ne "WarrantySupportLevel" }
+    
+    # Select the data with the new column order including only the warranty columns we want to keep
+    $newColumnOrder += @("WarrantyStartDate", "WarrantyEndDate", "WarrantyExpired")
+
+    # Create the final dataset with the specified column order
+    $newData = $uniqueData | Select-Object -Property $newColumnOrder
+
+    # Clean up data
+    foreach ($item in $newData) {
+        # Clean up processor description
+        if ($item.Processor) {
+            # Remove (R) and Core(TM)
+            $item.Processor = $item.Processor -replace '\(R\)', '' -replace ' Core\(TM\)', ''
+            
+            # Keep only the string before "CPU" if it exists, otherwise before "@"
+            if ($item.Processor -match "(.+?)\s+CPU") {
+                $item.Processor = $matches[1].Trim()
+            } elseif ($item.Processor -match "(.+?)\s+@") {
+                $item.Processor = $matches[1].Trim()
+            }
+        }
+        
+        # Clean up OS name
+        if ($item.OS) {
+            $item.OS = $item.OS -replace 'Microsoft ', ''
+        }
+        
+        # Clean up manufacturer name
+        if ($item."Base Board Manufacturer") {
+            $item."Base Board Manufacturer" = $item."Base Board Manufacturer" -replace ' Corporation', ''
+        }
+        
+        # Format date fields
+        if ($item."Last Check Date") {
+            try {
+                # Get only the date part (before first space)
+                $datePart = $item."Last Check Date".Split(' ')[0]
+                # Parse and reformat as m/d/yyyy
+                $parsedDate = [DateTime]::Parse($datePart)
+                $item."Last Check Date" = $parsedDate.ToString('M/d/yyyy')
+            } catch {
+                # Keep original if parsing fails
+            }
+        }
+        
+        if ($item."WarrantyStartDate") {
+            try {
+                # If there's a space in the date string, get only the part before the space
+                if ($item."WarrantyStartDate" -match " ") {
+                    $datePart = $item."WarrantyStartDate".Split(' ')[0]
+                } else {
+                    $datePart = $item."WarrantyStartDate"
+                }
+                # Parse and reformat as m/d/yyyy
+                $parsedDate = [DateTime]::Parse($datePart)
+                $item."WarrantyStartDate" = $parsedDate.ToString('M/d/yyyy')
+            } catch {
+                # Keep original if parsing fails
+            }
+        }
+        
+        if ($item."WarrantyEndDate") {
+            try {
+                # If there's a space in the date string, get only the part before the space
+                if ($item."WarrantyEndDate" -match " ") {
+                    $datePart = $item."WarrantyEndDate".Split(' ')[0]
+                } else {
+                    $datePart = $item."WarrantyEndDate"
+                }
+                # Parse and reformat as m/d/yyyy
+                $parsedDate = [DateTime]::Parse($datePart)
+                $item."WarrantyEndDate" = $parsedDate.ToString('M/d/yyyy')
+            } catch {
+                # Keep original if parsing fails
+            }
+        }
+    }
+
+    # Rename columns
+    $columnMappings = @{
+        'Number of Cores' = 'Cores'
+        'Disk Volume (GB)' = 'Disk Size'
+        'Device Serial Number' = 'Serial #'
+        'Base Board Manufacturer' = 'Manufacturer'
+        'WarrantyStartDate' = 'Warranty Start'
+        'WarrantyEndDate' = 'Warranty End'
+        'WarrantyExpired' = 'Status'
+        'Last Check Date' = 'Last Check'
+    }
+
+    # Clean up and adjust column names in the column order list
+    $adjustedColumnOrder = $newColumnOrder | ForEach-Object {
+        if ($columnMappings.ContainsKey($_)) {
+            $columnMappings[$_]
+        } else {
+            $_
+        }
+    }
+
+    # Create a collection with renamed properties
+    $renamedData = $newData | ForEach-Object {
+        $obj = New-Object PSObject
+        foreach ($prop in $_.PSObject.Properties) {
+            $newName = if ($columnMappings.ContainsKey($prop.Name)) { $columnMappings[$prop.Name] } else { $prop.Name }
+            $obj | Add-Member -MemberType NoteProperty -Name $newName -Value $prop.Value
+        }
+        $obj
+    }
+
+    # Export to Excel with formatting
+    Write-Host "Creating Excel file with formatting..."
+
+    # Check if Excel module is available, if not, attempt to install it
+    if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+        Write-Host "ImportExcel module not found. Attempting to install..."
+        try {
+            Install-Module -Name ImportExcel -Force -Scope CurrentUser
+            Import-Module ImportExcel
+            Write-Host "ImportExcel module installed successfully."
+        } catch {
+            Write-Host "Unable to install ImportExcel module. Exiting." -ForegroundColor Red
+            exit
+        }
+    }
+
+    # Calculate the date one year from now for warranty comparisons
+    $oneYearFromNow = (Get-Date).AddYears(1)
+
+    # Export data to Excel with conditional formatting
+    $excelParams = @{
+        Path = $OutputFile
+        TableName = "SystemInformation"
+        TableStyle = "Medium15"
+        AutoSize = $true
+        FreezeTopRow = $true
+        WorksheetName = "System Information"
+    }
+
+    $renamedData | Export-Excel @excelParams -PassThru | ForEach-Object {
+        # Get the worksheet
+        $workSheet = $_.Workbook.Worksheets["System Information"]
+        
+        # Get the row count (excluding header)
+        $rowCount = $workSheet.Dimension.Rows
+        
+        # Find column indexes
+        $statusCol = $null
+        $warrantyEndCol = $null
+        $serialNumberCol = $null
+        $warrantyStartCol = $null
+        $lastCheckCol = $null
+        
+        for ($col = 1; $col -le $workSheet.Dimension.Columns; $col++) {
+            $headerValue = $workSheet.Cells[1, $col].Value
+            
+            if ($headerValue -eq "Status") {
+                $statusCol = $col
+            }
+            elseif ($headerValue -eq "Warranty End") {
+                $warrantyEndCol = $col
+            }
+            elseif ($headerValue -eq "Serial #") {
+                $serialNumberCol = $col
+            }
+            elseif ($headerValue -eq "Warranty Start") {
+                $warrantyStartCol = $col
+            }
+            elseif ($headerValue -eq "Last Check") {
+                $lastCheckCol = $col
+            }
+        }
+        
+        # Format the Serial Number column as text to preserve leading zeros
+        if ($serialNumberCol) {
+            for ($row = 2; $row -le $rowCount; $row++) {
+                $workSheet.Cells[$row, $serialNumberCol].Style.Numberformat.Format = "@"
+            }
+        }
+        
+        # Format date columns with short date format
+        foreach ($dateCol in @($warrantyStartCol, $warrantyEndCol, $lastCheckCol)) {
+            if ($dateCol) {
+                for ($row = 2; $row -le $rowCount; $row++) {
+                    $workSheet.Cells[$row, $dateCol].Style.Numberformat.Format = "m/d/yyyy"
+                }
+            }
+        }
+        
+        # Apply conditional formatting based on warranty status
+        if ($statusCol -and $warrantyEndCol) {
+            for ($row = 2; $row -le $rowCount; $row++) {
+                $statusValue = $workSheet.Cells[$row, $statusCol].Value
+                $endDateValue = $workSheet.Cells[$row, $warrantyEndCol].Value
+                
+                # Convert end date from string if needed
+                if ($endDateValue -and $endDateValue -is [string]) {
+                    try {
+                        $endDateValue = [DateTime]::Parse($endDateValue)
+                    } catch {
+                        $endDateValue = $null
+                    }
+                }
+                
+                # Apply styles based on conditions
+                $entireRow = $workSheet.Cells[$row, 1, $row, $workSheet.Dimension.Columns]
+                
+                if ([string]::IsNullOrWhiteSpace($statusValue)) {
+                    # Empty warranty - Note style (light blue)
+                    $entireRow.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                    $entireRow.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(218, 238, 243))
+                } elseif ($statusValue -eq "Expired") {
+                    # Expired warranty - Bad style (light red)
+                    $entireRow.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                    $entireRow.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(255, 199, 206))
+                } elseif ($statusValue -eq "Not Expired" -and $endDateValue) {
+                    if ($endDateValue -le $oneYearFromNow) {
+                        # Less than a year left - Neutral style (light yellow)
+                        $entireRow.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                        $entireRow.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(255, 235, 156))
+                    } else {
+                        # More than a year left - Good style (light green)
+                        $entireRow.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                        $entireRow.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(198, 239, 206))
+                    }
+                }
+            }
+        }
+        
+        # Save the workbook
+        $_.Save()
+        $_.Dispose()
+    }
+
+    Write-Host "Excel file has been created and saved to: $OutputFile"
+    Write-Host "Original row count: $($data.Count)"
+    Write-Host "Final row count after removing duplicates: $($newData.Count)"
+}
+
+Function Convert-ToSharedMailbox {
+	param
+	(
+		[Parameter(Mandatory = $false)]
+		[string]$DateLeft,
+
+		[Parameter(Mandatory = $false)]
+		[string]$Alias,
+
+		[Parameter(Mandatory = $false)]
+		[string]$GiveAccessTo,
+
+		[Parameter(Mandatory = $false)]
+		[ValidateSet('FullAccess', 'ReadPermission')]
+		[string]$GiveAccessPermission,
+
+		[Parameter(Mandatory = $false)]
+		[string]$DirectEmailTo,
+
+		[Parameter(Mandatory = $false)]
+		[switch]$NoAccess = $False,
+
+		[Parameter(Mandatory = $false)]
+		[switch]$NoReply = $False
+	)
+
+	If (-not $DateLeft) { $DateLeft = Read-Host "Please enter the date this person left in DDMMMYYY format, i.e. 01JAN2001" }
+	If (-not $Alias) { $Alias = Read-Host "Please enter the persons alias, the part of their email before the @ sign." }
+	$DeletedMailbox = Get-EXOMailbox -SoftDeletedMailbox -Identity $Alias -ErrorAction SilentlyContinue
+	If (-not $DeletedMailbox) {
+		Do {
+			#Active User Check
+			If ($(Get-EXOMailbox -Identity $Alias -ErrorAction SilentlyContinue)) {
+				Write-Host "That mailbox appears to be for an active user."
+				$Response = Read-Host -Prompt "Do you want to forcefully delete the user and proceed? (y/N)"
+				If (-not $Response) { $Response = "else" }
+				If ($Response -like "y*") {
+					Write-Host "Forcefully deleting the mailbox for $($DeletedMailbox.DisplayName)."
+					Write-Host "Please ensure sync is disabled for the user."
+					Remove-Mailbox -Identity $Alias
+				}
+				Else { Break }
+			}
+			#Retry the alias
+			$Alias = Read-Host "That alias didn't work. Enter another one or type QUIT to stop:`n"
+			If ($Alias -match "QUIT") { Break }
+			$DeletedMailbox = Get-EXOMailbox -SoftDeletedMailbox -Identity $Alias -ErrorAction SilentlyContinue
+		} While (-not $DeletedMailbox)
+	}
+
+	If ($DeletedMailbox) {
+		$Name = $DeletedMailbox.DisplayName
+		$DeletedMailboxSize = ($DeletedMailbox | Get-MailboxStatistics -IncludeSoftDeletedRecipients).TotalItemSize.Value
+		Write-Host "Deleted mailbox for $Name found. It is $DeletedMailboxSize"
+		If ([int64]($DeletedMailboxSize -replace '.+\(|bytes\)') -gt "50GB") {
+			Write-Warning -Message "$Name has a mailbox larger then 50GB, the restored shared mailbox needs to be assigned an Office 365 Enterprise E3 or E5 license."
+			Write-Host -NoNewLine 'Press any key to acknowledge and continue...';
+			$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown');
+		}
+		$SmtpAddress = $DeletedMailbox.PrimarySmtpAddress
+		Write-Host "Creating Shared Mailbox."
+		New-Mailbox -Name "SHARED $Name LEFT $DateLeft" -Alias $Alias -PrimarySmtpAddress $SmtpAddress -Shared
+		Write-Host "Waiting 30 seconds for mailbox to fully initialize."
+		Start-Sleep -Seconds 30
+		$NewSharedMailbox = Get-EXOMailbox -Identity $Alias
+		$NewSharedMailbox | Select-Object DisplayName, RecipientTypeDetails
+		Write-Host "Hiding the mailbox from address lists."
+		$NewSharedMailbox | Set-Mailbox -HiddenFromAddressListsEnabled:$true -MaxSendSize 150MB -MaxReceiveSize 150MB
+		
+		Write-Host "Restoring deleted mailbox to new shared mailbox."
+		$RestoreName = $Alias + "_" + $(Get-Date -uFormat %T_%d%b%Y)
+		New-MailboxRestoreRequest -Name $RestoreName -SourceMailbox $DeletedMailbox.GUID.GUID -TargetMailbox $NewSharedMailbox.GUID.GUID -AllowLegacyDNMismatch -ConflictResolutionOption ForceCopy -AssociatedMessagesCopyOption DoNotCopy
+		Write-Host "Retrieving Restore Status"
+		Get-SharedMailboxRestoreRequest
+		Write-Host -ForegroundColor Yellow -BackgroundColor Black "Run Get-SharedMailboxRestoreRequest to see the progress of the restore."
+
+		#Mailbox Permissions
+		If (-not $NoAccess) {
+			Do {
+				If ($GiveAccessPermission) {
+					$Permission = $GiveAccessPermission
+				}
+				Else {
+					$Response = Read-Host -Prompt "Do you want to add any permissions to the shared mailbox? (Y/n)"
+					If (-not $Response) { $Response = "y" }
+					If ($Response -like "y*") {
+						$Rights = "FullAccess", "ReadPermission", "QUIT"
+						$Rights | Select-Object @{N = 'Index'; E = { $Rights.IndexOf($_) } }, @{N = 'Permission'; E = { $_ } } | Out-Host -Paging -ErrorAction SilentlyContinue
+						$Permission = Read-Host "Please enter the number of the permission you wish to assign."
+						$Permission = $Rights[$Permission]
+					}
+				}
+				If ($Permission -ne "QUIT" -and $Response -notlike "n*") {
+					If ($GiveAccessTo) {
+						$AddUser = $GiveAccessTo
+					}
+					Else {
+						$AddUser = Read-Host "Alias of the user to grant access"
+					}
+					If (-not $(Get-EXOMailbox -Identity $AddUser)) {
+						Do {
+							$AddUser = Read-Host "That alias didn't work. Enter another one or type QUIT to stop:`n"
+							If ($AddUser -match "QUIT") { Break }
+						} While (-not $(Get-EXOMailbox -Identity $AddUser))
+					}
+					Write-Host "Giving $AddUser $Permission to the mailbox."
+					$NewSharedMailbox | Add-MailboxPermission -User $AddUser -AccessRights $Permission -InheritanceType All -Verbose
+					$NewSharedMailbox | Get-MailboxPermission | Format-Table
+					If ($GiveAccessPermission) { $Response = "no" }
+				}
+				Else { Break }
+			} While ($Response -notlike "n*")
+		}
+
+		#AutoReply
+		If (-not $NoReply) {
+			If ($DirectEmailTo) {
+				$ReplyTo = $DirectEmailTo
+			}
+			Else {
+				$Response = Read-Host -Prompt "Do you want to an auto reply? (Y/n)"
+				If (-not $Response) { $Response = "y" }
+				If ($Response -like "y*") {
+					$ReplyTo = Read-Host "Alias of the user to direct emails to"
+					If (-not $(Get-EXOMailbox -Identity $ReplyTo)) {
+						Do {
+							$ReplyTo = Read-Host "That alias didn't work. Enter another one or type QUIT to stop:`n"
+							If ($ReplyTo -match "QUIT") { Break }
+						} While (-not $(Get-EXOMailbox -Identity $ReplyTo))
+					}
+					$ReplyTo = Get-EXOMailbox -Identity $ReplyTo
+					$ReplyToName = $ReplyTo.DisplayName
+					$ReplyToEmail = $ReplyTo.PrimarySmtpAddress
+					$NewSharedMailbox | Set-MailboxAutoReplyConfiguration –InternalMessage "$Name is no longer with the organization. Please direct communications to $ReplyToName at $ReplyToEmail" –ExternalMessage "$Name is no longer with the organization. Please direct communications to $ReplyToName at $ReplyToEmail" -Verbose
+					$NewSharedMailbox | Set-MailboxAutoReplyConfiguration -AutoReplyState enabled
+					$NewSharedMailbox | Get-MailboxAutoReplyConfiguration | Select-Object Identity, AutoReplyState, ExternalMessage | FL
+					Clear-Variable -Name ReplyTo -Force -ErrorAction SilentlyContinue
+					Clear-Variable -Name ReplyToName -Force -ErrorAction SilentlyContinue
+					Clear-Variable -Name ReplyToEmail -Force -ErrorAction SilentlyContinue
+				}
+			}
+		}
+
+		# Forward Email
+		If (-not $NoForward) {
+			If ($DirectEmailTo) {
+				$ForwardTo = $DirectEmailTo
+			}
+			Else {
+				$Response = Read-Host -Prompt "Do you want to forward emails? (Y/n)"
+				If (-not $Response) { $Response = "y" }
+				If ($Response -like "y*") {
+					$ForwardTo = Read-Host "Alias of the user to forward emails to"
+					If (-not $(Get-EXOMailbox -Identity $ForwardTo)) {
+						Do {
+							$ForwardTo = Read-Host "That alias didn't work. Enter another one or type QUIT to stop:`n"
+							If ($ForwardTo -match "QUIT") { Break }
+						} While (-not $(Get-EXOMailbox -Identity $ForwardTo))
+					}
+					$ForwardTo = Get-EXOMailbox -Identity $ForwardTo
+					$ForwardToName = $ForwardTo.DisplayName
+					$ForwardToEmail = $ForwardTo.PrimarySmtpAddress
+					$NewSharedMailbox | Set-Mailbox -DeliverToMailboxAndForward $true -ForwardingSMTPAddress $ForwardToEmail
+					$NewSharedMailbox | Format-List ForwardingSMTPAddress, DeliverToMailboxandForward
+					Clear-Variable -Name ForwardTo -Force -ErrorAction SilentlyContinue
+					Clear-Variable -Name ForwardToName -Force -ErrorAction SilentlyContinue
+					Clear-Variable -Name ForwardToEmail -Force -ErrorAction SilentlyContinue
+				}
+			}
+		}
+	}
+	Clear-Variable -Name NewSharedMailbox -Force -ErrorAction SilentlyContinue
+	$(
+		Write-Host -NoNewLine "Obtaining progress, which can be repeated with the "
+		Write-Host -ForegroundColor Yellow -NoNewLine "Get-SharedMailboxRestoreRequest"
+		Write-Host " command."
+	)
+	Get-SharedMailboxRestoreRequest
+
+	Write-Host -ForegroundColor Yellow "Remember, you can also copy over a user's OneDrive files with 'Export-UsersOneDrive'."
+
+	<#
+	.SYNOPSIS
+		Takes a deleted user, and converts their email to a shared mailbox. Can add permissions and an autoreply.
+	.PARAMETER Alias
+		Please enter the persons alias, the part of their email before the @ sign.
+	.PARAMETER DateLeft
+		Please enter the date this person left in DDMMMYYY format, i.e. 01JAN2001
+	.PARAMETER GiveAccessTo
+		Please enter the alias of the person who needs access to the shared mailbox. Leave blank to be prompted for multiple names.
+	.PARAMETER GiveAccessPermission
+		Please enter the permission level to give. Acceptible values are 'FullAccess' and 'ReadPermission'.
+	.PARAMETER DirectEmailTo
+		Please enter the alias of the person who people should be directed to in the auto reply.
+	.PARAMETER NoAccess
+		Add this switch if you do not want to be prompted for giving access.
+	.PARAMETER NoReply
+		Add this switch if you do not want to be prompted for setting up an autoreply.
+	.EXAMPLE
+		Convert-ToSharedMailbox -DateLeft "30SEP2021" -Alias cscippio
+	.EXAMPLE
+		Convert-ToSharedMailbox -DateLeft DEC2021 -Alias kelli -GiveAccessTo javila -GiveAccessPermission ReadPermission -DirectEmailTo javila
+	.EXAMPLE
+		Convert-ToSharedMailbox -DateLeft DEC2021 -Alias rich -NoAccess -NoReply
+	#>
+}
+
+
+# SIG # Begin signature block
+# MIIF0AYJKoZIhvcNAQcCoIIFwTCCBb0CAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
+# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUrd82rLsJjqlUjlN+uunpJn2E
+# KjSgggNKMIIDRjCCAi6gAwIBAgIQFhG2sMJplopOBSMb0j7zpDANBgkqhkiG9w0B
+# AQsFADA7MQswCQYDVQQGEwJVUzEYMBYGA1UECgwPVGVjaG5vbG9neUdyb3VwMRIw
+# EAYDVQQDDAlBbWJpdGlvbnMwHhcNMjQwNTE3MjEzNjE0WhcNMjUwNTE3MjE0NjE0
+# WjA7MQswCQYDVQQGEwJVUzEYMBYGA1UECgwPVGVjaG5vbG9neUdyb3VwMRIwEAYD
+# VQQDDAlBbWJpdGlvbnMwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCc
+# sesiq3h/qYB2H80J5kTzMdmjIWe/BHmnUDv2JHBGdxp+ZOT+J9RpPtHNQDXB3Lca
+# aL4YjAWC4H+UqJDJJpFj8OXBns9zfpR5coV5+eR6YjRvos9TILNwdErlLrp5CcxN
+# vtNR99GyXGsfzrvxc4uWwRc4/fjCPgYHs1BmFyxzSneTlr4CZ56wPJZ1yGRHKn0y
+# H5O26/af7stiGZ2GLmXF8VMpEqGE/xWs31aM8xzYBN5FAQjAwoJTGZvm13kukR1t
+# 6Uq3huPX5lUpTasPJ3qLXnePKYtIr+390aNzj2+sDt3lcH51vP46nFMQrpzD/Xaz
+# K/7UP+9I4J8goswNTrZRAgMBAAGjRjBEMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUE
+# DDAKBggrBgEFBQcDAzAdBgNVHQ4EFgQUuS0+jvyX95p7+tTFuzZ+ulXo7jQwDQYJ
+# KoZIhvcNAQELBQADggEBAF4DPkvlELNjrIUYtWMsFjn+VU6vXENJ3lktFShfL8IS
+# 1GDlNZFu+vuJJ2nzLuSNERzdfWa6Pd5qIP05eeinJJtN/sqCPVoLjmA1Td4K6Rau
+# Cg8WlxgemTDr3IwqejUlGq8h5AYIw1ike7Q70m9UWyIWT8XNILcXXK0UKUylHRl/
+# f+fPinhW56qDDmL+7ctECrTBtm8d1aZOtLEijEbZTg72N2SwaKF7mUVmycT5MuN7
+# 46w+V1w/i46wPcf0hkTazvISgUevjXj7dM04U+htX+mDwpvjP/QvQjo37ozOYdQR
+# pIjjnNPZIFXprVXI2PRvM/YqP6KTiyKPqOuI+TA9RmkxggHwMIIB7AIBATBPMDsx
+# CzAJBgNVBAYTAlVTMRgwFgYDVQQKDA9UZWNobm9sb2d5R3JvdXAxEjAQBgNVBAMM
+# CUFtYml0aW9ucwIQFhG2sMJplopOBSMb0j7zpDAJBgUrDgMCGgUAoHgwGAYKKwYB
+# BAGCNwIBDDEKMAigAoAAoQKAADAZBgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAc
+# BgorBgEEAYI3AgELMQ4wDAYKKwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUGJpM
+# D0wsP4TyUjO1/PT8izBRYdkwDQYJKoZIhvcNAQEBBQAEggEAbz4F8EoN/xICpwLm
+# BXIRZDkLsbVQnUB1T/gtK4n0Djsec+K/hMq7RZvnYiNaXPzhpQfKrp9tS/RL5YcW
+# AiAjTNeZXTIy4bQ9uUpZHo1MJ6p1tqUcwBof2DeDi/qw9Pyb233hQzRh7JqEuguN
+# 5PLhqLfR/tc8nWREPQRo4mI+3mqIme5rNFo4nJ58KX4jol2CEB8Kkyo8XZoSfceA
+# r15sZNWKv3QOkglQT+UTtZ3HerLzUN9YyxNPM3wUXgMfrxJ05EFb1FQkFBT8qtiQ
+# b4GMaiOSaSCnJbUwCqacgTL4/PZqRN3e9uH+vOFQy1MMQAqSCdcaTv/hr+NJoZpD
+# hr2gsA==
+# SIG # End signature block

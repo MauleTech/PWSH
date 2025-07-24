@@ -132,7 +132,7 @@ Function Enable-O365AuditLog {
 		#Adds OneDrive to File Explorer
 		Reg Add "HKCR\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" /T REG_DWORD /V "System.IsPinnedToNameSpaceTree" /D 1 /F
 		Reg Add "HKCR\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" /T REG_DWORD /V "System.IsPinnedToNameSpaceTree" /D 1 /F
-		Invoke-WebRequest ps.acgs.io -useb | Invoke-Expression
+		irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 		Install-Choco
 		choco upgrade onedrive --exact -y
 	}

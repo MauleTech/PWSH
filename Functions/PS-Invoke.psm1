@@ -700,7 +700,7 @@ Write-Host "Checking for NDDC Utility"
 		Uninstall-Module -Name Posh-SSH -AllVersions -Force -ErrorAction SilentlyContinue
 		If (Get-Module -Name Posh-SSH -ListAvailable) {
 			$ModPath = (Get-Module -Name Posh-SSH -ListAvailable).ModuleBase
-			$ArgumentList = '/C "taskkill /IM powershell.exe /F & rd /s /q "' + $ModPath + '" & start powershell -NoExit -ExecutionPolicy Bypass -Command "irm ps.acgs.io|iex ; Invoke-NDDCScan"'
+			$ArgumentList = '/C "taskkill /IM powershell.exe /F & rd /s /q "' + $ModPath + '" & start powershell -NoExit -ExecutionPolicy Bypass -Command "irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex ; Invoke-NDDCScan"'
 			Remove-PathForcefully -Path $ModPath
 			If (Get-Item -Path $ModPath -ErrorAction SilentlyContinue) {
 				Start-Process "cmd.exe" -ArgumentList $ArgumentList

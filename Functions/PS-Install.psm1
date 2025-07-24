@@ -80,18 +80,18 @@ Function Install-ITS247Agent {
 	If ($SiteCode -and !$IAmJOB) {
 		Start-Job -Name "InstallAgent" -InitializationScript {
 			$progressPreference = 'silentlyContinue'
-			iex(iwr ps.acgs.io -usebasicparsing)
+			irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 		} -ScriptBlock {
 			$global:SiteCode = $using:SiteCode
 			$global:IAmJOB = $True
-			iex(iwr ps.acgs.io -usebasicparsing)
+			irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 			Install-ITS247Agent
 		} | Receive-Job -Wait #-AutoRemoveJob
 	} ElseIf (($SiteCode -and $IAmJOB) -or (!$SiteCode -and !$IAmJOB)) {
 		Write-Host "I'm running as a job!"
 		$progressPreference = 'silentlyContinue'
 		Set-ExecutionPolicy Bypass -Scope Process -Force
-		iex(iwr ps.acgs.io -usebasicparsing)
+		irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 		Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/ITS247Agent/Install_ITS247_Agent_MSI.txt -UseBasicParsing | Invoke-Expression
 	} ElseIf (!$SiteCode -and $IAmJOB) {Write-Warning "You can't run the installer as job without specifying the SiteCode Variable. You can't interact with a job."}
 
@@ -291,7 +291,7 @@ Function Install-UmbrellaDns {
         
         try {
             # Download and import IT scripts
-            irm ps.acgs.io | iex
+            irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
             
             # Run appropriate installation command
             If (Get-Variable -Name Code -ErrorAction SilentlyContinue) {
@@ -604,7 +604,7 @@ Function Install-UmbrellaDNSasJob {
 			}
 		} Else {
 			Write-Host "Attempting to determine location"
-			$DetectedIP = (Invoke-WebRequest -uri "http://ip.acgs.io" -UseBasicParsing).Content
+			$DetectedIP = irm https://icanhazip.com
 			$searchterm = '*' + $DetectedIP + '*'
 			$DetectedSite = $SiteConfigs.Where( { $PSItem.ExtIPs -like $searchterm })
 			If ($DetectedSite) {
@@ -686,7 +686,7 @@ Function Install-WinGet {
 			Write-Host "Installing the latest version of winget from:`n $realDownloadUrl"
 			$DownloadLocation = $($env:temp)
 			Write-Host "Downloading Desktop App Installer"
-			If (-not (Get-Command -Name "Get-FileDownload" -ErrorAction SilentlyContinue)) {iex(iwr ps.acgs.io -UseBasicParsing)}
+			If (-not (Get-Command -Name "Get-FileDownload" -ErrorAction SilentlyContinue)) {irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex}
 			$DownloadFileInfo = Get-FileDownload -URL $realDownloadUrl -SaveToFolder $($env:temp)
 			$DownloadFilePath = $DownloadFileInfo[-1]
 			Add-AppxPackage -Path $DownloadFilePath -ForceApplicationShutdown -InstallAllResources -Verbose

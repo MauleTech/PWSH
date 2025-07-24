@@ -48,7 +48,7 @@ Function Remove-DuplicateFiles {
 		[string]$Path = $PWD.Path,
 		[switch]$Recurse = $False
 	)
-	If (-not(Get-Command "Remove-PathForcefully" -ErrorAction SilentlyContinue)) { Invoke-RestMethod ps.acgs.io | Invoke-Expression }
+	If (-not(Get-Command "Remove-PathForcefully" -ErrorAction SilentlyContinue)) { irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex }
 	Function Remove-DuplicateFilesInt {
 		$DuplicateFiles = @((Get-ChildItem -Path $Path -Force | Get-FileHash -ErrorAction SilentlyContinue | Group-Object -property hash | Where-Object { $_.count -gt 1 } | ForEach-Object { $_.group | Sort-Object { $_.Path.Length } | Select-Object -Skip 1 }).Path)
 		If ($DuplicateFiles) {

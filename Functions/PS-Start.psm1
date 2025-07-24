@@ -60,7 +60,7 @@ Function Start-PSWinGet {
 	)
 	
 	#Baseline install and run
-	$ScriptBlock = 'irm ps.acgs.io | iex ; '
+	$ScriptBlock = 'irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex ; '
 	If ($Command) {	$ScriptBlock = $ScriptBlock + $Command }
 	
 	#Running as Powershell 5, need to switch to core

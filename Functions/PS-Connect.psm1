@@ -162,7 +162,7 @@ Function Connect-O365Exchange {
 					Uninstall-Module -Name ExchangeOnlineManagement -AllVersions -Force -ErrorAction SilentlyContinue
 					If (Get-Module -Name ExchangeOnlineManagement -ListAvailable) {
 						$ModPath = (Get-Module -Name ExchangeOnlineManagement -ListAvailable).ModuleBase
-						$ArgumentList = '/C "taskkill /IM powershell.exe /F & rd /s /q "' + $ModPath + '" & start powershell -NoExit -ExecutionPolicy Bypass -Command "irm ps.acgs.io|iex ; Connect-O365Exchange"'
+						$ArgumentList = '/C "taskkill /IM powershell.exe /F & rd /s /q "' + $ModPath + '" & start powershell -NoExit -ExecutionPolicy Bypass -Command "irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex ; Connect-O365Exchange"'
 						Start-Process "cmd.exe" -ArgumentList $ArgumentList
 					}
 					Install-Module -Name ExchangeOnlineManagement -AllowClobber -Force

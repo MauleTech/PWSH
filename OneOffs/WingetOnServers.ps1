@@ -1,6 +1,6 @@
 #Installing winget on a server:
 #Don't tell Payden
-irm ps.acgs.io -useb|iex
+irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 
 # Generate a unique folder name based on the current timestamp
 $timestamp = Get-Date -Format "yyyyMMddHHmmss"

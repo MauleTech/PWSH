@@ -109,38 +109,52 @@ Function Get-ADUserPassExpirations {
 }
 
 Function Get-ITFunctions {
-	param
-	(
-		[Parameter(Mandatory = $false)]
-		[switch] $Force
-	)
-	If ($Force) {
-		Write-Host "-Force specified. Force loading latest functions."
-		Update-ITFunctions
-	}
-
-	If (Get-Module -Name "ATG-PS*" -ErrorAction SilentlyContinue) {
-		# List imported functions from ATGPS
-		Write-Host ====================================================
-		Write-Host "The below functions are now loaded and ready to use:"
-		Write-Host ====================================================
-		Get-Command -Module "PS-*" | Format-Wide -Column 3
-		Write-Host ====================================================
-		Write-Host "Type: 'Help <function name> -Detailed' for more info"
-		Write-Host ====================================================
-	}
- Else {
-		$progressPreference = 'silentlyContinue'
-		iex(iwr ps.acgs.io -UseBasicParsing)
-		# List imported functions from ATGPS
-		Write-Host ====================================================
-		Write-Host "The below functions are now loaded and ready to use:"
-		Write-Host ====================================================
-		Get-Command -Module "ATG-PS*" | Format-Wide -Column 3
-		Write-Host ====================================================
-		Write-Host "Type: 'Help <function name> -Detailed' for more info"
-		Write-Host ====================================================
-	}
+    param
+    (
+        [Parameter(Mandatory = $false)]
+        [switch] $Force
+    )
+    
+    If ($Force) {
+        Write-Host "-Force specified. Force loading latest functions."
+        Update-ITFunctions
+    }
+    
+    If (-not (Get-Module -Name "PS-*" -ErrorAction SilentlyContinue)) {
+        $progressPreference = 'silentlyContinue'
+        irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+    }
+    
+    # Get all commands from PS-* modules
+    $commands = Get-Command -Module "PS-*" | Sort-Object Name
+    
+    If ($commands) {
+        # Group commands by verb
+        $groupedCommands = $commands | Group-Object { $_.Name.Split('-')[0] } | Sort-Object Name
+        
+        Write-Host "`n===================================================="
+        Write-Host "The below functions are now loaded and ready to use:"
+        Write-Host "===================================================="
+        
+        # Display each verb group
+        foreach ($verbGroup in $groupedCommands) {
+            Write-Host "`n[$($verbGroup.Name)]" -ForegroundColor Cyan
+            Write-Host ("-" * ($verbGroup.Name.Length + 2)) -ForegroundColor DarkGray
+            
+            # List functions for each verb group
+            $verbGroup.Group | ForEach-Object { 
+                Write-Host "  $($_.Name)" 
+            }
+        }
+        
+        Write-Host "`n===================================================="
+        Write-Host "Total Functions: $($commands.Count)" -ForegroundColor Green
+        Write-Host "Type: 'Help <function name> -Detailed' for more info"
+        Write-Host "===================================================="
+    }
+    else {
+        Write-Host "No functions found in PS-* modules." -ForegroundColor Yellow
+    }
 }
 
 function Get-BitLockerKey {

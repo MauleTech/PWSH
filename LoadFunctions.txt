@@ -300,38 +300,3 @@ if ($FunctionFiles.Count -gt 0) {
 } else {
     Write-Host "No .psm1 function files found in $FunctionsFolder" -ForegroundColor Yellow
 }
-
-# Create a global function to easily update in the future
-Function Global:Update-ITFunctions {
-    Write-Host "Updating IT Functions from GitHub..." -ForegroundColor Yellow
-    if (Test-Path $PWSHFolder) {
-        try {
-            Push-Location $PWSHFolder
-            if (Test-Path $GitExePath) {
-                & $GitExePath fetch origin 2>$null
-                & $GitExePath reset --hard origin/master 2>$null
-            } else {
-                git fetch origin 2>$null
-                git reset --hard origin/master 2>$null
-            }
-            Pop-Location
-            
-            # Reload functions
-            $FunctionFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File | ForEach-Object { $_.FullName }
-            $FunctionFiles | ForEach-Object {
-                If (Test-Path $_ -ErrorAction SilentlyContinue) {
-                    Import-Module $_ -Global -Force
-                }
-            }
-            Write-Host "IT Functions updated and reloaded successfully!" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "Failed to update functions: $_" -ForegroundColor Red
-            if (Get-Location -eq $PWSHFolder) {
-                Pop-Location
-            }
-        }
-    } else {
-        Write-Host "PowerShell Functions repository not found. Please run the main script again." -ForegroundColor Red
-    }
-}

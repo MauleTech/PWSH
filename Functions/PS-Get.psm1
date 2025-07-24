@@ -108,7 +108,7 @@ Function Get-ADUserPassExpirations {
 	}
 }
 
-Function Get-ATGPS {
+Function Get-ITFunctions {
 	param
 	(
 		[Parameter(Mandatory = $false)]
@@ -116,12 +116,7 @@ Function Get-ATGPS {
 	)
 	If ($Force) {
 		Write-Host "-Force specified. Force loading latest functions."
-		Start-Job -ScriptBlock { Invoke-WebRequest http://download.ambitionsgroup.com/Scripts/Update-ATGPS.txt -UseBasicParsing -Headers @{"Cache-Control"="no-cache"} | Invoke-Expression } | Receive-Job -AutoRemoveJob -Wait
-		$DestinationFiles | ForEach-Object {
-			If (Test-Path $_ -ErrorAction SilentlyContinue) {
-				Import-Module $_ -Global -Force
-			}
-		}
+		Update-ITFunctions
 	}
 
 	If (Get-Module -Name "ATG-PS*" -ErrorAction SilentlyContinue) {
@@ -129,7 +124,7 @@ Function Get-ATGPS {
 		Write-Host ====================================================
 		Write-Host "The below functions are now loaded and ready to use:"
 		Write-Host ====================================================
-		Get-Command -Module "ATG-PS*" | Format-Wide -Column 3
+		Get-Command -Module "PS-*" | Format-Wide -Column 3
 		Write-Host ====================================================
 		Write-Host "Type: 'Help <function name> -Detailed' for more info"
 		Write-Host ====================================================

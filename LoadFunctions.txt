@@ -9,10 +9,10 @@ $greenCheck = @{
 }
 $progressPreference = 'Continue'
 
-# Default IT folder path
-param(
-    [string]$ITFolder = "C:\IT"
-)
+# Set default IT folder path if not already defined
+if (-not $ITFolder) {
+    $ITFolder = "$Env:SystemDrive\IT"
+}
 
 #Enable TLS
 [System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192

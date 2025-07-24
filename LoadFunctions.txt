@@ -291,7 +291,7 @@ if ($FunctionFiles.Count -gt 0) {
     If ($LoadedModules) {
         Write-Host -NoNewLine " "
         Write-Host @greenCheck
-        Write-Host -NoNewLine "$((Get-Module -Name "PS-*").ExportedFunctions.Count) Functions successfully loaded "
+        Write-Host -NoNewLine " $((Get-Module -Name "PS-*").ExportedFunctions.Count) Functions successfully loaded "
         Write-Host @greenCheck
         Write-Host "`n - Get-ITFunctions to see commands. Update-ITFunctions to load updates.`n"
     } Else {

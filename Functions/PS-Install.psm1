@@ -18,7 +18,7 @@ Function Install-Action1 {
 	If (-not (Get-Service -Name "A1Agent" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Action1 patch management."
 		$SiteConfigs = @()
-		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/master/Scripts/Action1.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
+		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Action1.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
 
 		# If a global variable 'SiteCode' exists, use it
 		If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {

@@ -272,6 +272,27 @@ Function Install-O365ProofPointConnectors {
 	}
 }
 
+Function Install-SophosDnsCert {
+	Write-Host "Checking Root Certificate"
+	$RootCertPath = "Cert:\LocalMachine\Root\F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD" #Thumbprint of the Cert set to expire in 2036
+	If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
+		$certFilePath = "$Env:SystemDrive\IT\GitHub\PWSH\OneOffs\Sophos_certificate.pem"
+		If (!(Test-Path $certFilePath -ea SilentlyContinue)) {
+			Write-Host "Downloading the Umbrella Root Cert"
+			irm 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt' | iex
+			Update-ITFunctions
+		}
+		Write-Host "Installing the Umbrella Root Cert"
+		Import-Certificate -FilePath $certFilePath -CertStoreLocation Cert:\LocalMachine\Root\
+		If(Test-Path "C:\Program Files\Mozilla Firefox\defaults\pref\") {
+			Write-Host "Configuring Firefox to use the Cert"
+			Set-Content "C:\Program Files\Mozilla Firefox\defaults\pref\firefox-windows-truststore.js" "pref('security.enterprise_roots.enabled', true);"
+		}
+	} Else {
+		Write-Host -ForegroundColor Green "The Umbrella Root Cert is already installed."
+	}
+}
+
 Function Install-UmbrellaDns {
     [cmdletbinding()]
     param(

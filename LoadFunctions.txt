@@ -11,7 +11,7 @@ $progressPreference = 'Continue'
 
 # Set default IT folder path if not already defined
 if (-not $ITFolder) {
-    $ITFolder = "$Env:SystemDrive\IT"
+    $Global:ITFolder = "$Env:SystemDrive\IT"
 }
 
 #Enable TLS
@@ -269,15 +269,26 @@ if (Test-Path $FunctionsFolder) {
 
 # Import existing functions first
 Function Update-ITPS {
+    Push-Location $PWSHFolder
+    # Determine which git to use
+    $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
+    # Show current status
+    & $GitCommand status --porcelain > $null
+    # Fetch all remotes
+    & $GitCommand fetch origin > $null 2>&1
+    # Check what branch we're on
+    $CurrentBranch = (& $GitCommand branch --show-current).Trim()
+    # Reset to the remote version of current branch
+    & $GitCommand reset --hard "origin/$CurrentBranch" > $null 2>&1
+    # Show final status
+    & $GitCommand log --oneline -1 > $null
+    Pop-Location
+    # Reload functions
+    $FunctionFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
     $FunctionFiles | ForEach-Object {
-        If (Test-Path $_ -ErrorAction SilentlyContinue) {
-            try {
-                Import-Module $_ -Global -Force
-            }
-            catch {
-                Write-Host "Failed to import $_" -ForegroundColor Yellow
-            }
-        }
+    If (Test-Path $_ -ErrorAction SilentlyContinue) {
+        Import-Module $_ -Global -Force -Verbose:$false > $null 2>&1
+    }
     }
 }
 

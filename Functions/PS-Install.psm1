@@ -72,8 +72,8 @@ Function Install-Choco {
 	$progressPreference = 'silentlyContinue'
 	Set-ExecutionPolicy Bypass -Scope Process -Force
 	Enable-SSL
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Chocolatey/installchoco.txt -UseBasicParsing | Invoke-Expression
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Chocolatey/installchoco.txt -UseBasicParsing | Invoke-Expression
+	$ChocoInstallScript = Join-Path -Path $ITFolder -ChildPath "GitHub\PWSH\Scripts\Chocolatey\installchoco.ps1"
+	& $ChocoInstallScript
 }
 
 Function Install-ITS247Agent {

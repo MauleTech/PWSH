@@ -74,6 +74,7 @@ Function Install-Choco {
 	Enable-SSL
 	$ChocoInstallScript = Join-Path -Path $ITFolder -ChildPath "GitHub\PWSH\Scripts\Chocolatey\installchoco.ps1"
 	& $ChocoInstallScript
+	& $ChocoInstallScript
 }
 
 Function Install-ITS247Agent {

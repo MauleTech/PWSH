@@ -3,7 +3,6 @@ Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
 #Custom
 #Dowload config file index
 $SiteConfigs = @()
-$SiteConfigs = (Invoke-WebRequest -uri "http://download.ambitionsgroup.com/Sites/ITS247Agent/SiteAgentConfigs.csv" -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
 
 $DetectedIP = (Invoke-WebRequest -uri "https://icanhazip.com" -UseBasicParsing).Content
 $searchterm = '*' + $DetectedIP + '*'
@@ -15,9 +14,9 @@ If ($DetectedSite.Choco) {
 	[string]$packageRepo = $DetectedSite.Choco
 
 	if ($null -eq $packageRepo -or '' -eq $packageRepo) {
-		Write-Host "Install Ambitions Chocolatey Server"
-		$ChocoName = "ACG-Choco"
-		$packageRepo = 'https://choco.ambitionsgroup.com/nuget/chocolatey-group/'
+		Write-Host "Install Chocolatey Server"
+		#$ChocoName = "ACG-Choco"
+		#$packageRepo = 'https://choco.ambitionsgroup.com/nuget/chocolatey-group/'
 	} else {
 		Write-Host "Install local Chocolatey Server"
 		$ChocoName = $DetectedCode + "-Choco"
@@ -29,17 +28,18 @@ If ($DetectedSite.Choco) {
 	}
 } else {
 	Write-Host "You're not at a specialized site."
-	Write-Host "Install Ambitions Chocolatey Server"
+	Write-Host "Install Chocolatey Server"
 	#Remove stale ambitions source if it is no longer needed.
 	If (Get-Command choco -errorAction SilentlyContinue) {
 		$Sources = (choco source)
 		If ($Sources -match "ACG-Choco - http://choco.ambitionsgroup.com:8081") { choco source remove -n=ACG-Choco }
+		If ($Sources -match "ACG-Choco - https://choco.ambitionsgroup.com/nuget/chocolatey-group/") { choco source remove -n=ACG-Choco }
 		If ($Sources -match "ACG-Choco - https://choco.ambitionsgroup.com/repository/chocolatey-group/") { choco source remove -n=ACG-Choco }
 	}
-	$ChocoName = "ACG-Choco"
-	$packageRepo = 'https://choco.ambitionsgroup.com/nuget/chocolatey-group/'
+	#$ChocoName = "ACG-Choco"
+	#$packageRepo = 'https://choco.ambitionsgroup.com/nuget/chocolatey-group/'
 	$SourceAdd = @()
-	$SourceAdd += "choco source add -n=" + $ChocoName + " -s=" + $packageRepo + " --priority=2"
+	#$SourceAdd += "choco source add -n=" + $ChocoName + " -s=" + $packageRepo + " --priority=2"
 	$SourceAdd += "choco source add -n=openmw -s=`"https://repo.openmw.org/repository/Chocolatey/`" --priority=10"
 	$SourceAdd += "choco source add -n=chocolatey -s=`"https://chocolatey.org/api/v2`" --priority=100"
 }

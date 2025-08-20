@@ -548,7 +548,7 @@ Function Update-PowerShellModule {
 
                 # Ensure NuGet package provider is installed
                 if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-                    Install-PackageProvider -Name NuGet -Force -Scope CurrentUser
+                    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
                 }
 
                 # Remove the module from current session if loaded
@@ -603,7 +603,7 @@ Function Update-PowerShellModule {
 
         # Ensure NuGet package provider is installed
         if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-            Install-PackageProvider -Name NuGet -Force -Scope CurrentUser
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
         }
 
         # Install the module
@@ -616,7 +616,7 @@ Function Update-PowershellModules {
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 	$Providers = (Get-PackageProvider).Name
 	If ($Providers -NotContains "Nuget") {
-		Install-PackageProvider -Name NuGet -MinimumVersion 3.0.0.1 -Force -ErrorAction SilentlyContinue
+		Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue
 	}
 	Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
 	$ModulesToInstall = @("PSReadline","PowerShellGet","AdvancedHistory")
@@ -837,3 +837,4 @@ If (Get-Module -Name ATGPS -ErrorAction SilentlyContinue){
 # O799pl5w+MVM+EkZ1JZFogq4VCWqPcn5gT5zLuDWuDDwZxVICuNGOJ+HYJckcQGG
 # R6QKsw==
 # SIG # End signature block
+

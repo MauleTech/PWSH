@@ -74,6 +74,7 @@ If (Get-Command choco.exe -ErrorAction SilentlyContinue) {
 		Write-Host "Attempting to use chocolatey's script to install chocolatey."
 		Set-ExecutionPolicy Bypass -Scope Process -Force
 		[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+		Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
 		iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 	}
 

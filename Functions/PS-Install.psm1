@@ -340,9 +340,9 @@ Function Install-SophosEndpoint {
 	$ExeUrl = 'https://'
 	$GUID = ($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID
 	$InstallURL = $ExeUrl + $GUID + "/SophosSetup.exe"
-	$SophosInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\Action1Patches
+	$SophosInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\SophosEndpoint
 	$ExePath = $SophosInstaller[1]
-	$arguments = "/quiet"
+	$arguments = --quiet"
 	$process = Start-Process -FilePath $ExePath -ArgumentList $arguments -Wait -PassThru
 
 	if ($process.ExitCode -eq 0) {

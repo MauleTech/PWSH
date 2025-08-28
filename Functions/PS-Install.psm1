@@ -295,64 +295,64 @@ Function Install-SophosDnsCert {
 }
 
 Function Install-SophosEndpoint {
-<#
-.Synopsis
-Installs the Sophos Endpoint Software
-.Description
-Installs Sophos Endpoint Software
-.Notes
-For a list of site codes, go to:
-https://github.com/MauleTech/PWSH/blob/main/Scripts/Sophos.csv
-#>
+	<#
+	.Synopsis
+	Installs the Sophos Endpoint Software
+	.Description
+	Installs Sophos Endpoint Software
+	.Notes
+	For a list of site codes, go to:
+	https://github.com/MauleTech/PWSH/blob/main/Scripts/Sophos.csv
+	#>
 
-###Require -RunAsAdministrator
-[cmdletbinding()]
-param(
-[string]$Code
-)
+	###Require -RunAsAdministrator
+	[cmdletbinding()]
+	param(
+		[string]$Code
+	)
 
-If (-not (Get-Service -Name "Sophos Endpoint Defense Service" -ErrorAction SilentlyContinue)) {
-Write-Host "Installing Sophos Endpoint."
-$SiteConfigs = @()
-$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Sophos.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
+	If (-not (Get-Service -Name "Sophos Endpoint Defense Service" -ErrorAction SilentlyContinue)) {
+		Write-Host "Installing Sophos Endpoint."
+		$SiteConfigs = @()
+		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Sophos.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
 
-# If a global variable 'SiteCode' exists, use it
-If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {
-$Code = $SiteCode
-$Silent = $True
-}
+		# If a global variable 'SiteCode' exists, use it
+		If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {
+		$Code = $SiteCode
+		$Silent = $True
+	}
 
-if ([String]::IsNullOrEmpty(($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID)) {
-# Always display the available site codes before prompting
-Write-Host "`nAvailable Site Codes:" -ForegroundColor Cyan
-$SiteConfigs | Where-Object -Property GUID -ne "" | Select-Object Code, Site | Format-Table -AutoSize
+	if ([String]::IsNullOrEmpty(($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID)) {
+	# Always display the available site codes before prompting
+	Write-Host "`nAvailable Site Codes:" -ForegroundColor Cyan
+	$SiteConfigs | Where-Object -Property GUID -ne "" | Select-Object Code, Site | Format-Table -AutoSize
 
-# Ensure $Code is provided and valid
-while ($null -eq $Code -or -not ($SiteConfigs | Where-Object { $_.Code -eq $Code })) {
-if ($null -ne $Code) {
-Write-Host "Invalid site code: $Code. Please enter a valid site code." -ForegroundColor Red
-}
-$Code = Read-Host "Enter Site Code"
-}
-}
+	# Ensure $Code is provided and valid
+	while ($null -eq $Code -or -not ($SiteConfigs | Where-Object { $_.Code -eq $Code })) {
+		if ($null -ne $Code) {
+		Write-Host "Invalid site code: $Code. Please enter a valid site code." -ForegroundColor Red
+		}
+			$Code = Read-Host "Enter Site Code"
+		}
+	}
 
-# Proceed with installation after validation
-$ExeUrl = 'https://'
-$GUID = ($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID
-$InstallURL = $ExeUrl + $GUID + "/SophosSetup.exe"
-$SophosInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\Action1Patches
-$ExePath = $SophosInstaller[1]
-$arguments = /quiet"
-$process = Start-Process -FilePath "ExePath" -ArgumentList $arguments -Wait -PassThru
+	# Proceed with installation after validation
+	$ExeUrl = 'https://'
+	$GUID = ($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID
+	$InstallURL = $ExeUrl + $GUID + "/SophosSetup.exe"
+	$SophosInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\Action1Patches
+	$ExePath = $SophosInstaller[1]
+	$arguments = "/quiet"
+	$process = Start-Process -FilePath $ExePath -ArgumentList $arguments -Wait -PassThru
 
-if ($process.ExitCode -eq 0) {
-Write-Output "Installation of $ExePath completed successfully."
-} else {
-Write-Output "Installation failed with exit code: $($process.ExitCode)"
-}
-} Else {
-Write-Output "Sophos service is already installed."
-}
+	if ($process.ExitCode -eq 0) {
+		Write-Output "Installation of $ExePath completed successfully."
+	} else {
+		Write-Output "Installation failed with exit code: $($process.ExitCode)"
+	}
+	} Else {
+		Write-Output "Sophos service is already installed."
+	}
 }
 
 Function Install-UmbrellaDns {

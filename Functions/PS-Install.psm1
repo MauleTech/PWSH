@@ -343,6 +343,7 @@ Function Install-SophosEndpoint {
 	$SophosInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\SophosEndpoint
 	$ExePath = $SophosInstaller[1]
 	$arguments = "--quiet"
+	Write-Host "Beginning Install"
 	$process = Start-Process -FilePath $ExePath -ArgumentList $arguments -Wait -PassThru
 
 	if ($process.ExitCode -eq 0) {

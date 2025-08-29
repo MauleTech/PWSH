@@ -93,3 +93,54 @@ foreach ($Folder in $FoldersToDelete) {
 }
 
 Write-Host "TeamViewer removal process completed." -ForegroundColor Green
+
+# Complete AnyDesk Force Removal Script
+Write-Host "Starting AnyDesk force removal..." -ForegroundColor Green
+
+# Stop and remove service first
+Write-Host "Stopping AnyDesk service..." -ForegroundColor Yellow
+Stop-Service -Name "AnyDesk" -Force -ErrorAction SilentlyContinue
+
+Write-Host "Removing AnyDesk service..." -ForegroundColor Yellow
+if (Get-Command Remove-Service -ErrorAction SilentlyContinue) {
+    Remove-Service -Name "AnyDesk" -ErrorAction SilentlyContinue
+} else {
+    sc.exe delete "AnyDesk" | Out-Null
+}
+
+# Kill AnyDesk processes
+Write-Host "Terminating AnyDesk processes..." -ForegroundColor Yellow
+Stop-Process -Name "AnyDesk" -Force -ErrorAction SilentlyContinue
+
+# Remove files
+Write-Host "Removing AnyDesk files..." -ForegroundColor Yellow
+$AnyDeskPaths = @(
+    "${env:ProgramFiles(x86)}\AnyDesk",
+    "$env:ProgramFiles\AnyDesk",
+    "$env:APPDATA\AnyDesk",
+    "$env:ProgramData\AnyDesk"
+)
+
+foreach ($Path in $AnyDeskPaths) {
+    if (Test-Path $Path) {
+        Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed: $Path" -ForegroundColor Cyan
+    }
+}
+
+# Remove registry entries
+Write-Host "Removing AnyDesk registry entries..." -ForegroundColor Yellow
+$RegPaths = @(
+    "HKLM:\SOFTWARE\AnyDesk",
+    "HKLM:\SOFTWARE\WOW6432Node\AnyDesk",
+    "HKCU:\SOFTWARE\AnyDesk"
+)
+
+foreach ($RegPath in $RegPaths) {
+    if (Test-Path $RegPath) {
+        Remove-Item -Path $RegPath -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed registry: $RegPath" -ForegroundColor Cyan
+    }
+}
+
+Write-Host "AnyDesk force removal completed" -ForegroundColor Green

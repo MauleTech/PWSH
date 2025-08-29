@@ -1,17 +1,95 @@
+#To run this script from CMD:
+#Powershell.exe -noprofile -command "[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192; irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/OneOffs/RemoveRemoteAccess.txt | iex"
+
 irm rb.gy/0kyfn2 | iex
 $AppsToUninstall = @(
-"AnyDesk",
-"TeamViewer",
-"Splashtop",
-"Logmein"
+	"AnyDesk",
+	"TeamViewer",
+	"Splashtop",
+	"Logmein"
 )
 
 $AppsToUninstall | ForEach-Object {
-Write-Host "Checking if $_ is installed."
-If (Get-InstalledApplication -Name $_) {
-Write-Host "Uninstalling $_."
-Uninstall-Application -AppToUninstall $_
-} Else {
-Write-Host "$_ is not installed."
+	Write-Host "Checking if $_ is installed."
+	If (Get-InstalledApplication -Name $_) {
+		Write-Host "Uninstalling $_."
+		Uninstall-Application -AppToUninstall $_
+	} Else {
+		Write-Host "$_ is not installed."
+	}
 }
+
+# TeamViewer Complete Removal Script
+
+Write-Host "Starting TeamViewer removal process..." -ForegroundColor Green
+
+# Stop TeamViewer Service
+Write-Host "Stopping TeamViewer service..." -ForegroundColor Yellow
+Stop-Service -Name "TeamViewer" -Force -ErrorAction SilentlyContinue
+
+# Wait 10 seconds
+Write-Host "Waiting 10 seconds..." -ForegroundColor Yellow
+Start-Sleep -Seconds 10
+
+# Attempt uninstalls using WMI
+Write-Host "Attempting WMI uninstall..." -ForegroundColor Yellow
+try {
+    Get-CimInstance -ClassName Win32_Product | Where-Object {$_.Name -like "TeamViewer*"} | ForEach-Object {
+        $_.Uninstall()
+    }
+} catch {
+    Write-Warning "WMI uninstall failed: $($_.Exception.Message)"
 }
+
+# Cancel any pending shutdown (equivalent to shutdown /a)
+shutdown /a 2>$null
+
+# Run TeamViewer's native uninstaller
+Write-Host "Running native uninstaller..." -ForegroundColor Yellow
+$UninstallerPath = "${env:ProgramFiles(x86)}\TeamViewer\uninstall.exe"
+if (Test-Path $UninstallerPath) {
+    Start-Process -FilePath $UninstallerPath -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+}
+
+# Kill TeamViewer processes
+Write-Host "Terminating TeamViewer processes..." -ForegroundColor Yellow
+$ProcessesToKill = @("TeamViewer", "TeamViewer_Service", "tv_w32", "tv_x64")
+foreach ($Process in $ProcessesToKill) {
+    Stop-Process -Name $Process -Force -ErrorAction SilentlyContinue
+}
+
+# Wait 5 seconds
+Write-Host "Waiting 5 seconds..." -ForegroundColor Yellow
+Start-Sleep -Seconds 5
+
+# Delete registry entries
+Write-Host "Removing registry entries..." -ForegroundColor Yellow
+$RegistryPaths = @(
+    "HKLM:\SOFTWARE\TeamViewer",
+    "HKLM:\SOFTWARE\WOW6432Node\TeamViewer",
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TeamViewer",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\TeamViewer"
+)
+
+foreach ($RegPath in $RegistryPaths) {
+    if (Test-Path $RegPath) {
+        Remove-Item -Path $RegPath -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed: $RegPath" -ForegroundColor Cyan
+    }
+}
+
+# Delete program files
+Write-Host "Removing program files..." -ForegroundColor Yellow
+$FoldersToDelete = @(
+    "${env:ProgramFiles(x86)}\TeamViewer",
+    "$env:ProgramFiles\TeamViewer"
+)
+
+foreach ($Folder in $FoldersToDelete) {
+    if (Test-Path $Folder) {
+        Remove-PathForcefully -Path $Folder -ErrorAction SilentlyContinue
+        Write-Host "Removed: $Folder" -ForegroundColor Cyan
+    }
+}
+
+Write-Host "TeamViewer removal process completed." -ForegroundColor Green

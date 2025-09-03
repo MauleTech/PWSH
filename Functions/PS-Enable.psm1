@@ -153,9 +153,18 @@ Function Enable-O365AuditLog {
 		# Use integers because the enumeration values for TLS 1.2 and TLS 1.1 won't
 		# exist in .NET 4.0, even though they are addressable if .NET 4.5+ is
 		# installed (.NET 4.5 is an in-place upgrade).
-		[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+		# Enable TLS 1.2 system-wide for .NET applications
+		Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+		Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v2.0.50727' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+
+		# For 64-bit systems, also set the Wow6432Node keys
+		if ([Environment]::Is64BitOperatingSystem) {
+			Set-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+			Set-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v2.0.50727' -Name 'SchUseStrongCrypto' -Value 1 -Type DWord
+		}
 		} catch {
-		Write-Output 'Unable to set PowerShell to use TLS 1.2 and TLS 1.1 due to old .NET Framework installed. If you see underlying connection closed or trust errors, you may need to upgrade to .NET Framework 4.5+ and PowerShell v3+.'
+			Write-Output 'Unable to set PowerShell to use TLS 1.2 and TLS 1.1 due to old .NET Framework installed. If you see underlying connection closed or trust errors, you may need to upgrade to .NET Framework 4.5+ and PowerShell v3+.'
 		}
 	}
 

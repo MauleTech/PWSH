@@ -273,6 +273,47 @@ Function Install-O365ProofPointConnectors {
 	}
 }
 
+Function Install-ScreenConnect {
+	<#
+	.Synopsis
+		Installs the ScreenConnect Remote Support Software
+	.Description
+		Installs ScreenConnect Remote Support Software from MauleTech BinCache
+	.Notes
+		Downloads and installs the ScreenConnect client from:
+		https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi
+	#>
+	###Require -RunAsAdministrator
+	[cmdletbinding()]
+	param()
+	
+	# Check if ScreenConnect is already installed by looking for the service
+	If (-not (Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue)) {
+		Write-Host "Installing ScreenConnect Remote Support Software." -ForegroundColor Green
+		
+		# Direct URL to the ScreenConnect MSI
+		$InstallURL = 'https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi'
+		
+		# Download the installer using Get-FileDownload from MauleTech/PWSH
+		$ScreenConnectInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder "$ITFolder\ScreenConnect"
+		$msiPath = $ScreenConnectInstaller[1]
+		
+		# Install the MSI silently
+		Write-Host "Installing ScreenConnect from: $msiPath" -ForegroundColor Cyan
+		$arguments = "/i `"$msiPath`" /quiet /norestart"
+		$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+		
+		# Check installation result
+		if ($process.ExitCode -eq 0) {
+			Write-Output "Installation of ScreenConnect completed successfully."
+		} else {
+			Write-Output "Installation failed with exit code: $($process.ExitCode)"
+		}
+	} Else {
+		Write-Output "ScreenConnect service is already installed."
+	}
+}
+
 Function Install-SophosDnsCert {
 	Write-Host "Checking Root Certificate"
 	$RootCertPath = "Cert:\LocalMachine\Root\F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD" #Thumbprint of the Cert set to expire in 2036

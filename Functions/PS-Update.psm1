@@ -789,6 +789,196 @@ Function Update-WindowTitle ([String] $PassNumber) {
 		$host.ui.RawUI.WindowTitle = "$SiteCode Provisioning | $env:computername | Pass $PassNumber | Please Wait"
 }
 
+Function Update-WindowsTo11 {
+	<# 
+	.SYNOPSIS
+	Find and install ONLY the Windows 11 Feature Update using PSWindowsUpdate.
+
+	.PARAMETER AutoReboot
+	Reboot automatically when the upgrade requires it.
+
+	.PARAMETER LogPath
+	Path for transcript logging.
+
+	.PARAMETER WhatIfOnly
+	Show what would happen without installing.
+
+	.NOTES
+	Requires: PowerShell as Administrator, Internet access or WSUS that offers the upgrade.
+	#>
+
+	[CmdletBinding(SupportsShouldProcess=$true)]
+	param(
+	[switch]$AutoReboot,
+	[string]$LogPath = "$env:ProgramData\Win11-Upgrade-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
+	[switch]$WhatIfOnly
+	)
+
+	### Helpers
+	function Write-Info($msg){ Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
+	function Write-Warn($msg){ Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
+	function Write-Err ($msg){ Write-Host "[ERROR] $msg" -ForegroundColor Red }
+
+	### Start transcript
+	try { Start-Transcript -Path $LogPath -Force | Out-Null } catch { }
+
+	### 1) Quick eligibility checks (non-bypass)
+	$elig = [ordered]@{
+	OS               = (Get-CimInstance Win32_OperatingSystem).Caption
+	OSVersion        = (Get-CimInstance Win32_OperatingSystem).Version
+	Architecture     = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
+	RAM_GB           = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,1)
+	FreeSysDrive_GB  = [math]::Round((Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free/1GB,1)
+	TPM_Present      = $false
+	TPM_Ready        = $false
+	TPM_VersionOK    = $false
+	SecureBoot       = $false
+	}
+
+	# TPM
+	try {
+	$tpm = Get-Tpm
+	if ($tpm) {
+		$elig.TPM_Present = $true
+		$elig.TPM_Ready   = $tpm.TpmReady
+		# Windows 11 requires TPM 2.0
+		# If Get-Tpm returns SpecVersion, check contains "2.0"
+		$spec = ($tpm.SpecVersion -join ',')
+		$elig.TPM_VersionOK = $spec -match '2\.0'
+	}
+	} catch { }
+
+	# Secure Boot
+	try {
+	$elig.SecureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
+	} catch {
+	# On BIOS/Legacy this throws, leave as $false
+	}
+
+	Write-Info "Eligibility snapshot:"
+	$elig.GetEnumerator() | ForEach-Object { Write-Host (" - {0}: {1}" -f $_.Key, $_.Value) }
+
+	# Basic gates (do not hard fail, just warn)
+	if ($elig.OS -notmatch 'Windows 10' -and $elig.OS -notmatch 'Windows 11') {
+	Write-Warn "This script is intended to upgrade Windows 10 to Windows 11. Current OS: $($elig.OS)"
+	}
+	if ($elig.RAM_GB -lt 4)            { Write-Warn "RAM under 4 GB may block the upgrade." }
+	if ($elig.FreeSysDrive_GB -lt 25)  { Write-Warn "Low free space on system drive (< 25 GB). Consider cleanup before upgrade." }
+	if (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK) { Write-Warn "TPM 2.0 not detected. Windows 11 may not be offered." }
+	if (-not $elig.SecureBoot)         { Write-Warn "Secure Boot not detected. Windows 11 may not be offered." }
+
+	### 2) Detect potential policy blockers
+	$wsusInUse = $false
+	try {
+	$wuPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+	$au       = Join-Path $wuPolicy 'AU'
+	$wsus     = Get-ItemProperty -Path $wuPolicy -Name WUServer -ErrorAction SilentlyContinue
+	if ($wsus) { $wsusInUse = $true; Write-Info "WSUS detected: $($wsus.WUServer)" }
+
+	$trlv = Get-ItemProperty -Path $wuPolicy -Name TargetReleaseVersion -ErrorAction SilentlyContinue
+	$trlvInfo = Get-ItemProperty -Path $wuPolicy -Name TargetReleaseVersionInfo -ErrorAction SilentlyContinue
+	if ($trlv -and $trlv.TargetReleaseVersion -eq 1) {
+		Write-Warn "TargetReleaseVersion pin is set. Current TargetReleaseVersionInfo: '$($trlvInfo.TargetReleaseVersionInfo)'. This can block feature upgrades."
+	}
+
+	$defer = Get-ItemProperty -Path $au -Name DeferFeatureUpdatesPeriodInDays -ErrorAction SilentlyContinue
+	if ($defer) { Write-Warn "Feature update deferral is set to $($defer.DeferFeatureUpdatesPeriodInDays) days. This can delay the Windows 11 offer." }
+	} catch { }
+
+	### 3) Ensure PSWindowsUpdate is present and Microsoft Update is enabled
+	try {
+	if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+		Write-Info "Installing PSWindowsUpdate..."
+		Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber
+	}
+	Import-Module PSWindowsUpdate -Force
+
+	# Ensure Microsoft Update source is added
+	if (-not (Get-WUServiceManager | Where-Object {$_.Name -match 'Microsoft Update'})) {
+		Write-Info "Enabling Microsoft Update catalog..."
+		Add-WUServiceManager -MicrosoftUpdate | Out-Null
+	}
+	} catch {
+	Write-Err "Failed to prepare PSWindowsUpdate. $_"
+	Stop-Transcript | Out-Null
+	exit 1
+	}
+
+	### 4) Find ONLY the Windows 11 upgrade
+	Write-Info "Scanning for Windows 11 feature upgrade..."
+	# Hints:
+	#  - Category 'Upgrades' often narrows to feature upgrades
+	#  - Titles typically contain "Feature update to Windows 11" or "Upgrade to Windows 11"
+	$filters = @(
+	'Feature update to Windows 11',
+	'Upgrade to Windows 11'
+	)
+
+	# Use -MicrosoftUpdate and -Category Upgrades to narrow results
+	$updates = Get-WindowsUpdate -MicrosoftUpdate -Category Upgrades -IgnoreUserInput -AcceptAll -NotTitle "Preview" -ErrorAction SilentlyContinue
+
+	# Fallback scan if nothing in Upgrades category
+	if (-not $updates) {
+	$updates = Get-WindowsUpdate -MicrosoftUpdate -IgnoreUserInput -AcceptAll -ErrorAction SilentlyContinue
+	}
+
+	$win11 = $updates | Where-Object {
+	$t = $_.Title
+	$filters | Where-Object { $t -like "$_*" }
+	}
+
+	if (-not $win11) {
+	Write-Warn "No Windows 11 feature upgrade is currently being offered to this device."
+	if ($wsusInUse) { Write-Warn "WSUS controls may be withholding the upgrade. Check product/classification and approvals." }
+	Write-Warn "Also check any TargetReleaseVersion pins or deferrals noted above."
+	Stop-Transcript | Out-Null
+	exit 0
+	}
+
+	Write-Info "Found Windows 11 upgrade:"
+	$win11 | Select-Object KB,Title,Size,Deadline | Format-List
+
+	### 5) Install only the Windows 11 upgrade
+	if ($WhatIfOnly) {
+	Write-Info "WhatIfOnly set. Skipping install."
+	Stop-Transcript | Out-Null
+	exit 0
+	}
+
+	$installParams = @{
+	MicrosoftUpdate = $true
+	AcceptAll       = $true
+	Install         = $true
+	IgnoreUserInput = $true
+	# Target strictly by title to avoid other updates
+	UpdateTitle     = ($filters | ForEach-Object { "$_*" })
+	}
+
+	if ($AutoReboot) { $installParams.AutoReboot = $true }
+
+	if ($PSCmdlet.ShouldProcess("Install Windows 11 Feature Update","Install")) {
+	try {
+		Write-Info "Starting Windows 11 upgrade..."
+		# PSWindowsUpdate accepts a single string for -UpdateTitle. Pick the most common pattern first.
+		$installParams.UpdateTitle = 'Feature update to Windows 11*'
+		$null = Get-WindowsUpdate @installParams
+	} catch {
+		Write-Warn "Install by primary title pattern failed. Trying alternate pattern..."
+		try {
+		$installParams.UpdateTitle = 'Upgrade to Windows 11*'
+		$null = Get-WindowsUpdate @installParams
+		} catch {
+		Write-Err "Failed to start the upgrade via PSWindowsUpdate. $_"
+		Stop-Transcript | Out-Null
+		exit 1
+		}
+	}
+	}
+
+	Write-Info "If not using -AutoReboot, you may be prompted to reboot to continue."
+	try { Stop-Transcript | Out-Null } catch { }
+}
+
 If (Get-Module -Name ATGPS -ErrorAction SilentlyContinue){
 	# List imported functions from ATGPS
 	Write-Host `n====================================================

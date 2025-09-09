@@ -229,6 +229,7 @@ if (Test-Path $PWSHFolder) {
     try {
         Push-Location $PWSHFolder
         if (Test-Path $GitExePath) {
+            & $GitExePath config --global --add safe.directory $PWSHFolder
             & $GitExePath fetch origin 2>$null
             & $GitExePath reset --hard origin/master 2>$null
         } else {
@@ -253,6 +254,7 @@ if (Test-Path $PWSHFolder) {
         } else {
             git clone https://github.com/MauleTech/PWSH.git $PWSHFolder 2>$null
         }
+        & $GitExePath config --global --add safe.directory $PWSHFolder
         Write-Host "Repository cloned successfully!" -ForegroundColor Green
     }
     catch {

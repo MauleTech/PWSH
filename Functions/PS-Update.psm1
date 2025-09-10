@@ -901,7 +901,7 @@ Function Update-WindowsTo11 {
 	} catch {
 	Write-Err "Failed to prepare PSWindowsUpdate. $_"
 	Stop-Transcript | Out-Null
-	exit 1
+	Return 1#exit 1
 	}
 
 	### 4) Find ONLY the Windows 11 upgrade
@@ -932,7 +932,7 @@ Function Update-WindowsTo11 {
 	if ($wsusInUse) { Write-Warn "WSUS controls may be withholding the upgrade. Check product/classification and approvals." }
 	Write-Warn "Also check any TargetReleaseVersion pins or deferrals noted above."
 	Stop-Transcript | Out-Null
-	exit 0
+	Return 0 #exit 0
 	}
 
 	Write-Info "Found Windows 11 upgrade:"
@@ -942,7 +942,7 @@ Function Update-WindowsTo11 {
 	if ($WhatIfOnly) {
 	Write-Info "WhatIfOnly set. Skipping install."
 	Stop-Transcript | Out-Null
-	exit 0
+	Return 0 #exit 0
 	}
 
 	$installParams = @{
@@ -970,7 +970,7 @@ Function Update-WindowsTo11 {
 		} catch {
 		Write-Err "Failed to start the upgrade via PSWindowsUpdate. $_"
 		Stop-Transcript | Out-Null
-		exit 1
+		Return 1 #exit 1
 		}
 	}
 	}

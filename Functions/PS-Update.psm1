@@ -699,6 +699,9 @@ Function Update-PWSH {
 }
 
 Function Update-PSWinGetPackages {
+	If (Get-Command -Name "winget.exe" -ErrorAction SilentlyContinue) {
+		& winget.exe update --all --silent  --accept-package-agreements --accept-source-agreements --include-unknown --force
+	}
 	Start-PSWinGet -Command 'Get-WinGetPackage | Where {$_.IsUpdateAvailable -eq $True} | Update-WinGetPackage -Mode Silent -Verbose'
 }
 

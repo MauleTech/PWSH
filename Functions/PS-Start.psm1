@@ -29,6 +29,12 @@ Function Start-BackstageBrowser {
 
 	# Launch Pale Moon Portable
 	Start-Process -FilePath $executablePath
+	Start-Sleep 1
+	If (-not (Get-Process -ProcessName Palemoon-Portable -ErrorAction SilentlyContinue)) {
+		Write-Host "Corrupt browser detected, repairing."
+		DownloadAndExtractPaleMoon
+		Start-Process -FilePath $executablePath
+	}
 }
 
 Function Start-CleanupOfSystemDrive {

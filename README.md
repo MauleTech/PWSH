@@ -134,6 +134,9 @@ IEX(new-object net.webclient).downloadstring('https://raw.githubusercontent.com/
   Install-O2016STD
   Install-O365
   Install-O365ProofPointConnectors
+  Install-ScreenConnect
+  Install-SophosDnsCert
+  Install-SophosEndpoint
   Install-UmbrellaDns
   Install-UmbrellaDNSasJob
   Install-UmbrellaDnsCert
@@ -232,6 +235,7 @@ IEX(new-object net.webclient).downloadstring('https://raw.githubusercontent.com/
   Update-PWSH
   Update-Windows
   Update-WindowsApps
+  Update-WindowsTo11
   Update-WindowTitle
 
 
@@ -241,3 +245,4 @@ IEX(new-object net.webclient).downloadstring('https://raw.githubusercontent.com/
 ```powershell 
 Help <function-name> -Detailed
 ```
+

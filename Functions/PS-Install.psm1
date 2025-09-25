@@ -320,11 +320,11 @@ Function Install-SophosDnsCert {
 	If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
 		$certFilePath = "$Env:SystemDrive\IT\GitHub\PWSH\OneOffs\Sophos_certificate.pem"
 		If (!(Test-Path $certFilePath -ea SilentlyContinue)) {
-			Write-Host "Downloading the Umbrella Root Cert"
+			Write-Host "Downloading the Sophos Root Cert"
 			irm 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt' | iex
 			Update-ITFunctions
 		}
-		Write-Host "Installing the Umbrella Root Cert"
+		Write-Host "Installing the Sophos Root Cert"
 		Import-Certificate -FilePath $certFilePath -CertStoreLocation Cert:\LocalMachine\Root\
 		If(Test-Path "C:\Program Files\Mozilla Firefox\defaults\pref\") {
 			Write-Host "Configuring Firefox to use the Cert"

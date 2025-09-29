@@ -725,16 +725,13 @@ Function Update-Windows {
 			Add-WUServiceManager -ServiceID 7971f918-a847-4430-9279-4a52d1efe18d -Confirm:$false
 		}
 	}
+	Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force -ErrorAction SilentlyContinue
+	Install-PackageProvider -Name NuGet -MinimumVersion 3.0.0.1 -Force -ErrorAction SilentlyContinue
+
 	
-	Write-Host "Checking Chocolatey Installation"
-	If (-NOT (Test-Path "C:\ProgramData\chocolatey\bin\choco.exe")) {
-		Write-Host "Choco is not installed. Installing Choco."
-		Install-Choco
-	}
-	
-	Write-Host "Choco is installed. Checking for powershell version."
 	If ($PSVersionTable.PSVersion.Major -lt "5") {
 		Write-Host "Powershell needs an update, installing now"
+		If (!(Test-Path "C:\ProgramData\chocolatey\bin\choco.exe" -ErrorAction SilentlyContinue) ){Install-Choco}
 		& "C:\ProgramData\chocolatey\bin\choco.exe" install dotnet4.5.2 -y
 		& "C:\ProgramData\chocolatey\bin\choco.exe" install powershell -y
 		Write-Host "Reboot computer and run script again"
@@ -748,16 +745,19 @@ Function Update-Windows {
 		}
 	
 		If (-Not (((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Major -ge "2") -and ((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Minor -ge "1"))) {
-			Write-Host "Attempting automatic installation of PSWUI 2.2.0.3"
+			Write-Host "Attempting automatic installation of PSWUI 2.2.1.5"
+			Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force -ErrorAction SilentlyContinue
 			Install-PackageProvider -Name NuGet -MinimumVersion 3.0.0.1 -Force -ErrorAction SilentlyContinue
-			Install-Module -Name PSWindowsUpdate -MinimumVersion 2.2.0.3 -Force -ErrorAction SilentlyContinue
+			Install-Module -Name PSWindowsUpdate -MinimumVersion 2.2.1.5 -Force -ErrorAction SilentlyContinue
+			Install-PSResource PSWindowsUpdate
+			Import-Module PSWindowsUpdate
 			RegMU
 			If (-Not (((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Major -ge "2") -and ((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Minor -ge "1"))) {
-				Write-Host "Auto install Failed, Attempting Manual installation of PSWUI 2.2.0.3"
+				Write-Host "Attempting Manual installation of PSWUI 2.2.1.5"
 				New-Item -ItemType Directory -Force -Path '$ITFolder' -ErrorAction Stop
-				(New-Object System.Net.WebClient).DownloadFile('https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.0.3.nupkg', '$ITFolder\pswindowsupdate.2.2.0.3.zip')
-				New-Item -ItemType Directory -Force -Path 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.0.3' -ErrorAction Stop
-				Expand-Archive -LiteralPath '$ITFolder\pswindowsupdate.2.2.0.3.zip' -DestinationPath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.0.3' -ErrorAction Stop
+				(New-Object System.Net.WebClient).DownloadFile('https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.1.5.nupkg', '$ITFolder\pswindowsupdate.2.2.1.5.zip')
+				New-Item -ItemType Directory -Force -Path 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.1.5' -ErrorAction Stop
+				Expand-Archive -LiteralPath '$ITFolder\pswindowsupdate.2.2.1.5.zip' -DestinationPath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.1.5' -ErrorAction Stop
 				Import-Module PSWindowsUpdate -ErrorAction Stop
 				RegMU
 			}

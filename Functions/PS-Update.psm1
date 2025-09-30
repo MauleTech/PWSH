@@ -968,7 +968,7 @@ Function Update-WindowsTo11 {
 			$SetupArgs = @(
 				"/auto", "Upgrade"
 				"/quiet"
-				#"/product", "server"
+				"/product", "server"
 				"/DynamicUpdate", "Disable"
 				"/ShowOOBE", "None"
 				"/Telemetry", "Disable"
@@ -1096,9 +1096,9 @@ Function Update-WindowsTo11 {
 				Write-Log "Fido script downloaded successfully"
 				
 				Write-Log "Generating Windows 11 download URL..."
-				$Win11URL = & $TempScript -Win "Windows 11" -Rel "24H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $True -Locale "en-US"
+				$Win11URL = & $TempScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $True -Locale "en-US"
 				If ($Null -eq $Win11URL) {
-					$Win11URL = "https://download.ambitionsgroup.com/Software/Win11_24H2_English_x64.iso"
+					$Win11URL = "https://download.ambitionsgroup.com/Software/Win11_25H2_English_x64.iso"
 				}
 				if (-not $Win11URL) {
 					throw "Failed to generate Windows 11 download URL"

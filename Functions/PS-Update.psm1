@@ -1083,7 +1083,7 @@ Function Update-WindowsTo11 {
 					Get-FileDownload -URL $URL -SaveToFolder $SaveFolder
 				}
 				& "$ITFolder\Downloads\FDM\FDM.exe" -y -o"$ITFolder\Downloads\FDM"
-				Get-FileDownload -URL "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/FDM/settings.ini" -SaveToFolder "$\Downloads\FDM\FDM\portabledata"
+				Get-FileDownload -URL "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/FDM/settings.ini" -SaveToFolder "$ITFolder\Downloads\FDM\FDM\portabledata"
 			}
 			# Download and use ISO method
 			try {
@@ -1107,7 +1107,7 @@ Function Update-WindowsTo11 {
 				Write-Log "Download URL generated successfully"
 				Write-Log "Downloading Windows 11 ISO..."
 				Stop-Process -Name fdm -Force -ErrorAction SilentlyContinue
-				& $ITFolder\Downloads\FDM\FDM\fdm.exe --url="$Win11URL" --hidden -s
+				& "$ITFolder\Downloads\FDM\FDM\fdm.exe" --url="$Win11URL" --hidden -s
 				Start-Sleep 10
 				If (!(Test-Path -Path "$ITFolder\Downloads\Win11_24H2_English_x64.*" -ErrorAction SilentlyContinue)) {
 					$Win11iso = (Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads")[-1]

@@ -40,11 +40,21 @@ function Set-ChocolateySources {
     # Get current sources
     $currentSources = choco source list --limit-output | ForEach-Object {
         $parts = $_ -split '\|'
+        
+        # Try to find priority - it should be a numeric value
+        $priority = 0
+        for ($i = 0; $i -lt $parts.Count; $i++) {
+            if ($parts[$i] -match '^\d+$') {
+                $priority = [int]$parts[$i]
+                break
+            }
+        }
+        
         [PSCustomObject]@{
             Name     = $parts[0]
             Source   = $parts[1]
-            Disabled = $parts[2] -eq 'true'
-            Priority = if ($parts[6]) { [int]$parts[6] } else { 0 }
+            Disabled = $parts[2] -eq 'True'
+            Priority = $priority
         }
     }
     

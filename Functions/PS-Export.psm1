@@ -192,7 +192,7 @@ function Export-ExchangeDistributionList {
 		foreach ($Member in $GroupMembers) {
 			# Check if member is a group
 			if ($Member.RecipientType -like "*Group*") {
-				Write-Host ("  " * $Level) + "└─ Processing nested group: $($Member.DisplayName)" -ForegroundColor Yellow
+				Write-Host ("  " * $Level) + "|-- Processing nested group: $($Member.DisplayName)" -ForegroundColor Yellow
 				
 				# Add the group itself
 				$Members += [PSCustomObject]@{

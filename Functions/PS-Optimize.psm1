@@ -38,12 +38,12 @@ Function Optimize-Powershell {
 		    }
 		    
 		    Get-HorizontalLine -ForeColor Cyan
-			Write-Host "| " -NoNewLine -BackgroundColor Black -ForegroundColor Red
+			Write-Host "| " -NoNewLine -BackgroundColor Black -ForegroundColor Cyan
 		    Write-Host "$env:USERNAME/$env:COMPUTERNAME" -NoNewLine -BackgroundColor Black -ForegroundColor DarkCyan
-			Write-Host " | " -NoNewLine -BackgroundColor Black -ForegroundColor Red
+			Write-Host " | " -NoNewLine -BackgroundColor Black -ForegroundColor Cyan
 			Write-Host "$(Get-Date -Format 'yyyy-MM-dd') $((Get-Date).ToString("HH:mm:ss"))" -NoNewLine -BackgroundColor Black -ForegroundColor Magenta
-			Write-Host " |" -BackgroundColor Black -ForegroundColor Red
-			Write-Host "| " -NoNewLine -BackgroundColor Black -ForegroundColor Red
+			Write-Host " |" -BackgroundColor Black -ForegroundColor Cyan
+			Write-Host "| " -NoNewLine -BackgroundColor Black -ForegroundColor Cyan
 			Write-Host "DIR: $($curdir.Path)" -BackgroundColor Black -ForegroundColor Yellow
 		    "[Command]: "
 		}
@@ -86,7 +86,7 @@ Function Optimize-Powershell {
 		}
 		
 		# Execute additional configurations
-		irm rb.gy/0kyfn2 | iex
+		irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 		
 		if ($PSScriptRoot -notlike "C:\Program Files (x86)\ITSPlatform\tmp\scripting\*") {
 		    Expand-Terminal

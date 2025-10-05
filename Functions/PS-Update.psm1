@@ -249,54 +249,54 @@ Function Update-Everything {
 }
 
 Function Global:Update-ITFunctions {
-    Write-Host "Updating IT Functions from GitHub..." -ForegroundColor Yellow
-    if (Test-Path $PWSHFolder) {
-        try {
-            Push-Location $PWSHFolder
-            
-            # Determine which git to use
-            $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
-            
-            # Show current status
-            Write-Host "Current status:" -ForegroundColor Yellow
-            & $GitCommand status --porcelain
-            
-            # Fetch all remotes
-            Write-Host "Fetching latest changes..." -ForegroundColor Yellow
-            & $GitCommand fetch origin
-            
-            # Check what branch we're on
-            $CurrentBranch = (& $GitCommand branch --show-current).Trim()
-            Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
-            
-            # Reset to the remote version of current branch
-            Write-Host "Resetting to origin/$CurrentBranch..." -ForegroundColor Yellow
-            & $GitCommand reset --hard "origin/$CurrentBranch"
-            
-            # Show final status
-            Write-Host "Updated successfully! Current commit:" -ForegroundColor Green
-            & $GitCommand log --oneline -1
-            
-            Pop-Location
-            
-            # Reload functions
-            $FunctionFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
-            $FunctionFiles | ForEach-Object {
-                If (Test-Path $_ -ErrorAction SilentlyContinue) {
-                    Import-Module $_ -Global -Force
-                }
-            }
-            Write-Host "IT Functions updated and reloaded successfully!" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "Failed to update functions: $_" -ForegroundColor Red
-            if ((Get-Location).Path -eq $PWSHFolder) {
-                Pop-Location
-            }
-        }
-    } else {
-        Write-Host "PowerShell Functions repository not found. Please run the main script again." -ForegroundColor Red
-    }
+	Write-Host "Updating IT Functions from GitHub..." -ForegroundColor Yellow
+	if (Test-Path $PWSHFolder) {
+		try {
+			Push-Location $PWSHFolder
+			
+			# Determine which git to use
+			$GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
+			
+			# Show current status
+			Write-Host "Current status:" -ForegroundColor Yellow
+			& $GitCommand status --porcelain
+			
+			# Fetch all remotes
+			Write-Host "Fetching latest changes..." -ForegroundColor Yellow
+			& $GitCommand fetch origin
+			
+			# Check what branch we're on
+			$CurrentBranch = (& $GitCommand branch --show-current).Trim()
+			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
+			
+			# Reset to the remote version of current branch
+			Write-Host "Resetting to origin/$CurrentBranch..." -ForegroundColor Yellow
+			& $GitCommand reset --hard "origin/$CurrentBranch"
+			
+			# Show final status
+			Write-Host "Updated successfully! Current commit:" -ForegroundColor Green
+			& $GitCommand log --oneline -1
+			
+			Pop-Location
+			
+			# Reload functions
+			$FunctionFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+			$FunctionFiles | ForEach-Object {
+				If (Test-Path $_ -ErrorAction SilentlyContinue) {
+					Import-Module $_ -Global -Force
+				}
+			}
+			Write-Host "IT Functions updated and reloaded successfully!" -ForegroundColor Green
+		}
+		catch {
+			Write-Host "Failed to update functions: $_" -ForegroundColor Red
+			if ((Get-Location).Path -eq $PWSHFolder) {
+				Pop-Location
+			}
+		}
+	} else {
+		Write-Host "PowerShell Functions repository not found. Please run the main script again." -ForegroundColor Red
+	}
 }
 
 
@@ -517,98 +517,98 @@ Function Update-O365Apps {
 }
 
 Function Update-PowerShellModule {
-    param (
-        [Parameter(Mandatory=$true)]
-        [string]$ModuleName
-    )
+	param (
+		[Parameter(Mandatory=$true)]
+		[string]$ModuleName
+	)
 
-    # Get the currently installed version of the module - handle multiple versions
-    $InstalledModules = Get-Module -ListAvailable -Name $ModuleName
-    if ($InstalledModules) {
-        # If multiple versions exist, get the highest one
-        if ($InstalledModules -is [array]) {
-            $ModVer = ($InstalledModules | Sort-Object Version -Descending)[0].Version
-        } else {
-            # Single module
-            $ModVer = $InstalledModules.Version
-        }
+	# Get the currently installed version of the module - handle multiple versions
+	$InstalledModules = Get-Module -ListAvailable -Name $ModuleName
+	if ($InstalledModules) {
+		# If multiple versions exist, get the highest one
+		if ($InstalledModules -is [array]) {
+			$ModVer = ($InstalledModules | Sort-Object Version -Descending)[0].Version
+		} else {
+			# Single module
+			$ModVer = $InstalledModules.Version
+		}
 
-        # Try to find the module in PSGallery
-        try {
-            $AvailableModule = Find-Module $ModuleName -Repository PSGallery -ErrorAction Stop
-            $AvailableModVer = $AvailableModule.Version
+		# Try to find the module in PSGallery
+		try {
+			$AvailableModule = Find-Module $ModuleName -Repository PSGallery -ErrorAction Stop
+			$AvailableModVer = $AvailableModule.Version
 
-            # Compare versions and proceed with update if needed
-            if ($ModVer -ne $AvailableModVer) {
-                # Inform user about the available update
-                Write-Host "$ModuleName has an update from $ModVer to $AvailableModVer.`nInstalling the update."
+			# Compare versions and proceed with update if needed
+			if ($ModVer -ne $AvailableModVer) {
+				# Inform user about the available update
+				Write-Host "$ModuleName has an update from $ModVer to $AvailableModVer.`nInstalling the update."
 
-                # Set PSGallery as trusted repository
-                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+				# Set PSGallery as trusted repository
+				Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
 
-                # Ensure NuGet package provider is installed
-                if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-                    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
-                }
+				# Ensure NuGet package provider is installed
+				if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+					Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
+				}
 
-                # Remove the module from current session if loaded
-                Remove-Module -Name $ModuleName -Force -ErrorAction SilentlyContinue
+				# Remove the module from current session if loaded
+				Remove-Module -Name $ModuleName -Force -ErrorAction SilentlyContinue
 
-                # Uninstall all existing versions of the module
-                Uninstall-Module -Name $ModuleName -AllVersions -Force -ErrorAction SilentlyContinue
+				# Uninstall all existing versions of the module
+				Uninstall-Module -Name $ModuleName -AllVersions -Force -ErrorAction SilentlyContinue
 
-                # Check if module files still exist and remove them forcefully if necessary
-                $RemainingModules = Get-Module -Name $ModuleName -ListAvailable
-                if ($RemainingModules) {
-                    foreach ($Module in $RemainingModules) {
-                        $ModPath = $Module.ModuleBase
+				# Check if module files still exist and remove them forcefully if necessary
+				$RemainingModules = Get-Module -Name $ModuleName -ListAvailable
+				if ($RemainingModules) {
+					foreach ($Module in $RemainingModules) {
+						$ModPath = $Module.ModuleBase
 
-                        # Check if Remove-PathForcefully is available
-                        if (Get-Command -Name Remove-PathForcefully -ErrorAction SilentlyContinue) {
-                            Remove-PathForcefully -Path $ModPath
-                        } else {
-                            # Fallback if Remove-PathForcefully is not available
-                            try {
-                                Remove-Item -Path $ModPath -Recurse -Force -ErrorAction Stop
-                            } catch {
-                                Write-Warning "Could not remove module path $ModPath. You may need to remove it manually."
+						# Check if Remove-PathForcefully is available
+						if (Get-Command -Name Remove-PathForcefully -ErrorAction SilentlyContinue) {
+							Remove-PathForcefully -Path $ModPath
+						} else {
+							# Fallback if Remove-PathForcefully is not available
+							try {
+								Remove-Item -Path $ModPath -Recurse -Force -ErrorAction Stop
+							} catch {
+								Write-Warning "Could not remove module path $ModPath. You may need to remove it manually."
 
-                                # Create command line arguments for forceful removal
-                                $ArgumentList = '/C "taskkill /IM powershell.exe /F & rd /s /q "' + $ModPath + '" & start powershell -NoExit -ExecutionPolicy Bypass'
+								# Create command line arguments for forceful removal
+								$ArgumentList = '/C "taskkill /IM powershell.exe /F & rd /s /q "' + $ModPath + '" & start powershell -NoExit -ExecutionPolicy Bypass'
 
-                                # Use cmd to force removal
-                                Start-Process "cmd.exe" -ArgumentList $ArgumentList
+								# Use cmd to force removal
+								Start-Process "cmd.exe" -ArgumentList $ArgumentList
 
-                                # Exit the function as we've launched a new PowerShell session
-                                return
-                            }
-                        }
-                    }
-                }
+								# Exit the function as we've launched a new PowerShell session
+								return
+							}
+						}
+					}
+				}
 
-                # Install the latest version of the module
-                Install-Module -Name $ModuleName -AllowClobber -Force -Scope CurrentUser
-            } else {
-                # Inform user if module is already up to date
-                Write-Host "$ModuleName is already up to date at version $AvailableModVer."
-            }
-        } catch {
-            Write-Error "Failed to find module $ModuleName in PSGallery. Error: $_"
-        }
-    } else {
-        Write-Host "Module $ModuleName is not currently installed. Installing from PSGallery..."
+				# Install the latest version of the module
+				Install-Module -Name $ModuleName -AllowClobber -Force -Scope CurrentUser
+			} else {
+				# Inform user if module is already up to date
+				Write-Host "$ModuleName is already up to date at version $AvailableModVer."
+			}
+		} catch {
+			Write-Error "Failed to find module $ModuleName in PSGallery. Error: $_"
+		}
+	} else {
+		Write-Host "Module $ModuleName is not currently installed. Installing from PSGallery..."
 
-        # Set PSGallery as trusted repository
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+		# Set PSGallery as trusted repository
+		Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
 
-        # Ensure NuGet package provider is installed
-        if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
-        }
+		# Ensure NuGet package provider is installed
+		if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+			Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
+		}
 
-        # Install the module
-        Install-Module -Name $ModuleName -AllowClobber -Force -Scope CurrentUser
-    }
+		# Install the module
+		Install-Module -Name $ModuleName -AllowClobber -Force -Scope CurrentUser
+	}
 }
 
 Function Update-PowershellModules {

@@ -767,11 +767,28 @@ Function Update-Windows {
 			Write-Host "PSWindowsUpdate is installed! Attempting Updates"
 			If ($NoDrivers -ne $True) {
 				Write-Host "Checking for DRIVER Updates..."
-				Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot -ErrorAction SilentlyContinue -Verbose
+				try {
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot -ErrorAction Stop -Verbose
+				}
+				catch {
+					Write-Warning "Driver update check failed. Running Reset-WUComponents..."
+					Reset-WUComponents
+					Write-Host "Retrying DRIVER Updates..."
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot -ErrorAction Stop -Verbose
+				}
 			}
+
 			If ($NoSoftware -ne $True) {
 				Write-Host "Checking for SOFTWARE Updates..."
-				Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot -ErrorAction SilentlyContinue -Verbose
+				try {
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot -ErrorAction Stop -Verbose
+				}
+				catch {
+					Write-Warning "Software update check failed. Running Reset-WUComponents..."
+					Reset-WUComponents
+					Write-Host "Retrying SOFTWARE Updates..."
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot -ErrorAction Stop -Verbose
+				}
 			}
 		} Else {
 			Write-Host "PSWindowsUpdate is failing to install, please investigate"

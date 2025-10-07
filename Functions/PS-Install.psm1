@@ -453,7 +453,7 @@ Function Install-SophosEndpoint {
 	Installs Sophos Endpoint Software
 	.Notes
 	For a list of site codes, go to:
-	https://github.com/MauleTech/PWSH/blob/main/Scripts/Sophos.csv
+	https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.csv
 	#>
 
 	###Require -RunAsAdministrator
@@ -465,7 +465,7 @@ Function Install-SophosEndpoint {
 	If (-not (Get-Service -Name "Sophos Endpoint Defense Service" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Sophos Endpoint."
 		$SiteConfigs = @()
-		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Sophos.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
+		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
 
 		# If a global variable 'SiteCode' exists, use it
 		If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {

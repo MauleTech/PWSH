@@ -179,50 +179,160 @@ Function Install-O2016STD([String] $MSPURL){
 		$Shortcut.Save()
 }
 
-Function Install-O365([String] $SiteCode = "Generic"){
-	Write-Host "Downloading MS Office"
-		Enable-SSL
-		New-Item -ItemType Directory -Force -Path "$ITFolder\O365"
-		(New-Object System.Net.WebClient).DownloadFile('https://download.ambitionsgroup.com/O365/setup.exe', '$ITFolder\O365\setup.exe')
-	Write-Host "Downloading MS Office config files"
-		$O365ConfigSource = "https://download.ambitionsgroup.com/Sites/" + $SiteCode + "/" + $SiteCode + "_O365_Config.xml"
-		$O365ConfigDest = "$ITFolder\O365\" + $SiteCode + "_O365_Config.xml"
-		(New-Object System.Net.WebClient).DownloadFile($O365ConfigSource, $O365ConfigDest)
-	Write-Host "Installing Office"
-		& $ITFolder\O365\setup.exe /configure $O365ConfigDest | Wait-Process
-	Write-Host "Placing Shortcuts"
-		If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE"){
-			$TargetFile = "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE"
-		} ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE"){
-			$TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE"
-		}
-		$ShortcutFile = "$env:Public\Desktop\Outlook.lnk"
-		$WScriptShell = New-Object -ComObject WScript.Shell
-		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
-		$Shortcut.TargetPath = $TargetFile
-		$Shortcut.Save()
+Function Install-O365 {
+    [CmdletBinding()]
+    param(
+        [String]$SiteCode = "Generic",
+        [String]$ConfigUrl,
+        [Switch]$SharedComputer
+    )
+    
+    Write-Host "Downloading MS Office"
+    Enable-SSL
+    
+    function Get-ODTUri {
+        <#
+        .SYNOPSIS
+        Get Download URL of latest Office 365 Deployment Tool (ODT)
+        #>
+        [CmdletBinding()]
+        [OutputType([string])]
+        param ()
+        
+        $url = "https://www.microsoft.com/en-us/download/details.aspx?id=49117"
+        
+        try {
+            $response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
+        }
+        catch {
+            throw "Failed to connect to ODT: $url with error $_."
+        }
+        
+        $ODTUri = $response.Links | Where-Object { 
+            $_.href -match "https://download\.microsoft\.com/download/.*/officedeploymenttool_.*\.exe" 
+        }
+        
+        if ($ODTUri) {
+            return $ODTUri.href
+        }
+        else {
+            throw "Could not find ODT download link on the page"
+        }
+    }
 
-		If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"){
-			$TargetFile = "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
-		} ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE"){
-			$TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE"
-		}
-		$ShortcutFile = "$env:Public\Desktop\Excel.lnk"
-		$WScriptShell = New-Object -ComObject WScript.Shell
-		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
-		$Shortcut.TargetPath = $TargetFile
-		$Shortcut.Save()
+    # Get the ODT Setup.exe URL
+    $downloadUrl = Get-ODTUri
+    Write-Host "ODT Download URL: $downloadUrl"
 
-		If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE"){
-			$TargetFile = "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE"
-		} ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE"){
-			$TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE"
-		}
-		$ShortcutFile = "$env:Public\Desktop\Word.lnk"
-		$WScriptShell = New-Object -ComObject WScript.Shell
-		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
-		$Shortcut.TargetPath = $TargetFile
-		$Shortcut.Save()
+    # Create the M365 folder if it doesn't exist
+    $m365Folder = Join-Path $ITFolder "M365"
+    if (-not (Test-Path $m365Folder)) {
+        New-Item -Path $m365Folder -ItemType Directory -Force | Out-Null
+        Write-Host "Created folder: $m365Folder"
+    }
+
+    # Download using your existing function
+    $odtPath = Join-Path $m365Folder "ODTSetup.exe"
+    Invoke-RestMethod -Uri $downloadUrl -OutFile $(Join-Path -Path $m365Folder -ChildPath ODTSetup.exe)
+
+    # Extract silently to the same folder
+    Write-Host "Extracting ODT to: $m365Folder"
+    Start-Process -FilePath $odtPath -ArgumentList "/quiet /extract:`"$m365Folder`"" -Wait
+
+    Write-Host "ODT extracted successfully to $m365Folder"
+
+    # Determine config file source and destination
+    Write-Host "Downloading MS Office config files"
+    if ($ConfigUrl) {
+        # Use the provided URL directly
+        $O365ConfigSource = $ConfigUrl
+        $configFileName = Split-Path $ConfigUrl -Leaf
+        if (-not $configFileName.EndsWith('.xml')) {
+            $configFileName = "O365_Config.xml"
+        }
+        $O365ConfigDest = Join-Path "$ITFolder\O365" $configFileName
+    }
+    else {
+        # Build URL from SiteCode
+        $O365ConfigSource = "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/M365/${SiteCode}_O365_Config.xml"
+        $O365ConfigDest = "$ITFolder\O365\${SiteCode}_O365_Config.xml"
+    }
+    
+    # Ensure O365 folder exists
+    $o365Folder = "$ITFolder\O365"
+    if (-not (Test-Path $o365Folder)) {
+        New-Item -Path $o365Folder -ItemType Directory -Force | Out-Null
+    }
+    
+    (New-Object System.Net.WebClient).DownloadFile($O365ConfigSource, $O365ConfigDest)
+    
+    # Modify config for SharedComputer if switch is enabled
+    if ($SharedComputer) {
+        Write-Host "Enabling SharedComputerLicensing in config file"
+        [xml]$configXml = Get-Content $O365ConfigDest
+        
+        # Find and update SharedComputerLicensing property
+        $sharedComputerProperty = $configXml.SelectNodes("//Property[@Name='SharedComputerLicensing']")
+        foreach ($property in $sharedComputerProperty) {
+            $property.Value = "1"
+        }
+        
+        # Save the modified config
+        $configXml.Save($O365ConfigDest)
+        Write-Host "SharedComputerLicensing enabled"
+    }
+    
+    Write-Host "Installing Office"
+    & $ITFolder\O365\setup.exe /configure $O365ConfigDest | Wait-Process
+    
+    Write-Host "Placing Shortcuts"
+    
+    # Outlook shortcut
+    If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE") {
+        $TargetFile = "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE"
+    } 
+    ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE") {
+        $TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE"
+    }
+    if ($TargetFile) {
+        $ShortcutFile = "$env:Public\Desktop\Outlook.lnk"
+        $WScriptShell = New-Object -ComObject WScript.Shell
+        $Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+        $Shortcut.TargetPath = $TargetFile
+        $Shortcut.Save()
+    }
+
+    # Excel shortcut
+    $TargetFile = $null
+    If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE") {
+        $TargetFile = "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
+    } 
+    ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE") {
+        $TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE"
+    }
+    if ($TargetFile) {
+        $ShortcutFile = "$env:Public\Desktop\Excel.lnk"
+        $WScriptShell = New-Object -ComObject WScript.Shell
+        $Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+        $Shortcut.TargetPath = $TargetFile
+        $Shortcut.Save()
+    }
+
+    # Word shortcut
+    $TargetFile = $null
+    If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE") {
+        $TargetFile = "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE"
+    } 
+    ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE") {
+        $TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE"
+    }
+    if ($TargetFile) {
+        $ShortcutFile = "$env:Public\Desktop\Word.lnk"
+        $WScriptShell = New-Object -ComObject WScript.Shell
+        $Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+        $Shortcut.TargetPath = $TargetFile
+        $Shortcut.Save()
+    }
 }
 
 Function Install-O365ProofPointConnectors {
@@ -398,79 +508,79 @@ Function Install-SophosEndpoint {
 }
 
 Function Install-UmbrellaDns {
-    [cmdletbinding()]
-    param(
-        [string]$Code #Shortcode of the site you want to install
-    )
-    
-    # Set variables if SiteCode exists in current scope
-    If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) { 
-        $Code = $SiteCode 
-        $Silent = $True 
-    }
-    
-    # Start job with a unique name for better tracking
-    $jobName = "UmbrellaDNSInstall-$(Get-Random)"
-    $job = Start-Job -Name $jobName -ArgumentList $SiteCode, $Code, $Silent -ScriptBlock {
-        param($SiteCode, $Code, $Silent)
-        
-        try {
-            # Download and import IT scripts
-            irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-            
-            # Run appropriate installation command
-            If (Get-Variable -Name Code -ErrorAction SilentlyContinue) {
-                Write-Host "Running Install-UmbrellaDNSasJob -Code $Code"
-                Install-UmbrellaDNSasJob -Code $Code
-            } Else {
-                Write-Host "Running Install-UmbrellaDNSasJob"
-                Install-UmbrellaDNSasJob
-            }
-            
-            # Return success status
-            return @{ Status = "Success"; Message = "Installation completed successfully" }
-        }
-        catch {
-            # Capture and return any errors
-            return @{ Status = "Error"; Message = $_.Exception.Message; ErrorDetails = $_ }
-        }
-    }
-    
-    Write-Host "Installation job started with ID: $($job.Id) and Name: $jobName"
-    
-    # Wait for the job with a timeout and properly handle it
-    try {
-        $completedJob = Wait-Job -Id $job.Id -Timeout 600 # 10-minute timeout
-        
-        if ($completedJob.State -eq "Completed") {
-            $jobResults = Receive-Job -Id $job.Id
-            Write-Host "Installation job completed successfully"
-            
-            # Output detailed results if available
-            if ($jobResults -is [hashtable] -and $jobResults.ContainsKey("Status")) {
-                Write-Host "Status: $($jobResults.Status)"
-                Write-Host "Message: $($jobResults.Message)"
-            } else {
-                # Display raw results if not in expected format
-                $jobResults
-            }
-        }
-        elseif ($completedJob.State -eq "Failed") {
-            Write-Error "Installation job failed. See error details below:"
-            Receive-Job -Id $job.Id
-        }
-        else {
-            Write-Warning "Job timed out or is in an unexpected state: $($completedJob.State)"
-            Write-Warning "You can check job status later with: Get-Job -Id $($job.Id)"
-        }
-    }
-    catch {
-        Write-Error "Error monitoring installation job: $_"
-    }
-    finally {
-        # Always clean up the job
-        Remove-Job -Id $job.Id -Force -ErrorAction SilentlyContinue
-    }
+	[cmdletbinding()]
+	param(
+		[string]$Code #Shortcode of the site you want to install
+	)
+	
+	# Set variables if SiteCode exists in current scope
+	If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) { 
+		$Code = $SiteCode 
+		$Silent = $True 
+	}
+	
+	# Start job with a unique name for better tracking
+	$jobName = "UmbrellaDNSInstall-$(Get-Random)"
+	$job = Start-Job -Name $jobName -ArgumentList $SiteCode, $Code, $Silent -ScriptBlock {
+		param($SiteCode, $Code, $Silent)
+		
+		try {
+			# Download and import IT scripts
+			irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+			
+			# Run appropriate installation command
+			If (Get-Variable -Name Code -ErrorAction SilentlyContinue) {
+				Write-Host "Running Install-UmbrellaDNSasJob -Code $Code"
+				Install-UmbrellaDNSasJob -Code $Code
+			} Else {
+				Write-Host "Running Install-UmbrellaDNSasJob"
+				Install-UmbrellaDNSasJob
+			}
+			
+			# Return success status
+			return @{ Status = "Success"; Message = "Installation completed successfully" }
+		}
+		catch {
+			# Capture and return any errors
+			return @{ Status = "Error"; Message = $_.Exception.Message; ErrorDetails = $_ }
+		}
+	}
+	
+	Write-Host "Installation job started with ID: $($job.Id) and Name: $jobName"
+	
+	# Wait for the job with a timeout and properly handle it
+	try {
+		$completedJob = Wait-Job -Id $job.Id -Timeout 600 # 10-minute timeout
+		
+		if ($completedJob.State -eq "Completed") {
+			$jobResults = Receive-Job -Id $job.Id
+			Write-Host "Installation job completed successfully"
+			
+			# Output detailed results if available
+			if ($jobResults -is [hashtable] -and $jobResults.ContainsKey("Status")) {
+				Write-Host "Status: $($jobResults.Status)"
+				Write-Host "Message: $($jobResults.Message)"
+			} else {
+				# Display raw results if not in expected format
+				$jobResults
+			}
+		}
+		elseif ($completedJob.State -eq "Failed") {
+			Write-Error "Installation job failed. See error details below:"
+			Receive-Job -Id $job.Id
+		}
+		else {
+			Write-Warning "Job timed out or is in an unexpected state: $($completedJob.State)"
+			Write-Warning "You can check job status later with: Get-Job -Id $($job.Id)"
+		}
+	}
+	catch {
+		Write-Error "Error monitoring installation job: $_"
+	}
+	finally {
+		# Always clean up the job
+		Remove-Job -Id $job.Id -Force -ErrorAction SilentlyContinue
+	}
 }
 
 Function Install-UmbrellaDNSasJob {

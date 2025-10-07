@@ -255,13 +255,12 @@ Function Install-O365 {
     else {
         # Build URL from SiteCode
         $O365ConfigSource = "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/M365/${SiteCode}_O365_Config.xml"
-        $O365ConfigDest = "$ITFolder\O365\${SiteCode}_O365_Config.xml"
+        $O365ConfigDest = "$m365Folder\${SiteCode}_O365_Config.xml"
     }
     
     # Ensure O365 folder exists
-    $o365Folder = "$ITFolder\O365"
-    if (-not (Test-Path $o365Folder)) {
-        New-Item -Path $o365Folder -ItemType Directory -Force | Out-Null
+    if (-not (Test-Path $m365Folder)) {
+        New-Item -Path $m365Folder -ItemType Directory -Force | Out-Null
     }
     
     (New-Object System.Net.WebClient).DownloadFile($O365ConfigSource, $O365ConfigDest)
@@ -283,7 +282,7 @@ Function Install-O365 {
     }
     
     Write-Host "Installing Office"
-    & $ITFolder\O365\setup.exe /configure $O365ConfigDest | Wait-Process
+    & $m365Folder\setup.exe /configure $O365ConfigDest | Wait-Process
     
     Write-Host "Placing Shortcuts"
     

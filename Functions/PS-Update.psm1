@@ -234,8 +234,7 @@ Function Update-Everything {
 	}
 	$delay = $null
 	If (Get-Command winget -ErrorAction SilentlyContinue) {
-		winget source update
-		winget upgrade --all -h
+		Update-PSWinGetPackages
 	} Else {
 		If (Get-Command choco -ErrorAction SilentlyContinue) {choco upgrade all -y}
 	}

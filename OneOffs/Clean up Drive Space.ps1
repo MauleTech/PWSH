@@ -425,6 +425,8 @@ $PathsToDelete = @(
 	#Quickbooks
 	(Join-Path -Path $Env:ProgramData "Intuit\QuickBooks*\Components\DownloadQB*")
 	(Join-Path -Path $Env:ProgramData "Intuit\QuickBooks*\Components\QBUpdateCache")
+	#Worldox
+	(Join-Path -Path $LocalAppData -ChildPath "Worldox\ZMS\*")
 )
 
 $FoldersToDeDuplicate = @(

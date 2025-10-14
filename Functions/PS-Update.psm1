@@ -52,12 +52,20 @@ Function Update-DellPackages {
 	<#
 	.SYNOPSIS
 		Uses the CLI version of Dell Command | Update to install any missing drivers/firmwares/Bios and update existing ones.
-		There are no parameters to use.
+	.PARAMETER EnableAdvancedDriverRestore
+		Enables Advanced Driver Restore feature in Dell Command Update, allowing restoration to any previously installed driver version.
 	.LINK
 		https://www.dell.com/support/kbdoc/en-us/000177325/dell-command-update
 	.EXAMPLE
 		Update-DellPackages
+	.EXAMPLE
+		Update-DellPackages -EnableAdvancedDriverRestore
 	#>
+	[CmdletBinding()]
+	Param(
+		[Parameter()]
+		[switch]$EnableAdvancedDriverRestore
+	)
 
 	Write-Host "Dell Updates"
 		$Manufact = (Get-CimInstance -Class Win32_ComputerSystem).Manufacturer
@@ -67,7 +75,7 @@ Function Update-DellPackages {
 				choco upgrade chocolatey -y
 			} Else { Install-Choco }
 
-						Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
+			Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
 			$DCUx86 = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
 			$DCUx64 = Join-Path -Path $Env:ProgramFiles -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
 
@@ -103,39 +111,47 @@ Function Update-DellPackages {
 					}
 				}
 			}
-					#Compare version numbers of any remaining installed version.
-					$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
-					If (-not $DCUInstalledVersion -and (Test-Path $DCUx86 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx86).VersionInfo.ProductVersion}
-					If (-not $DCUInstalledVersion -and (Test-Path $DCUx64 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx64).VersionInfo.ProductVersion}
-					If (Get-Command winget -ErrorAction SilentlyContinue) {
-						$DCUAvailableVersion = $(winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:").Line.Replace("Version: ","")
-					} Else {
-						$DCUAvailableVersion = choco search DellCommandUpdate --exact #Gets all results
-						$DCUAvailableVersion = ($DCUAvailableVersion | Select-String -Pattern "DellCommandUpdate " -SimpleMatch).Line #Isolates the desired result
-						$DCUAvailableVersion = $DCUAvailableVersion.split(" ",[System.StringSplitOptions]::RemoveEmptyEntries)[1] #Isolates the version number
-					}
+			#Compare version numbers of any remaining installed version.
+			$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
+			If (-not $DCUInstalledVersion -and (Test-Path $DCUx86 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx86).VersionInfo.ProductVersion}
+			If (-not $DCUInstalledVersion -and (Test-Path $DCUx64 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx64).VersionInfo.ProductVersion}
+			If (Get-Command winget -ErrorAction SilentlyContinue) {
+				$DCUAvailableVersion = $(winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:").Line.Replace("Version: ","")
+			} Else {
+				$DCUAvailableVersion = choco search DellCommandUpdate --exact #Gets all results
+				$DCUAvailableVersion = ($DCUAvailableVersion | Select-String -Pattern "DellCommandUpdate " -SimpleMatch).Line #Isolates the desired result
+				$DCUAvailableVersion = $DCUAvailableVersion.split(" ",[System.StringSplitOptions]::RemoveEmptyEntries)[1] #Isolates the version number
+			}
 
-				If (-not $DCUInstalledVersion) {
-					Write-Host "'Dell Command | Update' is not installed, installing now."
-					Install-DCU
+			If (-not $DCUInstalledVersion) {
+				Write-Host "'Dell Command | Update' is not installed, installing now."
+				Install-DCU
 
-				}  ElseIf ($DCUAvailableVersion -notmatch $DCUInstalledVersion) {
-					Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
+			}  ElseIf ($DCUAvailableVersion -notmatch $DCUInstalledVersion) {
+				Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
 
-					#Remove any programs listed through "Add and remove programs"
-					Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
-					Install-DCU
+				#Remove any programs listed through "Add and remove programs"
+				Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
+				Install-DCU
 
-				} ElseIf ($DCUInstalledVersion -eq $DCUAvailableVersion) {
-					Write-Host -ForegroundColor Green "'Dell Command | Update' is current."
-				}
+			} ElseIf ($DCUInstalledVersion -eq $DCUAvailableVersion) {
+				Write-Host -ForegroundColor Green "'Dell Command | Update' is current."
+			}
 
 			#Configure and run Dell Command Update
 			If (Test-Path $DCUx86) {
 				& $DCUx86 /configure -autoSuspendBitLocker=enable
+				If ($EnableAdvancedDriverRestore) {
+					Write-Host "Enabling Advanced Driver Restore..."
+					& $DCUx86 /configure -advancedDriverRestore=enable
+				}
 				& $DCUx86 /applyUpdates -reboot=disable
 			} ElseIf (Test-Path $DCUx64) {
 				& $DCUx64 /configure -autoSuspendBitLocker=enable
+				If ($EnableAdvancedDriverRestore) {
+					Write-Host "Enabling Advanced Driver Restore..."
+					& $DCUx64 /configure -advancedDriverRestore=enable
+				}
 				& $DCUx64 /applyUpdates -reboot=disable
 			} Else { Write-Error "Dell Command Update CLI not found."}
 

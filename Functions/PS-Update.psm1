@@ -1157,7 +1157,7 @@ Function Update-WindowsTo11 {
 					Start-Sleep 30
 					
 					# Try to find the ISO file
-					$Win11iso = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64.iso" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+					$Win11iso = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64*" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
 					
 					if ($Win11iso -and (Test-Path $Win11iso)) {
 						# ISO exists, check if download is still in progress

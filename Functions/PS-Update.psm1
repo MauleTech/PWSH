@@ -1118,46 +1118,69 @@ Function Update-WindowsTo11 {
 			}
 			# Download and use ISO method
 			try {
-				# Get Windows 11 download URL using Fido
-				Write-Log "Downloading Fido script for Windows 11 URL generation..."
-				$TempScript = [System.IO.Path]::GetTempFileName() + ".ps1"
-				$TempScriptToCleanup = $TempScript
+				# Check for existing Windows 11 ISO over 4GB
+				Write-Log "Checking for existing Windows 11 ISO in $ITFolder\Downloads..."
+				$ExistingISOs = Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11*.iso" -ErrorAction SilentlyContinue | 
+					Where-Object { $_.Length -gt 4GB } | 
+					Sort-Object LastWriteTime -Descending
 				
-				Invoke-RestMethod -Uri "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1" -OutFile $TempScript -ErrorAction Stop
-				Write-Log "Fido script downloaded successfully"
-				
-				Write-Log "Generating Windows 11 download URL..."
-				$Win11URL = & $TempScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $True -Locale "en-US"
-				If ($Null -eq $Win11URL) {
-					$Win11URL = "https://download.ambitionsgroup.com/Software/Win11_25H2_English_x64.iso"
-				}
-				if (-not $Win11URL) {
-					throw "Failed to generate Windows 11 download URL"
-				}
-				
-				Write-Log "Download URL generated successfully"
-				Write-Log "Downloading Windows 11 ISO..."
-				Stop-Process -Name fdm -Force -ErrorAction SilentlyContinue
-				& "$ITFolder\Downloads\FDM\FDM\fdm.exe" --url="$Win11URL" --hidden -s
-				Start-Sleep 10
-				If (!(Test-Path -Path "$ITFolder\Downloads\Win11_24H2_English_x64.*" -ErrorAction SilentlyContinue)) {
-					$Win11iso = (Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads")[-1]
-				} Else {
-					$Win11iso = "$ITFolder\Downloads\Win11_24H2_English_x64.iso"
-					Write-Host "Download started. Monitoring file size..."
-
-					# Define the file path
-					$DownloadTempFile = Join-Path $ITFolder "Downloads\Win11_24H2_English_x64.iso.fdmdownload"
-
-					# Wait until the file is deleted
-					Write-Host "Waiting for temporary download file to be deleted..."
-					while (Test-Path $DownloadTempFile) {
-						Start-Sleep -Seconds 5
+				if ($ExistingISOs -and $ExistingISOs.Count -gt 0) {
+					$Win11iso = $ExistingISOs[0].FullName
+					$IsoSizeGB = [math]::Round($ExistingISOs[0].Length / 1GB, 2)
+					Write-Log "Found existing Windows 11 ISO: $Win11iso ($IsoSizeGB GB)" -Level "SUCCESS"
+					Write-Log "Skipping download and using existing ISO"
+					# Don't set $IsoToCleanup since we want to keep existing ISO
+				} else {
+					Write-Log "No suitable existing ISO found. Proceeding with download..."
+					
+					# Get Windows 11 download URL using Fido
+					Write-Log "Downloading Fido script for Windows 11 URL generation..."
+					$TempScript = [System.IO.Path]::GetTempFileName() + ".ps1"
+					$TempScriptToCleanup = $TempScript
+					
+					Invoke-RestMethod -Uri "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1" -OutFile $TempScript -ErrorAction Stop
+					Write-Log "Fido script downloaded successfully"
+					
+					Write-Log "Generating Windows 11 download URL..."
+					$Win11URL = & $TempScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $True -Locale "en-US"
+					If ($Null -eq $Win11URL) {
+						$Win11URL = "https://download.ambitionsgroup.com/Software/Win11_25H2_English_x64.iso"
 					}
-					Write-Host "Temporary file deleted. Continuing..."
+					if (-not $Win11URL) {
+						throw "Failed to generate Windows 11 download URL"
+					}
+					
+					Write-Log "Download URL generated successfully"
+					Write-Log "Downloading Windows 11 ISO..."
 					Stop-Process -Name fdm -Force -ErrorAction SilentlyContinue
+					& "$ITFolder\Downloads\FDM\FDM\fdm.exe" --url="$Win11URL" --hidden -s
+					Start-Sleep 30
+					
+					# Try to find the ISO file
+					$Win11iso = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64.iso" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+					
+					if ($Win11iso -and (Test-Path $Win11iso)) {
+						# ISO exists, check if download is still in progress
+						$DownloadTempFile = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64.iso.fdmdownload" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+						
+						if ($DownloadTempFile -and (Test-Path $DownloadTempFile)) {
+							Write-Log "Download in progress. Monitoring until completion..."
+							# Wait until the temp file is deleted
+							while (Test-Path $DownloadTempFile) {
+								Start-Sleep -Seconds 5
+							}
+							Write-Log "Download completed" -Level "SUCCESS"
+							Stop-Process -Name fdm -Force -ErrorAction SilentlyContinue
+						} else {
+							Write-Log "Download already completed" -Level "SUCCESS"
+						}
+					} else {
+						# ISO not found, use fallback download method
+						Write-Log "ISO not found with FDM, using fallback download method..."
+						$Win11iso = (Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads")[-1]
+					}
+					$IsoToCleanup = $Win11iso
 				}
-				$IsoToCleanup = $Win11iso
 				
 				if (-not (Test-Path $Win11iso)) {
 					throw "ISO download failed or file not found: $Win11iso"
@@ -1216,19 +1239,6 @@ Function Update-WindowsTo11 {
 		Write-Log "Script execution completed. Log saved to: $LogFile"
 	}
 	#endregion
-}
-
-If (Get-Module -Name ATGPS -ErrorAction SilentlyContinue){
-	# List imported functions from ATGPS
-	Write-Host `n====================================================
-	Write-Host "The below functions are now loaded and ready to use:"
-	Write-Host ====================================================
-
-	Get-Command -Module ATGPS | Format-Wide -Column 3
-
-	Write-Host ====================================================
-	Write-Host "Type: 'Help <function name> -Detailed' for more info"
-	Write-Host ====================================================
 }
 
 

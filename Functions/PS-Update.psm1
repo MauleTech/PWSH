@@ -1074,7 +1074,7 @@ Function Update-WindowsTo11 {
 	try {
 		# Define network paths to check (in priority order)
 		$NetworkPaths = @(
-			"\\zeus.modrall.net\Win11Install$\Win11_24H2_English_x64\setup.exe",
+			"\\zeus.modrall.net\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
 			"\\dc0\Win11_24H2$\setup.exe",
 			"\\fileserver\Images\Win11\setup.exe"
 		)

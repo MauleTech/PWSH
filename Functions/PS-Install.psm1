@@ -61,7 +61,7 @@ Function Install-Action1 {
 
 Function Install-AppDefaults {
 	Write-Host "Downloading App Defaults"
-	New-Item -ItemType Directory -Force -Path $ITFolder\ITS247Agent
+	New-Item -ItemType Directory -Force -Path $ITFolder
 	(New-Object System.Net.WebClient).DownloadFile('https://download.ambitionsgroup.com/AppDefaults.xml', '$ITFolder\AppDefaults.xml')
 	Write-Host "Deploying App Defaults"
 	Dism.exe /online /import-defaultappassociations:'$ITFolder\AppDefaults.xml'

@@ -1101,12 +1101,7 @@ Function Update-WindowsTo11 {
 
 				# Define the URLs to download
 				$URLs = @(
-					'https://github.com/MauleTech/BinCache/raw/refs/heads/main/Utilities/FDM/FDM.exe',
-					'https://github.com/MauleTech/BinCache/raw/refs/heads/main/Utilities/FDM/FDM.7z.001',
-					'https://github.com/MauleTech/BinCache/raw/refs/heads/main/Utilities/FDM/FDM.7z.002',
-					'https://github.com/MauleTech/BinCache/raw/refs/heads/main/Utilities/FDM/FDM.7z.003',
-					'https://github.com/MauleTech/BinCache/raw/refs/heads/main/Utilities/FDM/FDM.7z.004',
-					'https://github.com/MauleTech/BinCache/raw/refs/heads/main/Utilities/FDM/FDM.7z.005'
+					'https://files.mauletech.com/files/Utilities/FDM.exe'
 				)
 
 				# Download each file

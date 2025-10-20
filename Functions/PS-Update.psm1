@@ -1166,6 +1166,7 @@ Function Update-WindowsTo11 {
 							}
 							Write-Log "Download completed" -Level "SUCCESS"
 							Stop-Process -Name fdm -Force -ErrorAction SilentlyContinue
+							$Win11iso = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64*" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
 						} else {
 							Write-Log "Download already completed" -Level "SUCCESS"
 						}

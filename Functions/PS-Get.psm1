@@ -109,52 +109,52 @@ Function Get-ADUserPassExpirations {
 }
 
 Function Get-ITFunctions {
-    param
-    (
-        [Parameter(Mandatory = $false)]
-        [switch] $Force
-    )
-    
-    If ($Force) {
-        Write-Host "-Force specified. Force loading latest functions."
-        Update-ITFunctions
-    }
-    
-    If (-not (Get-Module -Name "PS-*" -ErrorAction SilentlyContinue)) {
-        $progressPreference = 'silentlyContinue'
-        irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-    }
-    
-    # Get all commands from PS-* modules
-    $commands = Get-Command -Module "PS-*" | Sort-Object Name
-    
-    If ($commands) {
-        # Group commands by verb
-        $groupedCommands = $commands | Group-Object { $_.Name.Split('-')[0] } | Sort-Object Name
-        
-        Write-Host "`n===================================================="
-        Write-Host "The below functions are now loaded and ready to use:"
-        Write-Host "===================================================="
-        
-        # Display each verb group
-        foreach ($verbGroup in $groupedCommands) {
-            Write-Host "`n[$($verbGroup.Name)]" -ForegroundColor Cyan
-            Write-Host ("-" * ($verbGroup.Name.Length + 2)) -ForegroundColor DarkGray
-            
-            # List functions for each verb group
-            $verbGroup.Group | ForEach-Object { 
-                Write-Host "  $($_.Name)" 
-            }
-        }
-        
-        Write-Host "`n===================================================="
-        Write-Host "Total Functions: $($commands.Count)" -ForegroundColor Green
-        Write-Host "Type: 'Help <function name> -Detailed' for more info"
-        Write-Host "===================================================="
-    }
-    else {
-        Write-Host "No functions found in PS-* modules." -ForegroundColor Yellow
-    }
+	param
+	(
+		[Parameter(Mandatory = $false)]
+		[switch] $Force
+	)
+	
+	If ($Force) {
+		Write-Host "-Force specified. Force loading latest functions."
+		Update-ITFunctions
+	}
+	
+	If (-not (Get-Module -Name "PS-*" -ErrorAction SilentlyContinue)) {
+		$progressPreference = 'silentlyContinue'
+		irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+	}
+	
+	# Get all commands from PS-* modules
+	$commands = Get-Command -Module "PS-*" | Sort-Object Name
+	
+	If ($commands) {
+		# Group commands by verb
+		$groupedCommands = $commands | Group-Object { $_.Name.Split('-')[0] } | Sort-Object Name
+		
+		Write-Host "`n===================================================="
+		Write-Host "The below functions are now loaded and ready to use:"
+		Write-Host "===================================================="
+		
+		# Display each verb group
+		foreach ($verbGroup in $groupedCommands) {
+			Write-Host "`n[$($verbGroup.Name)]" -ForegroundColor Cyan
+			Write-Host ("-" * ($verbGroup.Name.Length + 2)) -ForegroundColor DarkGray
+			
+			# List functions for each verb group
+			$verbGroup.Group | ForEach-Object { 
+				Write-Host "  $($_.Name)" 
+			}
+		}
+		
+		Write-Host "`n===================================================="
+		Write-Host "Total Functions: $($commands.Count)" -ForegroundColor Green
+		Write-Host "Type: 'Help <function name> -Detailed' for more info"
+		Write-Host "===================================================="
+	}
+	else {
+		Write-Host "No functions found in PS-* modules." -ForegroundColor Yellow
+	}
 }
 
 function Get-BitLockerKey {
@@ -1376,6 +1376,40 @@ Function Get-UserProfileSpace {
 	} #If (ActiveProfiles)
 
 	Return $BigObject
+}
+
+Function Get-VMHostName {
+	<#
+	.SYNOPSIS
+		Retrieves the Hyper-V host name from a VM's registry.
+	.DESCRIPTION
+		Checks the registry key that contains the physical host name for a Hyper-V virtual machine.
+	.EXAMPLE
+		Get-VMHostName
+	#>
+	[CmdletBinding()]
+	param()
+	
+	try {
+		$regPath = "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters"
+		
+		if (Test-Path $regPath) {
+			$hostName = Get-ItemProperty -Path $regPath -Name "PhysicalHostName" -ErrorAction SilentlyContinue
+			
+			if ($hostName) {
+				return $hostName.PhysicalHostName
+			} else {
+				Write-Warning "PhysicalHostName value not found in registry."
+				return $null
+			}
+		} else {
+			Write-Warning "This does not appear to be a Hyper-V virtual machine."
+			return $null
+		}
+	} catch {
+		Write-Error "Failed to retrieve host information: $_"
+		return $null
+	}
 }
 
 Function Get-VSSWriter {

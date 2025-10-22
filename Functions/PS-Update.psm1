@@ -1139,7 +1139,7 @@ Function Update-WindowsTo11 {
 					Write-Log "Generating Windows 11 download URL..."
 					$Win11URL = & $TempScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $True -Locale "en-US"
 					If ($Null -eq $Win11URL) {
-						$Win11URL = "https://files.mauletech.com/files/ISOs/Win11_25H2_English_x64.iso"
+						$Win11URL = "https://files.mauletech.com/files/ISOs/Win11_25H2_English_x64.iso?dl"
 					}
 					if (-not $Win11URL) {
 						throw "Failed to generate Windows 11 download URL"

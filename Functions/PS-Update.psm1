@@ -890,9 +890,19 @@ Function Update-WindowsTo11 {
 		$elig.TPM_Present = $true
 		$elig.TPM_Ready   = $tpm.TpmReady
 		# Windows 11 requires TPM 2.0
-		# If Get-Tpm returns SpecVersion, check contains "2.0"
-		$spec = ($tpm.SpecVersion -join ',')
-		$elig.TPM_VersionOK = $spec -match '2\.0'
+		# Check ManufacturerVersion major version (TPM 2.0 = version starts with "2")
+		if ($tpm.ManufacturerVersion) {
+			$elig.TPM_VersionOK = $tpm.ManufacturerVersion -match '^2\.'
+		}
+		# Fallback: Check SpecVersion if ManufacturerVersion not available
+		elseif ($tpm.SpecVersion) {
+			$specStr = if ($tpm.SpecVersion -is [array]) { $tpm.SpecVersion[0] } else { $tpm.SpecVersion }
+			$elig.TPM_VersionOK = $specStr -match '^2\.' -or $specStr -match '2\.0'
+		}
+		# Final fallback: If TpmReady is true, assume TPM 2.0 on modern systems
+		else {
+			$elig.TPM_VersionOK = $tpm.TpmReady
+		}
 	}
 	} catch { }
 
@@ -911,7 +921,24 @@ Function Update-WindowsTo11 {
 	Write-Warn "This script is intended to upgrade Windows 10 to Windows 11. Current OS: $($elig.OS)"
 	}
 	if ($elig.RAM_GB -lt 4)            { Write-Warn "RAM under 4 GB may block the upgrade." }
-	if ($elig.FreeSysDrive_GB -lt 30)  { Write-Warn "Low free space on system drive (< 30 GB). Consider cleanup before upgrade." }
+
+	# Check free space and run cleanup if needed
+	if ($elig.FreeSysDrive_GB -lt 32) {
+		Write-Warn "Low free space on system drive ($($elig.FreeSysDrive_GB) GB). Running cleanup..."
+		try {
+			if (Get-Command Start-CleanupOfSystemDrive -ErrorAction SilentlyContinue) {
+				Start-CleanupOfSystemDrive
+				# Recheck free space after cleanup
+				$elig.FreeSysDrive_GB = [math]::Round((Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free/1GB,1)
+				Write-Info "Free space after cleanup: $($elig.FreeSysDrive_GB) GB"
+			} else {
+				Write-Warn "Start-CleanupOfSystemDrive command not found. Please ensure sufficient space manually."
+			}
+		} catch {
+			Write-Warn "Cleanup failed: $($_.Exception.Message). Please ensure sufficient space manually."
+		}
+	}
+
 	if (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK) { Write-Warn "TPM 2.0 not detected. Windows 11 may not be offered." }
 	if (-not $elig.SecureBoot)         { Write-Warn "Secure Boot not detected. Windows 11 may not be offered." }
 
@@ -1234,8 +1261,17 @@ Function Update-WindowsTo11 {
 		Write-Log "CRITICAL ERROR in main execution: $($_.Exception.Message)" -Level "ERROR"
 	} finally {
 		# Cleanup temporary files
-		Cleanup-TempFiles -IsoPath $IsoToCleanup -TempScript $TempScriptToCleanup
-		
+		# Only cleanup ISO if setup was successful; preserve it on failure for retry
+		if ($SetupSuccessful) {
+			Cleanup-TempFiles -IsoPath $IsoToCleanup -TempScript $TempScriptToCleanup
+		} else {
+			# Only cleanup temp script, keep ISO for retry
+			Cleanup-TempFiles -IsoPath $null -TempScript $TempScriptToCleanup
+			if ($IsoToCleanup) {
+				Write-Log "Preserving ISO file for retry: $IsoToCleanup" -Level "WARNING"
+			}
+		}
+
 		# Final status
 		if ($SetupSuccessful) {
 			Write-Log "Windows 11 setup process completed successfully!" -Level "SUCCESS"

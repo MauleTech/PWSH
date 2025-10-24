@@ -1261,8 +1261,17 @@ Function Update-WindowsTo11 {
 		Write-Log "CRITICAL ERROR in main execution: $($_.Exception.Message)" -Level "ERROR"
 	} finally {
 		# Cleanup temporary files
-		Cleanup-TempFiles -IsoPath $IsoToCleanup -TempScript $TempScriptToCleanup
-		
+		# Only cleanup ISO if setup was successful; preserve it on failure for retry
+		if ($SetupSuccessful) {
+			Cleanup-TempFiles -IsoPath $IsoToCleanup -TempScript $TempScriptToCleanup
+		} else {
+			# Only cleanup temp script, keep ISO for retry
+			Cleanup-TempFiles -IsoPath $null -TempScript $TempScriptToCleanup
+			if ($IsoToCleanup) {
+				Write-Log "Preserving ISO file for retry: $IsoToCleanup" -Level "WARNING"
+			}
+		}
+
 		# Final status
 		if ($SetupSuccessful) {
 			Write-Log "Windows 11 setup process completed successfully!" -Level "SUCCESS"

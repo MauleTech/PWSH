@@ -857,6 +857,19 @@ Function Update-WindowsTo11 {
 	### Start transcript
 	try { Start-Transcript -Path $LogPath -Force | Out-Null } catch { }
 
+	### 0) Check if already on Windows 11 25H2 or newer
+	$os = Get-CimInstance Win32_OperatingSystem
+	$buildNumber = [int]($os.BuildNumber)
+	$osCaption = $os.Caption
+
+	# Windows 11 25H2 is build 26100 or higher
+	if ($osCaption -match 'Windows 11' -and $buildNumber -ge 26100) {
+		Write-Info "System is already running Windows 11 25H2 or newer (Build $buildNumber)"
+		Write-Info "No upgrade needed. Exiting..."
+		try { Stop-Transcript | Out-Null } catch { }
+		return
+	}
+
 	### 1) Quick eligibility checks (non-bypass)
 	$elig = [ordered]@{
 	OS               = (Get-CimInstance Win32_OperatingSystem).Caption

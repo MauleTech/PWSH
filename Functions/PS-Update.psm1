@@ -48,10 +48,12 @@ Function Update-DnsServerRootHints{
 
 		# Create comparison table
 		Write-Host "`nDNS Root Hints Comparison:" -ForegroundColor Yellow
-		Write-Host ("=" * 80) -ForegroundColor Yellow
 
 		$comparisonTable = @()
 		$changesNeeded = $false
+		$upToDate = @()
+		$needsUpdate = @()
+		$missing = @()
 
 		# Compare all root hints
 		foreach ($server in ($latestRootHints.Keys | Sort-Object)) {
@@ -59,12 +61,15 @@ Function Update-DnsServerRootHints{
 			$currentIP = $currentRootHints[$server]
 
 			$status = if ($currentIP -eq $latestIP) {
+				$upToDate += $server
 				"Up to date"
 			} elseif ($null -eq $currentIP) {
 				$changesNeeded = $true
+				$missing += $server
 				"Missing"
 			} else {
 				$changesNeeded = $true
+				$needsUpdate += $server
 				"Needs update"
 			}
 
@@ -76,19 +81,20 @@ Function Update-DnsServerRootHints{
 			}
 		}
 
-		# Display the comparison table with color coding
-		foreach ($row in $comparisonTable) {
-			$color = switch ($row.Status) {
-				"Up to date" { "Green" }
-				"Needs update" { "Yellow" }
-				"Missing" { "Red" }
-				default { "White" }
-			}
+		# Display the comparison table using Format-Table
+		$comparisonTable | Format-Table -AutoSize
 
-			Write-Host ("{0,-25} | Current: {1,-15} | Latest: {2,-15} | " -f $row.NameServer, $row.CurrentIP, $row.LatestIP) -NoNewline
-			Write-Host $row.Status -ForegroundColor $color
+		# Display summary with color coding
+		Write-Host "Summary:" -ForegroundColor Yellow
+		if ($upToDate.Count -gt 0) {
+			Write-Host "  Up to date: $($upToDate.Count) root hint(s)" -ForegroundColor Green
 		}
-		Write-Host ("=" * 80) -ForegroundColor Yellow
+		if ($needsUpdate.Count -gt 0) {
+			Write-Host "  Needs update: $($needsUpdate.Count) root hint(s) - $($needsUpdate -join ', ')" -ForegroundColor Yellow
+		}
+		if ($missing.Count -gt 0) {
+			Write-Host "  Missing: $($missing.Count) root hint(s) - $($missing -join ', ')" -ForegroundColor Red
+		}
 
 		# Only make changes if needed
 		if ($changesNeeded) {

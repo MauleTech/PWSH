@@ -15,34 +15,105 @@ Function Update-DnsServerRootHints{
 	#>
 	If (Get-Service -DisplayName "DNS Server" -ErrorAction SilentlyContinue) {
 		$url = "https://www.internic.net/domain/named.root"
-		$hashtable = @{}
+		$latestRootHints = @{}
 
 		# Download the contents of the URL
+		Write-Host "Fetching latest root hints from www.internic.net..." -ForegroundColor Cyan
 		$content = Invoke-WebRequest -Uri $url
 
 		# Split the content into lines
-		$lines = $content.Content.Split("`r`n") | Where-Object {$_ -notmatch ";|NS|AAAA"}  # Use `"`r`n" for Windows-style newlines
+		$lines = $content.Content.Split("`r`n") | Where-Object {$_ -notmatch ";|NS|AAAA"}
 
-		# Process each line, ignoring lines starting with ;
+		# Process each line to extract root hints
 		foreach ($line in $lines) {
-			if (!($line -like ";*")) {
-				$values = $line.Split(" ")
-				$hashtable[$values[0]] = $values[-1]  # Store only the last string
+			if (!($line -like ";*") -and $line.Trim() -ne "") {
+				$values = $line.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+				if ($values.Count -ge 2) {
+					$latestRootHints[$values[0]] = $values[-1]
+				}
 			}
 		}
-		#$hashtable = $($hashtable.GetEnumerator() | Sort Name | Select Name,Value | Format-Table)
-		Write-Host "Currently set DNS Root Hints:";$(Get-DNSServerRootHint)
-		# Display the hashtable (optional)
-		Write-Host "Latest root hints from www.internic.net :";$($hashtable.GetEnumerator() | Sort Name | Select Name,Value | Format-Table)
 
-		# Remove the old entries and add the updated entries. Does not check if old is still up to date.
-		Write-Host "Replacing current set with updates"
-		foreach ($entry in $($hashtable.GetEnumerator()| Sort Name)) {
-			Remove-DnsServerRootHint -Force -NameServer ($entry.Name).ToLower() -ErrorAction SilentlyContinue
-			Add-DnsServerRootHint -NameServer $entry.Name -IPAddress $entry.Value -Verbose
+		# Get current root hints
+		Write-Host "Retrieving current DNS root hints..." -ForegroundColor Cyan
+		$currentRootHints = @{}
+		$currentHints = Get-DNSServerRootHint
+		foreach ($hint in $currentHints) {
+			# Use the first IPv4 address for comparison
+			$ipv4Address = ($hint.IPAddress | Where-Object {$_ -match '^\d+\.\d+\.\d+\.\d+$'} | Select-Object -First 1).RecordData.IPv4Address.IPAddressToString
+			if ($ipv4Address) {
+				$currentRootHints[$hint.NameServer.RecordData.NameServer] = $ipv4Address
+			}
 		}
-		Write-Host "DNS Root Hints are now set to:";$(Get-DNSServerRootHint)
-		
+
+		# Create comparison table
+		Write-Host "`nDNS Root Hints Comparison:" -ForegroundColor Yellow
+		Write-Host ("=" * 80) -ForegroundColor Yellow
+
+		$comparisonTable = @()
+		$changesNeeded = $false
+
+		# Compare all root hints
+		foreach ($server in ($latestRootHints.Keys | Sort-Object)) {
+			$latestIP = $latestRootHints[$server]
+			$currentIP = $currentRootHints[$server]
+
+			$status = if ($currentIP -eq $latestIP) {
+				"Up to date"
+			} elseif ($null -eq $currentIP) {
+				$changesNeeded = $true
+				"Missing"
+			} else {
+				$changesNeeded = $true
+				"Needs update"
+			}
+
+			$comparisonTable += [PSCustomObject]@{
+				NameServer = $server
+				CurrentIP = if ($currentIP) { $currentIP } else { "N/A" }
+				LatestIP = $latestIP
+				Status = $status
+			}
+		}
+
+		# Display the comparison table with color coding
+		foreach ($row in $comparisonTable) {
+			$color = switch ($row.Status) {
+				"Up to date" { "Green" }
+				"Needs update" { "Yellow" }
+				"Missing" { "Red" }
+				default { "White" }
+			}
+
+			Write-Host ("{0,-25} | Current: {1,-15} | Latest: {2,-15} | " -f $row.NameServer, $row.CurrentIP, $row.LatestIP) -NoNewline
+			Write-Host $row.Status -ForegroundColor $color
+		}
+		Write-Host ("=" * 80) -ForegroundColor Yellow
+
+		# Only make changes if needed
+		if ($changesNeeded) {
+			Write-Host "`nChanges detected. Updating DNS root hints..." -ForegroundColor Yellow
+			$updatedCount = 0
+
+			foreach ($entry in ($latestRootHints.GetEnumerator() | Sort-Object Name)) {
+				$currentIP = $currentRootHints[$entry.Name]
+
+				# Only update if different or missing
+				if ($currentIP -ne $entry.Value) {
+					# Remove old entry if it exists
+					Remove-DnsServerRootHint -Force -NameServer ($entry.Name).ToLower() -ErrorAction SilentlyContinue
+
+					# Add new entry
+					Add-DnsServerRootHint -NameServer $entry.Name -IPAddress $entry.Value -Verbose
+					$updatedCount++
+				}
+			}
+
+			Write-Host "`nSuccessfully updated $updatedCount root hint(s)." -ForegroundColor Green
+		} else {
+			Write-Host "`nAll DNS root hints are already up to date. No changes needed." -ForegroundColor Green
+		}
+
 	} Else {
 		Write-Warning "You can only run this command on a DNS server."
 	}

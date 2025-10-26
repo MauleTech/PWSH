@@ -39,10 +39,16 @@ Function Update-DnsServerRootHints{
 		$currentRootHints = @{}
 		$currentHints = Get-DNSServerRootHint
 		foreach ($hint in $currentHints) {
-			# Use the first IPv4 address for comparison
-			$ipv4Address = ($hint.IPAddress | Where-Object {$_ -match '^\d+\.\d+\.\d+\.\d+$'} | Select-Object -First 1).RecordData.IPv4Address.IPAddressToString
-			if ($ipv4Address) {
-				$currentRootHints[$hint.NameServer.RecordData.NameServer] = $ipv4Address
+			$nameServer = $hint.NameServer.RecordData.NameServer
+			# Look through IP addresses for IPv4 addresses
+			foreach ($ipRecord in $hint.IPAddress) {
+				if ($ipRecord.RecordData.IPv4Address) {
+					$ipAddress = $ipRecord.RecordData.IPv4Address.IPAddressToString
+					if ($ipAddress) {
+						$currentRootHints[$nameServer] = $ipAddress
+						break  # Use the first IPv4 address
+					}
+				}
 			}
 		}
 

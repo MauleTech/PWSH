@@ -7,13 +7,13 @@ We are using a **function-based system**. There are 2 ways to load the functions
 
 **Run _either_:**
 ```powershell
-irm rb.gy/0kyfn2 | iex
+irm ps.mauletech.com | iex
 ```
 
 **--OR--**
 
 ```powershell
-IEX(new-object net.webclient).downloadstring('https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt')
+irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 
 # note that this may not work if SSL is not enabled in PowerShell.
 ```
@@ -245,4 +245,5 @@ IEX(new-object net.webclient).downloadstring('https://raw.githubusercontent.com/
 ```powershell 
 Help <function-name> -Detailed
 ```
+
 

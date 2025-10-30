@@ -134,7 +134,7 @@ Function Remove-DuplicateDrivers {
 }
 
 Function Remove-StaleProfiles {
-	$thresholdDays = 365 #Days
+	$thresholdDays = 731 #Days
 	Write-Host "Checking for stale profiles to clean up"
 	# Get a list of user profiles
 	$profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object{$_.CreationTime -lt (get-date).adddays(-$thresholdDays)} | Where-Object{$_.Loaded -eq $False} | Where-Object { $_.LocalPath -notmatch 'atg|Remote Support|admin' }

@@ -490,6 +490,8 @@ $FoldersToDeDuplicate | ForEach-Object {
 #$CommandsToRun = @(
 	Start-ScheduledTask -TaskPath "\Microsoft\Windows\Servicing" -TaskName "StartComponentCleanup" -Verbose:$false ## Run the StartComponentCleanup task
 	Write-Host "Emptying Recycle Bin" ;Clear-RecycleBin -Force ## Empties Recycle Bin
+	Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+	Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-PathForcefully -ErrorAction SilentlyContinue
 	## Reduce the size of the WinSxS folder
 	Write-Host "Reducing the size of the WinSxS folder" 
 		Dism.exe /online /Cleanup-Image /StartComponentCleanup

@@ -1,3 +1,92 @@
+Function Restart-ComputerSafely {
+<#
+    .SYNOPSIS
+        Restarts the computer immediately with BitLocker protection.
+        Suspends BitLocker if enabled to prevent recovery prompts, then resumes after reboot.
+    
+    .PARAMETER Force
+        Forces applications to close without warning.
+    
+    .PARAMETER Delay
+        Seconds to wait before restarting. Defaults to 10 seconds.
+    
+    .EXAMPLE
+        Restart-ComputerSafely
+        Restarts the computer after 10 seconds, handling BitLocker automatically.
+    
+    .EXAMPLE
+        Restart-ComputerSafely -Force -Delay 0
+        Immediately restarts the computer without delay, forcing apps to close.
+#>
+    [CmdletBinding()]
+    param (
+        [Parameter()]
+        [switch]$Force,
+        
+        [Parameter()]
+        [int]$Delay = 10
+    )
+    
+    Write-Host "Preparing safe restart with BitLocker handling..."
+    
+    # Check if BitLocker is enabled
+    $Volume = Get-BitLockerVolume -MountPoint C:
+    
+    if ($Volume.ProtectionStatus -eq 'On') {
+        Write-Host "BitLocker is enabled. Suspending for 5 reboots..."
+        
+        # Suspend BitLocker
+        Suspend-BitLocker -MountPoint C: -RebootCount 5
+        
+        # Log the suspension
+        New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerSuspendedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
+        
+        # Create the resume BitLocker script
+        $ResumeScript = @'
+Start-Sleep -Seconds 30
+$Volume = Get-BitLockerVolume -MountPoint C:
+if ($Volume.ProtectionStatus -eq 'Off') {
+    Resume-BitLocker -MountPoint C:
+    New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerResumedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
+}
+'@
+        
+        # Save the resume script
+        $ScriptPath = "$env:ProgramData\MauleTech\ResumeBitLocker.ps1"
+        New-Item -Path "$env:ProgramData\MauleTech" -ItemType Directory -Force | Out-Null
+        $ResumeScript | Out-File -FilePath $ScriptPath -Encoding ASCII -Force
+        
+        # Set RunOnce to resume BitLocker after reboot
+        Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ResumeBitLocker' -Value "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $ScriptPath" -Force
+        
+        Write-Host "BitLocker suspended. Will resume automatically after reboot."
+    } else {
+        Write-Host "BitLocker is not enabled or already suspended."
+    }
+    
+    # Send notification to users if there's a delay
+    if ($Delay -gt 0) {
+        $Message = "SYSTEM RESTART: This computer will restart in $Delay seconds. Please save your work immediately."
+        try {
+            msg * $Message
+            Write-Host "User notification sent."
+        } catch {
+            Write-Host "Could not send user notification: $_"
+        }
+        
+        Write-Host "Restarting in $Delay seconds..."
+        Start-Sleep -Seconds $Delay
+    }
+    
+    if ($Force) {
+        Restart-Computer -Force
+    } else {
+        Restart-Computer
+    }
+}
+
 Function Restart-VSSWriter {
 	[CmdletBinding()]
 
@@ -94,4 +183,5 @@ Function Restart-VSSWriter {
 # dNy3bnUgSyYV7TmVrc6xbSPr3SWdL8Fzmrq/BTRtYpISwhn1gUlW5mI62XYIlSm4
 # riCac18KDGEPoQidv/aCzxBJbuuSCcrJXlGrjGe/Z1ETpniIqM23JadzYqZwT75o
 # G6Z5PQ==
+
 # SIG # End signature block

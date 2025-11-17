@@ -18,6 +18,14 @@ irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctio
 # note that this may not work if SSL is not enabled in PowerShell.
 ```
 
+If you get "irm : The request was aborted: Could not create SSL/TLS secure channel."
+Run:
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13 #Enables SSL Temporarily
+irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+Enable-SSL #Enables SSL Permanently
+```
+
 ### List of functions (can be entered as powershell commands): ###
 ```powershell
 

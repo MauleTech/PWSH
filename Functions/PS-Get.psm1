@@ -343,6 +343,73 @@ function Get-ComputerEntraStatus {
 	return [PSCustomObject]$statusObject
 }
 
+function Get-DatacenterLocation {
+    <#
+    .SYNOPSIS
+    Detects which datacenter a computer is in based on ping response times.
+    
+    .DESCRIPTION
+    Pings gateway IPs in Albuquerque and Phoenix datacenters and determines location
+    based on which has lower latency.
+    
+    .PARAMETER AlbuquerqueIP
+    IP address of Albuquerque datacenter gateway. Default: 140.82.177.82
+    
+    .PARAMETER PhoenixIP
+    IP address of Phoenix datacenter gateway. Default: 207.38.71.50
+    
+    .PARAMETER Count
+    Number of ping attempts. Default: 2
+    
+    .EXAMPLE
+    Get-DatacenterLocation
+    Returns: Albuquerque (or Phoenix)
+    
+    .EXAMPLE
+    Get-DatacenterLocation -Count 8
+    Uses 8 pings for more accurate average
+    
+    .NOTES
+    Used for stretched VLAN environments to determine physical location.
+    #>
+    
+    [CmdletBinding()]
+    param(
+        [string]$AlbuquerqueIP = "140.82.177.82",
+        [string]$PhoenixIP = "207.38.71.50",
+        [int]$Count = 2
+    )
+    
+    Write-Verbose "Pinging Albuquerque gateway: $AlbuquerqueIP"
+    $abqPing = Test-Connection -ComputerName $AlbuquerqueIP -Count $Count -ErrorAction SilentlyContinue
+    
+    Write-Verbose "Pinging Phoenix gateway: $PhoenixIP"
+    $phxPing = Test-Connection -ComputerName $PhoenixIP -Count $Count -ErrorAction SilentlyContinue
+    
+    if (-not $abqPing -and -not $phxPing) {
+        Write-Warning "Unable to reach either datacenter gateway"
+        return "Unknown"
+    } elseif (-not $abqPing) {
+        Write-Verbose "Albuquerque gateway unreachable, defaulting to Phoenix"
+        return "Phoenix"
+    } elseif (-not $phxPing) {
+        Write-Verbose "Phoenix gateway unreachable, defaulting to Albuquerque"
+        return "Albuquerque"
+    }
+    
+    $abqAvg = ($abqPing | Measure-Object -Property ResponseTime -Average).Average
+    $phxAvg = ($phxPing | Measure-Object -Property ResponseTime -Average).Average
+    
+    Write-Verbose "Albuquerque average: $abqAvg ms"
+    Write-Verbose "Phoenix average: $phxAvg ms"
+    
+    if ($abqAvg -lt $phxAvg) {
+        return "Albuquerque"
+    } else {
+        return "Phoenix"
+    }
+}
+
 Function Global:Get-DellWarranty {
 <#
 .SYNOPSIS

@@ -343,7 +343,7 @@ Function Update-Everything {
 	Update-NiniteApps
 	Update-PWSH
 	Update-PSWinGetPackages
-	Restart-Computer -Force
+	Restart-ComputerSafely -Force
 }
 
 Function Global:Update-ITFunctions {
@@ -1404,4 +1404,5 @@ Function Update-WindowsTo11 {
 # O799pl5w+MVM+EkZ1JZFogq4VCWqPcn5gT5zLuDWuDDwZxVICuNGOJ+HYJckcQGG
 # R6QKsw==
 # SIG # End signature block
+
 

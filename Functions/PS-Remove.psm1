@@ -74,9 +74,11 @@ Function Remove-ITS247InstallFolder {
 
 Function Remove-PathForcefully {
 	param(
-		[parameter(Mandatory = $true)]
+		[parameter(Mandatory = $true, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+		[Alias("FullName", "PSPath")]
 		[string] $Path
 	)
+	process {
 	<# the code below has been used from
 		- https://blogs.technet.com/b/heyscriptingguy/archive/2013/10/19/weekend-scripter-use-powershell-and-pinvoke-to-remove-stubborn-files.aspx
 	with inspiration from
@@ -141,6 +143,7 @@ Function Remove-PathForcefully {
 	}
  Else {
 		Write-Warning "$Path was not found."
+	}
 	}
 	<#
 	.SYNOPSIS

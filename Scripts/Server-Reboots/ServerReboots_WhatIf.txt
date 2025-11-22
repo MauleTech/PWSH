@@ -1,6 +1,5 @@
 	<#
 	Automated server reboot script
-	 Technology Group - (505)234-7777
 	RCS
 	13MAY2020
 	Broke out prerequisite checks to show just what file is missing.
@@ -401,3 +400,4 @@
 	$message = "Server Reboot Script has finished"
 
 	Send-To-Teams
+

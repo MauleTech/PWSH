@@ -72,7 +72,7 @@ Function Debug-SharedMailboxRestoreRequest {
 }
 
 Function Debug-ServerRebootScript {
-	# All scripts and funtions are now run from ps.ambitionsgroup.com (github)
+	# All scripts and funtions are now run from ps.mauletech.com (github)
 	Write-Host "Checking Scheduled Task"
 	$Task = Get-ScheduledTask -TaskName "IT*Scheduled*Server*Reboot*"
 	$ServerRebootScriptPath = "$ITFolder\scripts\ServerReboots.ps1"
@@ -114,7 +114,7 @@ Function Debug-ServerRebootScript {
 	} Else {
 		$ServerList | Format-Table
 		Pause
-		Write-Host -NoNewLine "`n - Retrieving Ambitions Server Reboot Script -"
+		Write-Host -NoNewLine "`n - Retrieving Server Reboot Script -"
 		$greenCheck = @{
 			Object          = [Char]8730
 			ForegroundColor = 'Green'

@@ -98,8 +98,8 @@
 	#To store a password securely, run
 	#"AReallyC00lP@55w0rd" | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString | Out-File "$ITFolder\Scripts\Server_Reboot_Cred.txt"
 	$filePath = "$ITFolder\Scripts\server_reboots.csv"
-	$username = Get-Content '$ITFolder\Scripts\server_reboot_user.txt'
-	$password = Get-Content '$ITFolder\Scripts\Server_Reboot_Cred.txt' | ConvertTo-SecureString
+	$username = Get-Content "$ITFolder\Scripts\server_reboot_user.txt"
+	$password = Get-Content "$ITFolder\Scripts\Server_Reboot_Cred.txt" | ConvertTo-SecureString
 	$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $username,$password
 	$ChangeLgPath = "$ITFolder\reboot.log"
 	#import CSV

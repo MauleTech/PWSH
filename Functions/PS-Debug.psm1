@@ -75,29 +75,27 @@ Function Debug-ServerRebootScript {
 	# All scripts and funtions are now run from ps.ambitionsgroup.com (github)
 	Write-Host "Checking Scheduled Task"
 	$Task = Get-ScheduledTask -TaskName "IT*Scheduled*Server*Reboot*"
+	$ServerRebootScriptPath = "$ITFolder\scripts\ServerReboots.ps1"
 	If ($Task) {
 		Write-Host -NoNewLine "Task State: $($Task.State)"
 		#$Task | Format-List State
 		$Task | Get-ScheduledTaskInfo | Format-List LastRunTime, LastTaskResult, NextRunTime
 		If ($Task.Actions.Execute -eq 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe') {
 			Write-Host -ForegroundColor Green "Scheduled Program Path looks correct."
-		}
-		Else {
+		} Else {
 			Write-Host -ForegroundColor Red "Scheduled Program looks incorrect."
 			Write-Host -ForegroundColor Yellow "$($Task.Actions.Execute)"
 			Write-Host -ForegroundColor Red "It should be `'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`'"
 		}
 
-		If ($Task.Actions.Arguments -eq '-ExecutionPolicy Bypass -NoProfile -File "$ITFolder\scripts\ServerReboots.ps1"') {
+		If ($Task.Actions.Arguments -eq "-ExecutionPolicy Bypass -NoProfile -File `"$ServerRebootScriptPath`"") {
 			Write-Host -ForegroundColor Green "Scheduled Program arguments looks correct."
-		}
-		Else {
+		} Else {
 			Write-Host -ForegroundColor Red "Scheduled Program arguments looks incorrect."
 			Write-Host -ForegroundColor Yellow "$($Task.Actions.Arguments)"
 			Write-Host -ForegroundColor Red "It should be `'-ExecutionPolicy Bypass -NoProfile -File `"$ITFolder\scripts\ServerReboots.ps1`"`'"
 		}
-	}
- Else {
+	} Else {
 		Write-Warning "Scheduled task does not exist!"
 	}
 	Pause
@@ -113,8 +111,7 @@ Function Debug-ServerRebootScript {
 	$ServerList = Get-Content -Path $ITFolder\Scripts\Server_Reboots.csv -ErrorAction SilentlyContinue | ConvertFrom-Csv
 	If (!($ServerList)) {
 		Write-Warning "Server List CSV File does not exist!"
-	}
- Else {
+	} Else {
 		$ServerList | Format-Table
 		Pause
 		Write-Host -NoNewLine "`n - Retrieving Ambitions Server Reboot Script -"

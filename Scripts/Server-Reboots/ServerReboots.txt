@@ -145,7 +145,7 @@
 					msg * "This server will be restarting momentarily. Please immediately save your work and log out."
 				} Else {
 					#Informing users of $server of reboot.
-					Invoke-Command -ComputerName $server -Credential $cred -scriptblock {msg * "This server will be restarting momentarily. Please immediately save your work and log out." }
+					Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -scriptblock {msg * "This server will be restarting momentarily. Please immediately save your work and log out." }
 				}
 			}
 		}
@@ -225,9 +225,9 @@
 						$color = 'd8d800'
 						$message = "$server will have it's firmware updated"
 						##Send-To-Teams
-						Invoke-Command -ComputerName $server -Credential $cred -Command "irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex ; #Update-DellServer"
+						Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -Command "irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex ; #Update-DellServer"
 					#Log the reboot
-					Invoke-Command -ComputerName $server -Credential $cred -ScriptBlock {
+					Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
 						#Log the major system Change
 						$date = Get-Date -Format g
 						$ChangeLgPath = "$ITFolder\reboot.log"
@@ -239,7 +239,10 @@
 						$color = 'd8d800'
 						$message = "$server will be rebooted without waiting"
 						#Send-To-Teams
-						Restart-Computer -ComputerName $server -Credential $cred -Force -ErrorVariable Output
+						$Output = $null
+						Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
+							Restart-Computer -Force
+						} -ErrorVariable Output
 						If ($Output) {
 							$color = 'ff0000'
 							$message = 'An error occured: ' + $Output
@@ -254,7 +257,10 @@
 						$color = 'd8d800'
 						$message = "$server will be rebooted and the script will wait to proceed until it's back online"
 						#Send-To-Teams
-						Restart-Computer -ComputerName $server -Credential $cred -Force -Wait -ErrorVariable Output
+						$Output = $null
+						Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
+							Restart-Computer -Force -Wait
+						} -ErrorVariable Output
 						If ($Output) {
 							$color = 'ff0000'
 							$message = 'An error occured: ' + $Output
@@ -274,13 +280,16 @@
 					$color = 'd8d800'
 					$message = "Shutting down $server"
 					#Send-To-Teams
-					Invoke-Command -ComputerName $server -Credential $cred -ScriptBlock {
+					Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
 						#Log the major system Change
 						$date = Get-Date -Format g
 						$ChangeLgPath = "$ITFolder\reboot.log"
 						Add-Content -Path $ChangeLgPath "$date`tScripted`tScheduled automatic VM shutdown" -Force
 					}
-					Stop-Computer -ComputerName $server -Credential $cred -Force -ErrorVariable Output
+					$Output = $null
+					Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
+						Stop-Computer -Force
+					} -ErrorVariable Output
 					If ($Output) {
 						$color = 'ff0000'
 						$message = 'An error occured: ' + $Output
@@ -317,14 +326,14 @@
 						}
 					} Else {
 					#Log the reboot
-					Invoke-Command -ComputerName $vmhost -Credential $cred -ScriptBlock {
+					Invoke-Command -ComputerName $vmhost -Credential $cred -Authentication Negotiate -ScriptBlock {
 						#Function to send messages to Teams. Set $date, $server, and $message variables
 						function Send-To-Teams{
 							#Enables latest version of TLS
 							[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
 							$date = Get-Date -Format g
 							$uri = "$([System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String("aHR0cHM6Ly9hbWJpdGlvbnNncm91cC53ZWJob29rLm9mZmljZS5jb20vd2ViaG9va2IyLzg5N2QyYjRjLTUwYzYtNDljYi1hNjk0LTUwZTNjNzI2NWJkY0BjZjRiZGQwNi1iMDNkLTRiYWYtODU2NS0xMjY1NDY5YTg3NGYvSW5jb21pbmdXZWJob29rLzg0Nzg4YjBlOTI2ZDRjYWM4YTlkMDM0ZDFjM2YzZTFkLzA0ZDMzMjQ3LWVlNzItNDFhZi1hNWFlLTFjNDI4MTI2MjQ0MQ==")))"
-					
+
 							$body = ConvertTo-Json -Depth 4 @{
 								themeColor = $color
 								title = $title
@@ -349,7 +358,7 @@
 								)
 							}
 							Invoke-RestMethod -uri $uri -Method Post -body $body -ContentType 'application/json'
-						}
+						}#>
 						$title = $env:userdomain + ': Scripted Server Reboot Notification'
 						#Log the shutdown
 						$date = Get-Date -Format g
@@ -408,7 +417,7 @@
 				If (($env:computername.StartsWith($server,"CurrentCultureIgnoreCase")) -or ($server.StartsWith($env:computername,"CurrentCultureIgnoreCase"))) {
 					$message = (& $ITFolder\Scripts\Invoke-StartService.ps1 -ErrorVariable Output)
 				} Else {
-					[String]$message = (Invoke-Command -ErrorVariable Output -ComputerName $server -Credential $cred -FilePath $ITFolder\Scripts\Invoke-StartService.ps1)
+					[String]$message = (Invoke-Command -ErrorVariable Output -ComputerName $server -Credential $cred -Authentication Negotiate -FilePath $ITFolder\Scripts\Invoke-StartService.ps1)
 				}
 				If ($Output) {
 					$color = 'ff0000'

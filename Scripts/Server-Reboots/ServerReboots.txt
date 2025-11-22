@@ -76,7 +76,7 @@
 		$message = "Needed file server_reboot_user.txt is missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
 		write-error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
-		Send-To-Teams
+		#Send-To-Teams
 		Exit
 	}
 
@@ -84,7 +84,7 @@
 		$message = "Needed files are missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
 		write-error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
-		Send-To-Teams
+		#Send-To-Teams
 		Exit
 	}
 
@@ -92,7 +92,7 @@
 		$message = "Needed file Server_Reboot_Cred.txt is missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
 		write-error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
-		Send-To-Teams
+		#Send-To-Teams
 		Exit
 	}
 
@@ -100,7 +100,7 @@
 		$message = "Needed file is Invoke-StartService.ps1 missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
 		write-error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
-		Send-To-Teams
+		#Send-To-Teams
 		Exit
 	}
 #End of Prerequisite checks
@@ -130,7 +130,7 @@
 			$color = 'ff8c00'
 			$message = "Uptime: $Uptime. An automated server reboot is starting, stay tuned for further information"
 			$server = "Reboot script host: $env:computername"
-			Send-To-Teams
+			#Send-To-Teams
 		#Warn users of impending reboot
 		ForEach ($d in $objdata) {
 			$sequence = $d.SEQUENCE | Out-String
@@ -168,7 +168,7 @@
 				Write-Host "Datto update assessment is being performed on $server"
 				$color = '0000ff'
 				$message = "Datto update assessment is being performed on $server"
-				Send-To-Teams
+				#Send-To-Teams
 				#If command is running locally, use "Start-VM -Name #$server"
 				If (($env:computername.StartsWith($server,"CurrentCultureIgnoreCase")) -or ($server.StartsWith($env:computername,"CurrentCultureIgnoreCase"))) {
 					& $ITFolder\scripts\DattoAgentUpdate.ps1
@@ -180,7 +180,7 @@
 				Write-Host "Datto update assessment is being skipped on End User Client VMs"
 				$color = '0000ff'
 				$message = "Datto update assessment is being skipped on End User Client VMs"
-				Send-To-Teams
+				#Send-To-Teams
 			}
 		}#>
 
@@ -207,7 +207,7 @@
 					$ChangeLgPath = "$ITFolder\reboot.log"
 					$color = 'd8d800'
 					$message = "Updating the firmware of the server"
-					#Send-To-Teams
+					##Send-To-Teams
 					irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 					#Update-DellServer
 					#Log the reboot
@@ -215,7 +215,7 @@
 					$ChangeLgPath = "$ITFolder\reboot.log"
 					$color = 'd8d800'
 					$message = "Initiating reboot of local server"
-					Send-To-Teams
+					#Send-To-Teams
 					Add-Content -Path $ChangeLgPath "$date`tScripted`tScheduled automatic reboot of local server"
 					#Reboot
 					Restart-Computer -Force
@@ -224,7 +224,7 @@
 						Write-Host "$server will have it's firmware updated"
 						$color = 'd8d800'
 						$message = "$server will have it's firmware updated"
-						#Send-To-Teams
+						##Send-To-Teams
 						Invoke-Command -ComputerName $server -Credential $cred -Command "irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex ; #Update-DellServer"
 					#Log the reboot
 					Invoke-Command -ComputerName $server -Credential $cred -ScriptBlock {
@@ -238,7 +238,7 @@
 						Write-Host "$server will be rebooted without waiting"
 						$color = 'd8d800'
 						$message = "$server will be rebooted without waiting"
-						Send-To-Teams
+						#Send-To-Teams
 						Restart-Computer -ComputerName $server -Credential $cred -Force -ErrorVariable Output
 						If ($Output) {
 							$color = 'ff0000'
@@ -247,13 +247,13 @@
 							$color = '0000ff'
 							$message = "The reboot initiated successfully without issue."
 						}
-						Send-To-Teams
+						#Send-To-Teams
 						Add-Content -Path $ChangeLgPath "$date`tScripted`t$Output" -Force
 					} Else {
 						Write-Host "$server will be rebooted and the script will wait to proceed until it's back online"
 						$color = 'd8d800'
 						$message = "$server will be rebooted and the script will wait to proceed until it's back online"
-						Send-To-Teams
+						#Send-To-Teams
 						Restart-Computer -ComputerName $server -Credential $cred -Force -Wait -ErrorVariable Output
 						If ($Output) {
 							$color = 'ff0000'
@@ -262,7 +262,7 @@
 							$color = '0000ff'
 							$message = "The restart of $server completed successfully without issue."
 						}
-						Send-To-Teams
+						#Send-To-Teams
 						Add-Content -Path $ChangeLgPath "$date`tScripted`t$Output" -Force
 					}
 				}
@@ -273,7 +273,7 @@
 					Write-Host "Shutting down $server"
 					$color = 'd8d800'
 					$message = "Shutting down $server"
-					Send-To-Teams
+					#Send-To-Teams
 					Invoke-Command -ComputerName $server -Credential $cred -ScriptBlock {
 						#Log the major system Change
 						$date = Get-Date -Format g
@@ -288,7 +288,7 @@
 						$color = '0000ff'
 						$message = "The shutdown completed successfully without issue."
 					}
-					Send-To-Teams
+					#Send-To-Teams
 					Add-Content -Path $ChangeLgPath "$date`tScripted`t$Output" -Force
 					#Wait till computer finishes shutting down unless NoWait is specified.
 					If ($NoWait -notlike "NoWait") {
@@ -304,14 +304,14 @@
 					$ChangeLgPath = "$ITFolder\reboot.log"
 					$color = 'd8d800'
 					$message = "Initiating shutdown of all remaining VMs on host $vmhost"
-					Send-To-Teams
+					#Send-To-Teams
 					Add-Content -Path $ChangeLgPath "$date`tScripted`tInitiating shutdown of all remain VMs on host $vmhost"
 					#Shutdown remaining VMs
 					# Shutdown VMs
 						(Get-VM | Where {$_.State -eq 'Running' -and $_.AutomaticStartAction -eq 'Start'}) | Sort-Object -Property AutomaticStartDelay -Descending | ForEach-Object {
 							$color = 'd8d800'
 							$message = "Initiating shutdown of " + $_.Name
-							Send-To-Teams
+							#Send-To-Teams
 							$_ | Stop-VM -Force
 							Start-Sleep -Seconds 15
 						}
@@ -319,7 +319,7 @@
 					#Log the reboot
 					Invoke-Command -ComputerName $vmhost -Credential $cred -ScriptBlock {
 						#Function to send messages to Teams. Set $date, $server, and $message variables
-						function Send-To-Teams{
+						function #Send-To-Teams{
 							#Enables latest version of TLS
 							[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
 							$date = Get-Date -Format g
@@ -356,14 +356,14 @@
 						$ChangeLgPath = "$ITFolder\reboot.log"
 						$color = 'd8d800'
 						$message = "Initiating shutdown of all remain VMs on host $vmhost"
-						Send-To-Teams
+						#Send-To-Teams
 						Add-Content -Path $ChangeLgPath "$date`tScripted`tInitiating shutdown of all remain VMs on host $vmhost"
 						#Shutdown remaining VMs
 						# Shutdown VMs
 						(Get-VM | Where {$_.State -eq 'Running' -and $_.AutomaticStartAction -eq 'Start'}) | Sort-Object -Property AutomaticStartDelay -Descending | ForEach-Object {
 							$color = 'd8d800'
 							$message = "Initiating shutdown of " + $_.Name
-							Send-To-Teams
+							#Send-To-Teams
 							$_ | Stop-VM -Force
 							Start-Sleep -Seconds 15
 						}
@@ -374,13 +374,13 @@
 			If ($action -eq "ConfirmStart") {
 				$color = 'd8d800'
 				$message = "Waiting and confirming that $server is online before continuing"
-				Send-To-Teams
+				#Send-To-Teams
 				$timeout = new-timespan -Minutes 20
 				$sw = [diagnostics.stopwatch]::StartNew()
 				do {$ping = test-connection -comp $server -Quiet} until (($ping) -or ($sw.elapsed -ge $timeout))
 				$color = '0000ff'
 				$message = "Verified $server is online or timeout has been reached, continuing"
-				Send-To-Teams
+				#Send-To-Teams
 			}
 		}
 	} Else {
@@ -389,7 +389,7 @@
 		$color = 'ff8c00'
 		$message = "Uptime: $Uptime. Starting automatic services that are stopped."
 		$server = "Reboot script host $env:computername"
-		Send-To-Teams
+		#Send-To-Teams
 		#Start Automatic Services that aren't started
 		$filePath = "$ITFolder\Scripts\server_reboots.csv"
 		#import CSV
@@ -414,11 +414,11 @@
 					$color = 'ff0000'
 					$message = 'An error occured: ' + $Output
 				}
-				Send-To-Teams
+				#Send-To-Teams
 			}
 		}
 	}
 	$title = 'Hey! Server Reboots are done at ' + $env:userdomain
 	$color = '00cd00'
 	$message = "Server Reboot Script has finished"
-	Send-To-Teams
+	#Send-To-Teams

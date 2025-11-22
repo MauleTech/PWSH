@@ -275,21 +275,55 @@
 			}
 			#Shutdown Actions
 			If ($action -eq "Shutdown") {
+				# Load Get-VMByFQDN function if vmhost is specified
+				If ($vmhost) {
+					irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+				}
 				If ($server -ne "allremainingvms"){
-					Write-Host "Shutting down $server"
-					$color = 'd8d800'
-					$message = "Shutting down $server"
-					#Send-To-Teams
-					Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
-						#Log the major system Change
-						$date = Get-Date -Format g
-						$ChangeLgPath = "$ITFolder\reboot.log"
-						Add-Content -Path $ChangeLgPath "$date`tScripted`tScheduled automatic VM shutdown" -Force
+					# Check if VM is already off (if vmhost is specified)
+					$vmAlreadyOff = $false
+					If ($vmhost) {
+						Try {
+							If (($env:computername.StartsWith($vmhost,"CurrentCultureIgnoreCase")) -or ($vmhost.StartsWith($env:computername,"CurrentCultureIgnoreCase"))) {
+								$vmInfo = Get-VMByFQDN -FQDN $server -ErrorAction SilentlyContinue
+							} Else {
+								$vmInfo = Invoke-Command -ComputerName $vmhost -Credential $cred -Authentication Negotiate -ScriptBlock {
+									param($fqdn)
+									irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+									Get-VMByFQDN -FQDN $fqdn -ErrorAction SilentlyContinue
+								} -ArgumentList $server
+							}
+							If ($vmInfo -and $vmInfo.State -eq "Off") {
+								$vmAlreadyOff = $true
+								Write-Host "$server is already in Off state, skipping shutdown"
+								$color = '0000ff'
+								$message = "$server is already in Off state, skipping shutdown"
+								#Send-To-Teams
+							}
+						} Catch {
+							Write-Host "Could not check VM state for $server, proceeding with shutdown attempt"
+						}
 					}
-					$Output = $null
-					Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
-						Stop-Computer -Force
-					} -ErrorVariable Output
+
+					# Only attempt shutdown if VM is not already off
+					If (-not $vmAlreadyOff) {
+						Write-Host "Shutting down $server"
+						$color = 'd8d800'
+						$message = "Shutting down $server"
+						#Send-To-Teams
+						Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
+							#Log the major system Change
+							$date = Get-Date -Format g
+							$ChangeLgPath = "$ITFolder\reboot.log"
+							Add-Content -Path $ChangeLgPath "$date`tScripted`tScheduled automatic VM shutdown" -Force
+						}
+						$Output = $null
+						Invoke-Command -ComputerName $server -Credential $cred -Authentication Negotiate -ScriptBlock {
+							Stop-Computer -Force
+						} -ErrorVariable Output
+					} Else {
+						$Output = $null
+					}
 					If ($Output) {
 						$color = 'ff0000'
 						$message = 'An error occured: ' + $Output
@@ -302,10 +336,46 @@
 					#Wait till computer finishes shutting down unless NoWait is specified.
 					If ($NoWait -notlike "NoWait") {
 						Write-Host "Waiting until the server is fully offline"
-						do {
-							Start-Sleep -s 5
-						} until (!(Test-Connection $server -Quiet -Count 1))
-						Start-Sleep -s 120
+						# If vmhost is specified, use Get-VMByFQDN to check VM state
+						If ($vmhost) {
+							Write-Host "Checking VM state via host $vmhost"
+							$vmOff = $false
+							$maxAttempts = 60  # 5 minutes maximum (60 * 5 seconds)
+							$attempts = 0
+							do {
+								Start-Sleep -s 5
+								$attempts++
+								Try {
+									If (($env:computername.StartsWith($vmhost,"CurrentCultureIgnoreCase")) -or ($vmhost.StartsWith($env:computername,"CurrentCultureIgnoreCase"))) {
+										$vmInfo = Get-VMByFQDN -FQDN $server -ErrorAction SilentlyContinue
+									} Else {
+										$vmInfo = Invoke-Command -ComputerName $vmhost -Credential $cred -Authentication Negotiate -ScriptBlock {
+											param($fqdn)
+											irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+											Get-VMByFQDN -FQDN $fqdn -ErrorAction SilentlyContinue
+										} -ArgumentList $server
+									}
+									If ($vmInfo -and $vmInfo.State -eq "Off") {
+										$vmOff = $true
+										Write-Host "$server is now in Off state"
+									} Else {
+										Write-Host "VM state: $($vmInfo.State), waiting..."
+									}
+								} Catch {
+									Write-Host "Error checking VM state, attempt $attempts of $maxAttempts"
+								}
+							} until ($vmOff -or ($attempts -ge $maxAttempts))
+
+							If (-not $vmOff) {
+								Write-Host "Warning: VM did not reach Off state within timeout period"
+							}
+						} Else {
+							# Fallback to original ping-based method if no vmhost
+							do {
+								Start-Sleep -s 5
+							} until (!(Test-Connection $server -Quiet -Count 1))
+							Start-Sleep -s 120
+						}
 					}
 				} ElseIf (($env:computername.StartsWith($vmhost,"CurrentCultureIgnoreCase")) -or ($vmhost.StartsWith($env:computername,"CurrentCultureIgnoreCase"))) {
 					#Log the shutdown

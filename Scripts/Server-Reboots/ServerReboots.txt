@@ -328,7 +328,7 @@
 					#Log the reboot
 					Invoke-Command -ComputerName $vmhost -Credential $cred -Authentication Negotiate -ScriptBlock {
 						#Function to send messages to Teams. Set $date, $server, and $message variables
-						<#function Send-To-Teams{
+						function Send-To-Teams{
 							#Enables latest version of TLS
 							[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
 							$date = Get-Date -Format g

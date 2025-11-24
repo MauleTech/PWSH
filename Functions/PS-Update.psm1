@@ -223,18 +223,12 @@ Function Update-DellPackages {
 
 			#Configure and run Dell Command Update
 			If (Test-Path $DCUx86) {
-				& $DCUx86 /configure -autoSuspendBitLocker=enable
-				If ($EnableAdvancedDriverRestore) {
-					Write-Host "Enabling Advanced Driver Restore..."
-					& $DCUx86 /configure -advancedDriverRestore=enable
-				}
+				& $DCUx86 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify
+
 				& $DCUx86 /applyUpdates -reboot=disable
 			} ElseIf (Test-Path $DCUx64) {
-				& $DCUx64 /configure -autoSuspendBitLocker=enable
-				If ($EnableAdvancedDriverRestore) {
-					Write-Host "Enabling Advanced Driver Restore..."
-					& $DCUx64 /configure -advancedDriverRestore=enable
-				}
+				& $DCUx64 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify
+
 				& $DCUx64 /applyUpdates -reboot=disable
 			} Else { Write-Error "Dell Command Update CLI not found."}
 
@@ -1404,5 +1398,6 @@ Function Update-WindowsTo11 {
 # O799pl5w+MVM+EkZ1JZFogq4VCWqPcn5gT5zLuDWuDDwZxVICuNGOJ+HYJckcQGG
 # R6QKsw==
 # SIG # End signature block
+
 
 

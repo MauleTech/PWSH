@@ -902,7 +902,7 @@ Function Update-WindowTitle ([String] $PassNumber) {
 }
 
 Function Update-WindowsTo11 {
-	<# 
+	<#
 	.SYNOPSIS
 	Find and install ONLY the Windows 11 Feature Update using PSWindowsUpdate.
 
@@ -915,6 +915,9 @@ Function Update-WindowsTo11 {
 	.PARAMETER WhatIfOnly
 	Show what would happen without installing.
 
+	.PARAMETER Force
+	Force the upgrade even if the system appears to already be running Windows 11 25H2 or newer.
+
 	.NOTES
 	Requires: PowerShell as Administrator, Internet access or WSUS that offers the upgrade.
 	#>
@@ -923,7 +926,8 @@ Function Update-WindowsTo11 {
 	param(
 	[switch]$AutoReboot,
 	[string]$LogPath = "$env:ProgramData\Win11-Upgrade-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
-	[switch]$WhatIfOnly
+	[switch]$WhatIfOnly,
+	[switch]$Force
 	)
 
 	### Helpers
@@ -939,12 +943,17 @@ Function Update-WindowsTo11 {
 	$buildNumber = [int]($os.BuildNumber)
 	$osCaption = $os.Caption
 
-	# Windows 11 25H2 is build 26100 or higher
-	if ($osCaption -match 'Windows 11' -and $buildNumber -ge 26100) {
+	# Windows 11 build numbers: 22621 (22H2), 22631 (23H2), 26100 (24H2), 27000+ (25H2 estimated)
+	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 27000) {
 		Write-Info "System is already running Windows 11 25H2 or newer (Build $buildNumber)"
 		Write-Info "No upgrade needed. Exiting..."
 		try { Stop-Transcript | Out-Null } catch { }
 		return
+	}
+
+	if ($Force) {
+		Write-Warn "Force parameter specified - skipping version check and proceeding with upgrade"
+		Write-Info "Current system: $osCaption (Build $buildNumber)"
 	}
 
 	### 1) Quick eligibility checks (non-bypass)

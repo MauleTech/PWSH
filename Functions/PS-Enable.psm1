@@ -168,6 +168,207 @@ Function Enable-O365AuditLog {
 		}
 	}
 
+	Function Enable-RDP {
+		<#
+			.SYNOPSIS
+				Enables Remote Desktop Protocol (RDP) on a computer, configures firewall rules, resolves common issues, and lists users/groups with RDP access.
+
+			.DESCRIPTION
+				This function performs the following actions:
+				- Enables Remote Desktop connections via registry
+				- Configures Network Level Authentication (NLA)
+				- Enables and starts required RDP services
+				- Configures Windows Firewall rules for RDP
+				- Lists all users and groups with Remote Desktop access
+				- Proactively resolves common issues that prevent RDP from working
+
+			.EXAMPLE
+				Enable-RDP
+
+			.NOTES
+				Requires Administrator privileges
+		#>
+
+		# Check for Administrator privileges
+		$IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+		If (-not $IsAdmin) {
+			Write-Warning "This function requires Administrator privileges. Please run as Administrator."
+			return
+		}
+
+		Write-Host "=== Enabling Remote Desktop Protocol ===" -ForegroundColor Cyan
+
+		# 1. Enable Remote Desktop via Registry
+		Write-Host "`nStep 1: Configuring Remote Desktop registry settings..." -ForegroundColor Yellow
+		Try {
+			$RDPPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+			$CurrentValue = Get-ItemProperty -Path $RDPPath -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
+
+			If ($CurrentValue.fDenyTSConnections -eq 0) {
+				Write-Host "  [OK] Remote Desktop is already enabled in registry" -ForegroundColor Green
+			} Else {
+				Set-ItemProperty -Path $RDPPath -Name "fDenyTSConnections" -Value 0 -ErrorAction Stop
+				Write-Host "  [SUCCESS] Remote Desktop enabled in registry" -ForegroundColor Green
+			}
+
+			# Enable Network Level Authentication (more secure)
+			$NLAPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+			$NLAValue = Get-ItemProperty -Path $NLAPath -Name "UserAuthentication" -ErrorAction SilentlyContinue
+
+			If ($NLAValue.UserAuthentication -eq 1) {
+				Write-Host "  [OK] Network Level Authentication is already enabled" -ForegroundColor Green
+			} Else {
+				Set-ItemProperty -Path $NLAPath -Name "UserAuthentication" -Value 1 -ErrorAction Stop
+				Write-Host "  [SUCCESS] Network Level Authentication enabled" -ForegroundColor Green
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure registry: $_"
+		}
+
+		# 2. Enable and Start RDP Services
+		Write-Host "`nStep 2: Configuring Remote Desktop services..." -ForegroundColor Yellow
+		$Services = @("TermService", "SessionEnv", "UmRdpService")
+
+		ForEach ($ServiceName in $Services) {
+			Try {
+				$Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+				If ($Service) {
+					# Set service to Automatic startup
+					If ($Service.StartType -ne "Automatic") {
+						Set-Service -Name $ServiceName -StartupType Automatic -ErrorAction Stop
+						Write-Host "  [SUCCESS] $ServiceName set to Automatic startup" -ForegroundColor Green
+					} Else {
+						Write-Host "  [OK] $ServiceName already set to Automatic" -ForegroundColor Green
+					}
+
+					# Start service if not running
+					If ($Service.Status -ne "Running") {
+						Start-Service -Name $ServiceName -ErrorAction Stop
+						Write-Host "  [SUCCESS] $ServiceName started" -ForegroundColor Green
+					} Else {
+						Write-Host "  [OK] $ServiceName is already running" -ForegroundColor Green
+					}
+				}
+			} Catch {
+				Write-Warning "  [WARNING] Issue with service $ServiceName : $_"
+			}
+		}
+
+		# 3. Configure Windows Firewall Rules
+		Write-Host "`nStep 3: Configuring Windows Firewall rules..." -ForegroundColor Yellow
+		Try {
+			# Enable predefined Remote Desktop firewall rules
+			$FirewallRules = Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+			If ($FirewallRules) {
+				ForEach ($Rule in $FirewallRules) {
+					If ($Rule.Enabled -eq $false) {
+						Enable-NetFirewallRule -Name $Rule.Name -ErrorAction Stop
+						Write-Host "  [SUCCESS] Enabled firewall rule: $($Rule.DisplayName)" -ForegroundColor Green
+					} Else {
+						Write-Host "  [OK] Firewall rule already enabled: $($Rule.DisplayName)" -ForegroundColor Green
+					}
+				}
+			} Else {
+				# Fallback: Create firewall rules manually
+				Write-Host "  [INFO] Predefined rules not found, creating custom rules..." -ForegroundColor Cyan
+
+				# TCP Rule
+				$TCPRule = Get-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
+				If (-not $TCPRule) {
+					New-NetFirewallRule -DisplayName "Remote Desktop - User Mode (TCP-In)" `
+						-Name "RemoteDesktop-UserMode-In-TCP" `
+						-Protocol TCP `
+						-LocalPort 3389 `
+						-Direction Inbound `
+						-Action Allow `
+						-Enabled True `
+						-ErrorAction Stop | Out-Null
+					Write-Host "  [SUCCESS] Created TCP firewall rule for RDP" -ForegroundColor Green
+				} Else {
+					Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction Stop
+					Write-Host "  [SUCCESS] Enabled existing TCP firewall rule" -ForegroundColor Green
+				}
+
+				# UDP Rule
+				$UDPRule = Get-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
+				If (-not $UDPRule) {
+					New-NetFirewallRule -DisplayName "Remote Desktop - User Mode (UDP-In)" `
+						-Name "RemoteDesktop-UserMode-In-UDP" `
+						-Protocol UDP `
+						-LocalPort 3389 `
+						-Direction Inbound `
+						-Action Allow `
+						-Enabled True `
+						-ErrorAction Stop | Out-Null
+					Write-Host "  [SUCCESS] Created UDP firewall rule for RDP" -ForegroundColor Green
+				} Else {
+					Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction Stop
+					Write-Host "  [SUCCESS] Enabled existing UDP firewall rule" -ForegroundColor Green
+				}
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure firewall rules: $_"
+		}
+
+		# 4. Check RDP Port Availability
+		Write-Host "`nStep 4: Checking RDP port availability..." -ForegroundColor Yellow
+		Try {
+			$RDPPort = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "PortNumber" -ErrorAction SilentlyContinue
+			$Port = $RDPPort.PortNumber
+			If (-not $Port) { $Port = 3389 }
+			Write-Host "  [INFO] RDP is configured to use port: $Port" -ForegroundColor Cyan
+
+			# Check if port is listening
+			$Listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+			If ($Listener) {
+				Write-Host "  [OK] Port $Port is listening for connections" -ForegroundColor Green
+			} Else {
+				Write-Warning "  [WARNING] Port $Port is not listening yet. Services may still be starting..."
+			}
+		} Catch {
+			Write-Warning "  [WARNING] Could not verify port status: $_"
+		}
+
+		# 5. List Users and Groups with RDP Access
+		Write-Host "`nStep 5: Users and Groups with Remote Desktop Access" -ForegroundColor Yellow
+		Write-Host "========================================" -ForegroundColor Cyan
+
+		Try {
+			# Get Remote Desktop Users group members
+			$RDPUsers = Get-LocalGroupMember -Group "Remote Desktop Users" -ErrorAction SilentlyContinue
+
+			Write-Host "`n  Remote Desktop Users Group Members:" -ForegroundColor White
+			If ($RDPUsers) {
+				ForEach ($User in $RDPUsers) {
+					Write-Host "    - $($User.Name) ($($User.ObjectClass))" -ForegroundColor Green
+				}
+			} Else {
+				Write-Host "    - No users explicitly added to Remote Desktop Users group" -ForegroundColor Yellow
+			}
+
+			# Get Administrators group members (they automatically have RDP access)
+			Write-Host "`n  Administrators Group Members (automatic RDP access):" -ForegroundColor White
+			$Admins = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue
+			If ($Admins) {
+				ForEach ($Admin in $Admins) {
+					Write-Host "    - $($Admin.Name) ($($Admin.ObjectClass))" -ForegroundColor Green
+				}
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to enumerate user groups: $_"
+		}
+
+		# 6. Final Summary
+		Write-Host "`n========================================" -ForegroundColor Cyan
+		Write-Host "=== Remote Desktop Configuration Complete ===" -ForegroundColor Green
+		Write-Host "`nTo add users to Remote Desktop access, run:" -ForegroundColor Cyan
+		Write-Host "  Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'DOMAIN\Username'" -ForegroundColor White
+		Write-Host "`nTo connect to this computer remotely, use:" -ForegroundColor Cyan
+		Write-Host "  mstsc /v:$($env:COMPUTERNAME)" -ForegroundColor White
+		Write-Host "========================================`n" -ForegroundColor Cyan
+	}
+
 	Function Enable-WakeOnLAN {
 		If (-not (Get-Module -Name DellBIOSProvider -ErrorAction SilentlyContinue) ) {
 			Try {
@@ -182,7 +383,7 @@ Function Enable-O365AuditLog {
 		If ($wolSetting) {
 			if ($wolSetting.CurrentValue -eq "Disabled") {
 				Write-Output "Wake on LAN is currently disabled. Enabling it now..."
-				
+
 				# Enable Wake on LAN
 				Try {
 					Set-Item -Path DellSmbios:\PowerManagement\WakeOnLan -Value LanWlan -ErrorAction Stop

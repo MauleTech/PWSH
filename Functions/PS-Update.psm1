@@ -918,6 +918,12 @@ Function Update-WindowsTo11 {
 	.PARAMETER Force
 	Force the upgrade even if the system appears to already be running Windows 11 25H2 or newer.
 
+	.PARAMETER DownloadOnly
+	Only download the Windows 11 ISO without installing. The ISO will be saved to $ITFolder\Downloads.
+
+	.PARAMETER ShowProgress
+	Run setup.exe with visible progress UI instead of quiet mode.
+
 	.NOTES
 	Requires: PowerShell as Administrator, Internet access or WSUS that offers the upgrade.
 	#>
@@ -927,7 +933,9 @@ Function Update-WindowsTo11 {
 	[switch]$AutoReboot,
 	[string]$LogPath = "$env:ProgramData\Win11-Upgrade-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
 	[switch]$WhatIfOnly,
-	[switch]$Force
+	[switch]$Force,
+	[switch]$DownloadOnly,
+	[switch]$ShowProgress
 	)
 
 	### Helpers
@@ -1090,7 +1098,8 @@ Function Update-WindowsTo11 {
 	Function Run-Win11Setup {
 		param(
 			[Parameter(Mandatory=$true)]
-			[string]$SetupPath
+			[string]$SetupPath,
+			[switch]$ShowProgress
 		)
 		
 		Write-Log "Attempting Windows 11 setup with path: $SetupPath"
@@ -1120,11 +1129,19 @@ Function Update-WindowsTo11 {
 			}
 			
 			Write-Log "Starting Windows 11 upgrade..." -Level "SUCCESS"
-			
-			# Setup arguments
-			$SetupArgs = @(
+
+			# Setup arguments - base arguments always used
+			$SetupArgs = [System.Collections.ArrayList]@(
 				"/auto", "Upgrade"
-				"/quiet"
+			)
+
+			# Add quiet mode unless ShowProgress is specified
+			if (-not $ShowProgress) {
+				$SetupArgs.Add("/quiet") | Out-Null
+			}
+
+			# Add remaining arguments
+			$SetupArgs.AddRange(@(
 				"/product", "server"
 				"/DynamicUpdate", "Disable"
 				"/ShowOOBE", "None"
@@ -1133,7 +1150,7 @@ Function Update-WindowsTo11 {
 				"/Compat", "IgnoreWarning"
 				"/copylogs", "C:\IT"
 				"/EULA", "Accept"
-			)
+			))
 			
 			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
 			#Enable in place upgrade
@@ -1216,11 +1233,19 @@ Function Update-WindowsTo11 {
 			}
 		}
 
-		if ($NetworkSetupPath) {
+		if ($NetworkSetupPath -and -not $DownloadOnly) {
 			Write-Log "Using network installation" -Level "SUCCESS"
-			$SetupSuccessful = Run-Win11Setup -SetupPath $NetworkSetupPath
-		} else {
-			Write-Log "No network paths available, proceeding with ISO download" -Level "WARNING"
+			$SetupSuccessful = Run-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
+		} elseif ($DownloadOnly -and $NetworkSetupPath) {
+			Write-Log "DownloadOnly specified but network path available. Proceeding with ISO download..." -Level "WARNING"
+		}
+
+		if (-not $NetworkSetupPath -or $DownloadOnly) {
+			if ($DownloadOnly) {
+				Write-Log "DownloadOnly mode - proceeding with ISO download" -Level "SUCCESS"
+			} else {
+				Write-Log "No network paths available, proceeding with ISO download" -Level "WARNING"
+			}
 			# Define the destination folder
 			If (!(Test-Path -Path "$ITFolder\Downloads\FDM\FDM.exe" -ErrorAction SilentlyContinue)){ 
 				$SaveFolder = "$ITFolder\Downloads\FDM"
@@ -1309,33 +1334,42 @@ Function Update-WindowsTo11 {
 				}
 				
 				Write-Log "ISO downloaded successfully: $Win11iso" -Level "SUCCESS"
-				
-				# Mount the ISO
-				Write-Log "Mounting ISO..."
-				$MountResult = Mount-DiskImage -ImagePath $Win11iso -PassThru -ErrorAction Stop
-				
-				# Get the drive letter of the mounted ISO
-				$DriveLetter = ($MountResult | Get-Volume).DriveLetter
-				
-				if (-not $DriveLetter) {
-					throw "Failed to retrieve drive letter for mounted ISO"
-				}
-				
-				Write-Log "ISO mounted to drive $DriveLetter`:" -Level "SUCCESS"
-				
-				# Build the setup.exe path
-				$SetupPath = "$DriveLetter`:\setup.exe"
-				
-				# Run the setup
-				$SetupSuccessful = Run-Win11Setup -SetupPath $SetupPath
-				
-				# Dismount the ISO
-				Write-Log "Dismounting ISO..."
-				try {
-					Dismount-DiskImage -ImagePath $Win11iso -ErrorAction Stop
-					Write-Log "ISO dismounted successfully" -Level "SUCCESS"
-				} catch {
-					Write-Log "Warning: Failed to dismount ISO: $($_.Exception.Message)" -Level "WARNING"
+
+				# If DownloadOnly, skip the setup
+				if ($DownloadOnly) {
+					Write-Log "DownloadOnly mode - ISO download complete. Skipping installation." -Level "SUCCESS"
+					Write-Log "ISO location: $Win11iso" -Level "SUCCESS"
+					$SetupSuccessful = $true
+					# Don't cleanup the ISO when DownloadOnly is used
+					$IsoToCleanup = $null
+				} else {
+					# Mount the ISO
+					Write-Log "Mounting ISO..."
+					$MountResult = Mount-DiskImage -ImagePath $Win11iso -PassThru -ErrorAction Stop
+
+					# Get the drive letter of the mounted ISO
+					$DriveLetter = ($MountResult | Get-Volume).DriveLetter
+
+					if (-not $DriveLetter) {
+						throw "Failed to retrieve drive letter for mounted ISO"
+					}
+
+					Write-Log "ISO mounted to drive $DriveLetter`:" -Level "SUCCESS"
+
+					# Build the setup.exe path
+					$SetupPath = "$DriveLetter`:\setup.exe"
+
+					# Run the setup
+					$SetupSuccessful = Run-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress
+
+					# Dismount the ISO
+					Write-Log "Dismounting ISO..."
+					try {
+						Dismount-DiskImage -ImagePath $Win11iso -ErrorAction Stop
+						Write-Log "ISO dismounted successfully" -Level "SUCCESS"
+					} catch {
+						Write-Log "Warning: Failed to dismount ISO: $($_.Exception.Message)" -Level "WARNING"
+					}
 				}
 				
 			} catch {

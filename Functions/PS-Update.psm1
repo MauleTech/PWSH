@@ -1,3 +1,113 @@
+function Update-ClaudeCode {
+	<#
+	.SYNOPSIS
+		Updates Claude Code to the latest version.
+	.DESCRIPTION
+		Checks for updates and reinstalls Claude Code if a newer version is available.
+		Requires Administrator privileges for system-wide install.
+	.PARAMETER Force
+		Update even if already on latest version.
+	.PARAMETER Quiet
+		Suppress output, return $true/$false only.
+	.EXAMPLE
+		Update-ClaudeCode
+	.EXAMPLE
+		Update-ClaudeCode -Force
+	.NOTES
+		Requires: Administrator privileges for system-wide update
+	#>
+	[CmdletBinding()]
+	param(
+		[switch]$Force,
+		[switch]$Quiet
+	)
+
+	# Paths
+	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+	$ClaudeFolder = "$Global:ITFolder\ClaudeCode"
+	$ClaudeExe = "$ClaudeFolder\claude.exe"
+
+	# Check if installed
+	if (-not (Test-Path $ClaudeExe)) {
+		if (-not $Quiet) {
+			Write-Host "[!] Claude Code is not installed." -ForegroundColor Red
+			Write-Host "    Run Install-ClaudeCode first." -ForegroundColor Yellow
+		}
+		return $false
+	}
+
+	# Ensure in PATH
+	if ($env:Path -notlike "*$ClaudeFolder*") { $env:Path = "$env:Path;$ClaudeFolder" }
+
+	# Get current version
+	$CurrentVersion = $null
+	try {
+		$CurrentVersion = (& $ClaudeExe --version 2>$null).Trim()
+	} catch { }
+
+	# Get latest version
+	$LatestVersion = $null
+	try {
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+		$npmInfo = Invoke-RestMethod -Uri "https://registry.npmjs.org/@anthropic-ai/claude-code/latest" -UseBasicParsing -ErrorAction SilentlyContinue
+		if ($npmInfo.version) { $LatestVersion = $npmInfo.version }
+	} catch {
+		if (-not $Quiet) {
+			Write-Host "[!] Could not check for updates." -ForegroundColor Yellow
+		}
+	}
+
+	# Compare versions
+	$NeedsUpdate = $false
+	if ($Force) {
+		$NeedsUpdate = $true
+	} elseif ($CurrentVersion -and $LatestVersion) {
+		if ($CurrentVersion -ne $LatestVersion) {
+			$NeedsUpdate = $true
+		}
+	} elseif (-not $CurrentVersion) {
+		# Can't determine version, offer update
+		$NeedsUpdate = $true
+	}
+
+	if (-not $NeedsUpdate) {
+		if (-not $Quiet) {
+			Write-Host "[OK] Claude Code is up to date ($CurrentVersion)" -ForegroundColor Green
+		}
+		return $true
+	}
+
+	if (-not $Quiet) {
+		Write-Host "`n=== Updating Claude Code ===" -ForegroundColor Cyan
+		if ($CurrentVersion) { Write-Host "Current version: $CurrentVersion" -ForegroundColor Gray }
+		if ($LatestVersion) { Write-Host "Latest version:  $LatestVersion" -ForegroundColor Gray }
+	}
+
+	# Check admin for system-wide update
+	$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+	if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		if (-not $Quiet) {
+			Write-Host "[!] Administrator privileges required for update." -ForegroundColor Red
+			Write-Host "    Run PowerShell as Administrator and try again." -ForegroundColor Yellow
+		}
+		return $false
+	}
+
+	# Run install with force to update
+	$result = Install-ClaudeCode -Force
+
+	if ($result -and -not $Quiet) {
+		# Get new version
+		try {
+			$NewVersion = (& $ClaudeExe --version 2>$null).Trim()
+			Write-Host "Updated to version: $NewVersion" -ForegroundColor Green
+		} catch { }
+	}
+
+	return $result
+}
+
 Function Update-DattoAgent {
 	Enable-SSL
 	$progressPreference = 'silentlyContinue'

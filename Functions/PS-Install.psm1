@@ -77,6 +77,117 @@ Function Install-Choco {
 	& $ChocoInstallScript
 }
 
+function Install-ClaudeCode {
+	<#
+	.SYNOPSIS
+		Installs Claude Code system-wide to $ITFolder\ClaudeCode.
+	.DESCRIPTION
+		Downloads and installs Claude Code for all users on the machine.
+		Requires Administrator privileges. Adds to system PATH.
+		Each user authenticates separately (credentials are per-user).
+	.PARAMETER Force
+		Reinstall even if already installed.
+	.EXAMPLE
+		Install-ClaudeCode
+	.EXAMPLE
+		Install-ClaudeCode -Force
+	.NOTES
+		Requires: Administrator privileges, Windows 10/11, PowerShell 5.1+
+	#>
+	[CmdletBinding()]
+	param(
+		[switch]$Force
+	)
+
+	# Paths
+	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+	$ClaudeFolder = "$Global:ITFolder\ClaudeCode"
+	$ClaudeExe = "$ClaudeFolder\claude.exe"
+	$UserClaudeFolder = "$env:LOCALAPPDATA\Programs\claude-code"
+	$UserClaudeExe = "$env:LOCALAPPDATA\Microsoft\WindowsApps\claude.exe"
+
+	# Check admin
+	$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+	if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Write-Host "[!] Administrator privileges required for system-wide install." -ForegroundColor Red
+		Write-Host "    Run PowerShell as Administrator and try again." -ForegroundColor Yellow
+		return $false
+	}
+
+	# Check existing
+	if ((Test-Path $ClaudeExe) -and -not $Force) {
+		Write-Host "[OK] Claude Code is already installed at $ClaudeFolder" -ForegroundColor Green
+		Write-Host "    Use -Force to reinstall, or run Start-ClaudeCode to launch." -ForegroundColor Yellow
+		return $true
+	}
+
+	# Enable TLS
+	try {
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+	} catch {
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+	}
+
+	Write-Host "`n=== Installing Claude Code System-Wide ===" -ForegroundColor Cyan
+	Write-Host "Install location: $ClaudeFolder" -ForegroundColor White
+
+	try {
+		Write-Host "`nStep 1: Running official installer..." -ForegroundColor Yellow
+		$script = Invoke-RestMethod -Uri "https://claude.ai/install.ps1" -UseBasicParsing
+		Invoke-Expression $script
+		Start-Sleep -Seconds 3
+
+		# Find installed location
+		$SourceFolder = $null
+		if (Test-Path $UserClaudeFolder) {
+			$SourceFolder = $UserClaudeFolder
+		} elseif (Test-Path "$env:USERPROFILE\.claude\local") {
+			$SourceFolder = "$env:USERPROFILE\.claude\local"
+		} else {
+			$found = Get-ChildItem -Path $env:LOCALAPPDATA -Filter "claude.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+			if ($found) { $SourceFolder = $found.DirectoryName }
+		}
+
+		if (-not $SourceFolder) {
+			throw "Could not locate Claude Code installation files."
+		}
+
+		Write-Host " [OK] Found at: $SourceFolder" -ForegroundColor Green
+
+		Write-Host "`nStep 2: Copying to system-wide location..." -ForegroundColor Yellow
+		if (Test-Path $ClaudeFolder) { Remove-Item -Path $ClaudeFolder -Recurse -Force -ErrorAction SilentlyContinue }
+		New-Item -ItemType Directory -Path $ClaudeFolder -Force | Out-Null
+		Copy-Item -Path "$SourceFolder\*" -Destination $ClaudeFolder -Recurse -Force
+		Write-Host " [OK] Installed to $ClaudeFolder" -ForegroundColor Green
+
+		Write-Host "`nStep 3: Adding to system PATH..." -ForegroundColor Yellow
+		$currentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+		if ($currentPath -notlike "*$ClaudeFolder*") {
+			$newPath = "$currentPath;$ClaudeFolder"
+			[Environment]::SetEnvironmentVariable("Path", $newPath, "Machine")
+			Write-Host " [OK] Added to system PATH" -ForegroundColor Green
+		} else {
+			Write-Host " [OK] Already in system PATH" -ForegroundColor Green
+		}
+		# Update current session
+		if ($env:Path -notlike "*$ClaudeFolder*") { $env:Path = "$env:Path;$ClaudeFolder" }
+
+		Write-Host "`nStep 4: Cleaning up user install..." -ForegroundColor Yellow
+		if (Test-Path $UserClaudeFolder) { Remove-Item -Path $UserClaudeFolder -Recurse -Force -ErrorAction SilentlyContinue }
+		if (Test-Path $UserClaudeExe) { Remove-Item -Path $UserClaudeExe -Force -ErrorAction SilentlyContinue }
+		Write-Host " [OK] Cleaned up" -ForegroundColor Green
+
+		Write-Host "`n=== Installation Complete ===" -ForegroundColor Green
+		Write-Host "Run Start-ClaudeCode to launch." -ForegroundColor Cyan
+		return $true
+
+	} catch {
+		Write-Host "[!] Installation failed: $_" -ForegroundColor Red
+		return $false
+	}
+}
+
 Function Install-ITS247Agent {
 	If ($SiteCode -and !$IAmJOB) {
 		Start-Job -Name "InstallAgent" -InitializationScript {
@@ -180,158 +291,158 @@ Function Install-O2016STD([String] $MSPURL){
 }
 
 Function Install-O365 {
-    [CmdletBinding()]
-    param(
-        [String]$SiteCode = "Generic",
-        [String]$ConfigUrl,
-        [Switch]$SharedComputer
-    )
-    
-    Write-Host "Downloading MS Office"
-    Enable-SSL
-    
-    function Get-ODTUri {
-        <#
-        .SYNOPSIS
-        Get Download URL of latest Office 365 Deployment Tool (ODT)
-        #>
-        [CmdletBinding()]
-        [OutputType([string])]
-        param ()
-        
-        $url = "https://www.microsoft.com/en-us/download/details.aspx?id=49117"
-        
-        try {
-            $response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
-        }
-        catch {
-            throw "Failed to connect to ODT: $url with error $_."
-        }
-        
-        $ODTUri = $response.Links | Where-Object { 
-            $_.href -match "https://download\.microsoft\.com/download/.*/officedeploymenttool_.*\.exe" 
-        }
-        
-        if ($ODTUri) {
-            return $ODTUri.href
-        }
-        else {
-            throw "Could not find ODT download link on the page"
-        }
-    }
+	[CmdletBinding()]
+	param(
+		[String]$SiteCode = "Generic",
+		[String]$ConfigUrl,
+		[Switch]$SharedComputer
+	)
+	
+	Write-Host "Downloading MS Office"
+	Enable-SSL
+	
+	function Get-ODTUri {
+		<#
+		.SYNOPSIS
+		Get Download URL of latest Office 365 Deployment Tool (ODT)
+		#>
+		[CmdletBinding()]
+		[OutputType([string])]
+		param ()
+		
+		$url = "https://www.microsoft.com/en-us/download/details.aspx?id=49117"
+		
+		try {
+			$response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
+		}
+		catch {
+			throw "Failed to connect to ODT: $url with error $_."
+		}
+		
+		$ODTUri = $response.Links | Where-Object { 
+			$_.href -match "https://download\.microsoft\.com/download/.*/officedeploymenttool_.*\.exe" 
+		}
+		
+		if ($ODTUri) {
+			return $ODTUri.href
+		}
+		else {
+			throw "Could not find ODT download link on the page"
+		}
+	}
 
-    # Get the ODT Setup.exe URL
-    $downloadUrl = Get-ODTUri
-    Write-Host "ODT Download URL: $downloadUrl"
+	# Get the ODT Setup.exe URL
+	$downloadUrl = Get-ODTUri
+	Write-Host "ODT Download URL: $downloadUrl"
 
-    # Create the M365 folder if it doesn't exist
-    $m365Folder = Join-Path $ITFolder "M365"
-    if (-not (Test-Path $m365Folder)) {
-        New-Item -Path $m365Folder -ItemType Directory -Force | Out-Null
-        Write-Host "Created folder: $m365Folder"
-    }
+	# Create the M365 folder if it doesn't exist
+	$m365Folder = Join-Path $ITFolder "M365"
+	if (-not (Test-Path $m365Folder)) {
+		New-Item -Path $m365Folder -ItemType Directory -Force | Out-Null
+		Write-Host "Created folder: $m365Folder"
+	}
 
-    # Download using your existing function
-    $odtPath = Join-Path $m365Folder "ODTSetup.exe"
-    Invoke-RestMethod -Uri $downloadUrl -OutFile $(Join-Path -Path $m365Folder -ChildPath ODTSetup.exe)
+	# Download using your existing function
+	$odtPath = Join-Path $m365Folder "ODTSetup.exe"
+	Invoke-RestMethod -Uri $downloadUrl -OutFile $(Join-Path -Path $m365Folder -ChildPath ODTSetup.exe)
 
-    # Extract silently to the same folder
-    Write-Host "Extracting ODT to: $m365Folder"
-    Start-Process -FilePath $odtPath -ArgumentList "/quiet /extract:`"$m365Folder`"" -Wait
+	# Extract silently to the same folder
+	Write-Host "Extracting ODT to: $m365Folder"
+	Start-Process -FilePath $odtPath -ArgumentList "/quiet /extract:`"$m365Folder`"" -Wait
 
-    Write-Host "ODT extracted successfully to $m365Folder"
+	Write-Host "ODT extracted successfully to $m365Folder"
 
-    # Determine config file source and destination
-    Write-Host "Downloading MS Office config files"
-    if ($ConfigUrl) {
-        # Use the provided URL directly
-        $O365ConfigSource = $ConfigUrl
-        $configFileName = Split-Path $ConfigUrl -Leaf
-        if (-not $configFileName.EndsWith('.xml')) {
-            $configFileName = "O365_Config.xml"
-        }
-        $O365ConfigDest = Join-Path "$ITFolder\O365" $configFileName
-    }
-    else {
-        # Build URL from SiteCode
-        $O365ConfigSource = "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/M365/${SiteCode}_O365_Config.xml"
-        $O365ConfigDest = "$m365Folder\${SiteCode}_O365_Config.xml"
-    }
-    
-    # Ensure O365 folder exists
-    if (-not (Test-Path $m365Folder)) {
-        New-Item -Path $m365Folder -ItemType Directory -Force | Out-Null
-    }
-    
-    (New-Object System.Net.WebClient).DownloadFile($O365ConfigSource, $O365ConfigDest)
-    
-    # Modify config for SharedComputer if switch is enabled
-    if ($SharedComputer) {
-        Write-Host "Enabling SharedComputerLicensing in config file"
-        [xml]$configXml = Get-Content $O365ConfigDest
-        
-        # Find and update SharedComputerLicensing property
-        $sharedComputerProperty = $configXml.SelectNodes("//Property[@Name='SharedComputerLicensing']")
-        foreach ($property in $sharedComputerProperty) {
-            $property.Value = "1"
-        }
-        
-        # Save the modified config
-        $configXml.Save($O365ConfigDest)
-        Write-Host "SharedComputerLicensing enabled"
-    }
-    
-    Write-Host "Installing Office"
-    & $m365Folder\setup.exe /configure $O365ConfigDest | Wait-Process
-    
-    Write-Host "Placing Shortcuts"
-    
-    # Outlook shortcut
-    If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE") {
-        $TargetFile = "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE"
-    } 
-    ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE") {
-        $TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE"
-    }
-    if ($TargetFile) {
-        $ShortcutFile = "$env:Public\Desktop\Outlook.lnk"
-        $WScriptShell = New-Object -ComObject WScript.Shell
-        $Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
-        $Shortcut.TargetPath = $TargetFile
-        $Shortcut.Save()
-    }
+	# Determine config file source and destination
+	Write-Host "Downloading MS Office config files"
+	if ($ConfigUrl) {
+		# Use the provided URL directly
+		$O365ConfigSource = $ConfigUrl
+		$configFileName = Split-Path $ConfigUrl -Leaf
+		if (-not $configFileName.EndsWith('.xml')) {
+			$configFileName = "O365_Config.xml"
+		}
+		$O365ConfigDest = Join-Path "$ITFolder\O365" $configFileName
+	}
+	else {
+		# Build URL from SiteCode
+		$O365ConfigSource = "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/M365/${SiteCode}_O365_Config.xml"
+		$O365ConfigDest = "$m365Folder\${SiteCode}_O365_Config.xml"
+	}
+	
+	# Ensure O365 folder exists
+	if (-not (Test-Path $m365Folder)) {
+		New-Item -Path $m365Folder -ItemType Directory -Force | Out-Null
+	}
+	
+	(New-Object System.Net.WebClient).DownloadFile($O365ConfigSource, $O365ConfigDest)
+	
+	# Modify config for SharedComputer if switch is enabled
+	if ($SharedComputer) {
+		Write-Host "Enabling SharedComputerLicensing in config file"
+		[xml]$configXml = Get-Content $O365ConfigDest
+		
+		# Find and update SharedComputerLicensing property
+		$sharedComputerProperty = $configXml.SelectNodes("//Property[@Name='SharedComputerLicensing']")
+		foreach ($property in $sharedComputerProperty) {
+			$property.Value = "1"
+		}
+		
+		# Save the modified config
+		$configXml.Save($O365ConfigDest)
+		Write-Host "SharedComputerLicensing enabled"
+	}
+	
+	Write-Host "Installing Office"
+	& $m365Folder\setup.exe /configure $O365ConfigDest | Wait-Process
+	
+	Write-Host "Placing Shortcuts"
+	
+	# Outlook shortcut
+	If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE") {
+		$TargetFile = "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE"
+	} 
+	ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE") {
+		$TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE"
+	}
+	if ($TargetFile) {
+		$ShortcutFile = "$env:Public\Desktop\Outlook.lnk"
+		$WScriptShell = New-Object -ComObject WScript.Shell
+		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+		$Shortcut.TargetPath = $TargetFile
+		$Shortcut.Save()
+	}
 
-    # Excel shortcut
-    $TargetFile = $null
-    If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE") {
-        $TargetFile = "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
-    } 
-    ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE") {
-        $TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE"
-    }
-    if ($TargetFile) {
-        $ShortcutFile = "$env:Public\Desktop\Excel.lnk"
-        $WScriptShell = New-Object -ComObject WScript.Shell
-        $Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
-        $Shortcut.TargetPath = $TargetFile
-        $Shortcut.Save()
-    }
+	# Excel shortcut
+	$TargetFile = $null
+	If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE") {
+		$TargetFile = "C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
+	} 
+	ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE") {
+		$TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE"
+	}
+	if ($TargetFile) {
+		$ShortcutFile = "$env:Public\Desktop\Excel.lnk"
+		$WScriptShell = New-Object -ComObject WScript.Shell
+		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+		$Shortcut.TargetPath = $TargetFile
+		$Shortcut.Save()
+	}
 
-    # Word shortcut
-    $TargetFile = $null
-    If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE") {
-        $TargetFile = "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE"
-    } 
-    ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE") {
-        $TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE"
-    }
-    if ($TargetFile) {
-        $ShortcutFile = "$env:Public\Desktop\Word.lnk"
-        $WScriptShell = New-Object -ComObject WScript.Shell
-        $Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
-        $Shortcut.TargetPath = $TargetFile
-        $Shortcut.Save()
-    }
+	# Word shortcut
+	$TargetFile = $null
+	If (Test-Path "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE") {
+		$TargetFile = "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE"
+	} 
+	ELSEIF (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE") {
+		$TargetFile = "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE"
+	}
+	if ($TargetFile) {
+		$ShortcutFile = "$env:Public\Desktop\Word.lnk"
+		$WScriptShell = New-Object -ComObject WScript.Shell
+		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+		$Shortcut.TargetPath = $TargetFile
+		$Shortcut.Save()
+	}
 }
 
 Function Install-O365ProofPointConnectors {

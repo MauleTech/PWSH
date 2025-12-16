@@ -43,6 +43,125 @@ Function Remove-ADStaleComputers {
 	}
 }
 
+function Remove-ClaudeCode {
+	<#
+	.SYNOPSIS
+		Removes Claude Code credentials and/or installation.
+	.DESCRIPTION
+		By default, removes only the current user's credentials (logout).
+		Use -Full to completely uninstall (requires admin).
+
+		Credentials are per-user, so logging out only affects the current account.
+		The system-wide installation remains for other users.
+	.PARAMETER Full
+		Completely uninstall Claude Code (requires admin).
+		Removes program files, PATH entry, and current user credentials.
+	.PARAMETER Force
+		Skip confirmation prompts.
+	.EXAMPLE
+		Remove-ClaudeCode
+		# Removes credentials for current user only
+	.EXAMPLE
+		Remove-ClaudeCode -Full
+		# Complete uninstall (admin required)
+	.EXAMPLE
+		Remove-ClaudeCode -Full -Force
+		# Complete uninstall without prompts
+	.NOTES
+		Run this when done using Claude Code on a client machine.
+	#>
+	[CmdletBinding()]
+	param(
+		[switch]$Full,
+		[switch]$Force
+	)
+
+	# Paths
+	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+	$ClaudeFolder = "$Global:ITFolder\ClaudeCode"
+	$ClaudeExe = "$ClaudeFolder\claude.exe"
+	$ClaudeConfig = "$env:USERPROFILE\.claude"
+	$ClaudeJson = "$env:USERPROFILE\.claude.json"
+
+	Write-Host "`n=== Removing Claude Code ===" -ForegroundColor Cyan
+
+	# Try to logout via CLI first
+	if (Test-Path $ClaudeExe) {
+		if ($env:Path -notlike "*$ClaudeFolder*") { $env:Path = "$env:Path;$ClaudeFolder" }
+		Write-Host "Running logout command..." -ForegroundColor Gray
+		try { & $ClaudeExe auth logout 2>$null } catch { }
+	}
+
+	# Remove user credentials
+	$CredsRemoved = $false
+	if (Test-Path $ClaudeConfig) {
+		Remove-Item -Path $ClaudeConfig -Recurse -Force -ErrorAction SilentlyContinue
+		Write-Host " [OK] Removed credentials folder (.claude)" -ForegroundColor Green
+		$CredsRemoved = $true
+	}
+	if (Test-Path $ClaudeJson) {
+		Remove-Item -Path $ClaudeJson -Force -ErrorAction SilentlyContinue
+		Write-Host " [OK] Removed config file (.claude.json)" -ForegroundColor Green
+		$CredsRemoved = $true
+	}
+
+	if (-not $CredsRemoved) {
+		Write-Host " [-] No credentials found for current user" -ForegroundColor Yellow
+	}
+
+	# Full uninstall
+	if ($Full) {
+		# Check admin
+		$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+		$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+		if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+			Write-Host "`n[!] Administrator privileges required for full uninstall." -ForegroundColor Red
+			Write-Host "    Run PowerShell as Administrator and try again." -ForegroundColor Yellow
+			Write-Host "    Credentials for current user have been removed." -ForegroundColor Gray
+			return
+		}
+
+		# Confirm unless forced
+		if (-not $Force) {
+			$confirm = Read-Host "`nCompletely remove Claude Code from this machine? (Y/N)"
+			if ($confirm -ne "Y" -and $confirm -ne "y") {
+				Write-Host "Cancelled. Credentials removed, program still installed." -ForegroundColor Yellow
+				return
+			}
+		}
+
+		# Remove program folder
+		if (Test-Path $ClaudeFolder) {
+			Remove-Item -Path $ClaudeFolder -Recurse -Force -ErrorAction SilentlyContinue
+			Write-Host " [OK] Removed program folder ($ClaudeFolder)" -ForegroundColor Green
+		}
+
+		# Remove from system PATH
+		$currentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+		if ($currentPath -like "*$ClaudeFolder*") {
+			$newPath = ($currentPath -split ";" | Where-Object { $_ -ne $ClaudeFolder -and $_ -ne "" }) -join ";"
+			[Environment]::SetEnvironmentVariable("Path", $newPath, "Machine")
+			Write-Host " [OK] Removed from system PATH" -ForegroundColor Green
+		}
+
+		# Clean up any user-local installs too
+		$UserClaudeFolder = "$env:LOCALAPPDATA\Programs\claude-code"
+		$UserClaudeExe = "$env:LOCALAPPDATA\Microsoft\WindowsApps\claude.exe"
+		if (Test-Path $UserClaudeFolder) {
+			Remove-Item -Path $UserClaudeFolder -Recurse -Force -ErrorAction SilentlyContinue
+			Write-Host " [OK] Removed user-local install" -ForegroundColor Green
+		}
+		if (Test-Path $UserClaudeExe) {
+			Remove-Item -Path $UserClaudeExe -Force -ErrorAction SilentlyContinue
+		}
+
+		Write-Host "`nClaude Code completely uninstalled." -ForegroundColor Green
+	} else {
+		Write-Host "`nCredentials removed. Program still installed for other users." -ForegroundColor Green
+		Write-Host "For full uninstall, run: Remove-ClaudeCode -Full (as admin)" -ForegroundColor Gray
+	}
+}
+
 Function Remove-DuplicateFiles {
 	param (
 		[string]$Path = $PWD.Path,

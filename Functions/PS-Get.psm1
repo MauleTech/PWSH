@@ -108,6 +108,99 @@ Function Get-ADUserPassExpirations {
 	}
 }
 
+function Get-ClaudeCodeStatus {
+	<#
+	.SYNOPSIS
+		Gets the installation and authentication status of Claude Code.
+	.DESCRIPTION
+		Returns an object with installation status, version, paths, and auth status.
+		Useful for checking before running Start-ClaudeCode or Update-ClaudeCode.
+	.PARAMETER Quiet
+		Returns just $true/$false for installed status (for scripting).
+	.EXAMPLE
+		Get-ClaudeCodeStatus
+	.EXAMPLE
+		if (Get-ClaudeCodeStatus -Quiet) { Start-ClaudeCode }
+	#>
+	[CmdletBinding()]
+	param(
+		[switch]$Quiet
+	)
+
+	# Paths
+	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+	$ClaudeFolder = "$Global:ITFolder\ClaudeCode"
+	$ClaudeExe = "$ClaudeFolder\claude.exe"
+	$ClaudeConfig = "$env:USERPROFILE\.claude"
+	$ClaudeJson = "$env:USERPROFILE\.claude.json"
+
+	$Installed = Test-Path $ClaudeExe
+	$HasCredentials = (Test-Path $ClaudeConfig) -or (Test-Path $ClaudeJson)
+
+	if ($Quiet) {
+		return $Installed
+	}
+
+	# Get version if installed
+	$Version = $null
+	$LatestVersion = $null
+	$UpdateAvailable = $false
+
+	if ($Installed) {
+		# Ensure in PATH for this session
+		if ($env:Path -notlike "*$ClaudeFolder*") { $env:Path = "$env:Path;$ClaudeFolder" }
+
+		try {
+			$Version = (& $ClaudeExe --version 2>$null).Trim()
+		} catch { }
+
+		# Check latest version from npm
+		try {
+			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+			$npmInfo = Invoke-RestMethod -Uri "https://registry.npmjs.org/@anthropic-ai/claude-code/latest" -UseBasicParsing -ErrorAction SilentlyContinue
+			if ($npmInfo.version) {
+				$LatestVersion = $npmInfo.version
+				if ($Version -and $LatestVersion -and $Version -ne $LatestVersion) {
+					$UpdateAvailable = $true
+				}
+			}
+		} catch { }
+	}
+
+	# Build status object
+	$Status = [PSCustomObject]@{
+		Installed       = $Installed
+		Path            = if ($Installed) { $ClaudeExe } else { $null }
+		Version         = $Version
+		LatestVersion   = $LatestVersion
+		UpdateAvailable = $UpdateAvailable
+		HasCredentials  = $HasCredentials
+		ConfigPath      = $ClaudeConfig
+	}
+
+	# Display if not quiet
+	Write-Host "`n=== Claude Code Status ===" -ForegroundColor Cyan
+
+	if ($Installed) {
+		Write-Host " [OK] Installed: $ClaudeExe" -ForegroundColor Green
+		if ($Version) { Write-Host "      Version: $Version" -ForegroundColor Gray }
+		if ($LatestVersion) { Write-Host "      Latest:  $LatestVersion" -ForegroundColor Gray }
+		if ($UpdateAvailable) { Write-Host "      Update available! Run Update-ClaudeCode" -ForegroundColor Yellow }
+	} else {
+		Write-Host " [X] Not installed" -ForegroundColor Red
+		Write-Host "     Run Install-ClaudeCode (as admin) to install." -ForegroundColor Yellow
+	}
+
+	if ($HasCredentials) {
+		Write-Host " [OK] Credentials found for current user" -ForegroundColor Green
+	} else {
+		Write-Host " [-] No credentials (not logged in)" -ForegroundColor Yellow
+	}
+
+	Write-Host ""
+	return $Status
+}
+
 Function Get-ITFunctions {
 	param
 	(
@@ -344,70 +437,70 @@ function Get-ComputerEntraStatus {
 }
 
 function Get-DatacenterLocation {
-    <#
-    .SYNOPSIS
-    Detects which datacenter a computer is in based on ping response times.
-    
-    .DESCRIPTION
-    Pings gateway IPs in Albuquerque and Phoenix datacenters and determines location
-    based on which has lower latency.
-    
-    .PARAMETER AlbuquerqueIP
-    IP address of Albuquerque datacenter gateway. Default: 140.82.177.82
-    
-    .PARAMETER PhoenixIP
-    IP address of Phoenix datacenter gateway. Default: 207.38.71.50
-    
-    .PARAMETER Count
-    Number of ping attempts. Default: 2
-    
-    .EXAMPLE
-    Get-DatacenterLocation
-    Returns: Albuquerque (or Phoenix)
-    
-    .EXAMPLE
-    Get-DatacenterLocation -Count 8
-    Uses 8 pings for more accurate average
-    
-    .NOTES
-    Used for stretched VLAN environments to determine physical location.
-    #>
-    
-    [CmdletBinding()]
-    param(
-        [string]$AlbuquerqueIP = "140.82.177.82",
-        [string]$PhoenixIP = "207.38.71.50",
-        [int]$Count = 2
-    )
-    
-    Write-Verbose "Pinging Albuquerque gateway: $AlbuquerqueIP"
-    $abqPing = Test-Connection -ComputerName $AlbuquerqueIP -Count $Count -ErrorAction SilentlyContinue
-    
-    Write-Verbose "Pinging Phoenix gateway: $PhoenixIP"
-    $phxPing = Test-Connection -ComputerName $PhoenixIP -Count $Count -ErrorAction SilentlyContinue
-    
-    if (-not $abqPing -and -not $phxPing) {
-        Write-Warning "Unable to reach either datacenter gateway"
-        return "Unknown"
-    } elseif (-not $abqPing) {
-        Write-Verbose "Albuquerque gateway unreachable, defaulting to Phoenix"
-        return "Phoenix"
-    } elseif (-not $phxPing) {
-        Write-Verbose "Phoenix gateway unreachable, defaulting to Albuquerque"
-        return "Albuquerque"
-    }
-    
-    $abqAvg = ($abqPing | Measure-Object -Property ResponseTime -Average).Average
-    $phxAvg = ($phxPing | Measure-Object -Property ResponseTime -Average).Average
-    
-    Write-Verbose "Albuquerque average: $abqAvg ms"
-    Write-Verbose "Phoenix average: $phxAvg ms"
-    
-    if ($abqAvg -lt $phxAvg) {
-        return "Albuquerque"
-    } else {
-        return "Phoenix"
-    }
+	<#
+	.SYNOPSIS
+	Detects which datacenter a computer is in based on ping response times.
+	
+	.DESCRIPTION
+	Pings gateway IPs in Albuquerque and Phoenix datacenters and determines location
+	based on which has lower latency.
+	
+	.PARAMETER AlbuquerqueIP
+	IP address of Albuquerque datacenter gateway. Default: 140.82.177.82
+	
+	.PARAMETER PhoenixIP
+	IP address of Phoenix datacenter gateway. Default: 207.38.71.50
+	
+	.PARAMETER Count
+	Number of ping attempts. Default: 2
+	
+	.EXAMPLE
+	Get-DatacenterLocation
+	Returns: Albuquerque (or Phoenix)
+	
+	.EXAMPLE
+	Get-DatacenterLocation -Count 8
+	Uses 8 pings for more accurate average
+	
+	.NOTES
+	Used for stretched VLAN environments to determine physical location.
+	#>
+	
+	[CmdletBinding()]
+	param(
+		[string]$AlbuquerqueIP = "140.82.177.82",
+		[string]$PhoenixIP = "207.38.71.50",
+		[int]$Count = 2
+	)
+	
+	Write-Verbose "Pinging Albuquerque gateway: $AlbuquerqueIP"
+	$abqPing = Test-Connection -ComputerName $AlbuquerqueIP -Count $Count -ErrorAction SilentlyContinue
+	
+	Write-Verbose "Pinging Phoenix gateway: $PhoenixIP"
+	$phxPing = Test-Connection -ComputerName $PhoenixIP -Count $Count -ErrorAction SilentlyContinue
+	
+	if (-not $abqPing -and -not $phxPing) {
+		Write-Warning "Unable to reach either datacenter gateway"
+		return "Unknown"
+	} elseif (-not $abqPing) {
+		Write-Verbose "Albuquerque gateway unreachable, defaulting to Phoenix"
+		return "Phoenix"
+	} elseif (-not $phxPing) {
+		Write-Verbose "Phoenix gateway unreachable, defaulting to Albuquerque"
+		return "Albuquerque"
+	}
+	
+	$abqAvg = ($abqPing | Measure-Object -Property ResponseTime -Average).Average
+	$phxAvg = ($phxPing | Measure-Object -Property ResponseTime -Average).Average
+	
+	Write-Verbose "Albuquerque average: $abqAvg ms"
+	Write-Verbose "Phoenix average: $phxAvg ms"
+	
+	if ($abqAvg -lt $phxAvg) {
+		return "Albuquerque"
+	} else {
+		return "Phoenix"
+	}
 }
 
 Function Global:Get-DellWarranty {
@@ -1446,110 +1539,110 @@ Function Get-UserProfileSpace {
 }
 
 function Get-VMByFQDN {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FQDN,
-        [switch]$Detailed
-    )
+	param(
+		[Parameter(Mandatory=$true)]
+		[string]$FQDN,
+		[switch]$Detailed
+	)
 
-    Write-Verbose "Searching for VM with FQDN: $FQDN"
+	Write-Verbose "Searching for VM with FQDN: $FQDN"
 
-    # Method 1: Try Integration Services/KVP data first (most reliable for Windows VMs)
-    Write-Verbose "Attempting Integration Services lookup..."
-    $VMs = Get-VM | Where-Object {$_.State -eq 'Running'}
+	# Method 1: Try Integration Services/KVP data first (most reliable for Windows VMs)
+	Write-Verbose "Attempting Integration Services lookup..."
+	$VMs = Get-VM | Where-Object {$_.State -eq 'Running'}
 
-    foreach ($VM in $VMs) {
-        try {
-            # Get KVP Exchange Component data
-            $VMID = $VM.Id
-            $KvpData = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_KvpExchangeComponent -Filter "SystemName='$VMID'"
+	foreach ($VM in $VMs) {
+		try {
+			# Get KVP Exchange Component data
+			$VMID = $VM.Id
+			$KvpData = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_KvpExchangeComponent -Filter "SystemName='$VMID'"
 
-            if ($KvpData.GuestIntrinsicExchangeItems) {
-                # Parse XML KVP data
-                foreach ($Item in $KvpData.GuestIntrinsicExchangeItems) {
-                    $XmlItem = [xml]$Item
-                    if ($XmlItem.Instance.Property | Where-Object {$_.Name -eq 'Name' -and $_.Value -eq 'FullyQualifiedDomainName'}) {
-                        $GuestFQDN = ($XmlItem.Instance.Property | Where-Object {$_.Name -eq 'Data'}).Value
-                        if ($GuestFQDN -eq $FQDN) {
-                            Write-Verbose "Found VM via Integration Services: $($VM.Name)"
-                            $NetworkInfo = Get-VMNetworkAdapter -VM $VM | Select-Object -First 1
-                            return [PSCustomObject]@{
-                                VMName = $VM.Name
-                                VMID = $VM.Id
-                                State = $VM.State
-                                FQDN = $GuestFQDN
-                                IPAddresses = $NetworkInfo.IPAddresses -join ', '
-                                MACAddress = $NetworkInfo.MacAddress
-                                Method = 'IntegrationServices'
-                                Host = $env:COMPUTERNAME
-                            }
-                        }
-                    }
-                }
-            }
-        } catch {
-            Write-Verbose "Integration Services lookup failed for $($VM.Name): $_"
-        }
-    }
+			if ($KvpData.GuestIntrinsicExchangeItems) {
+				# Parse XML KVP data
+				foreach ($Item in $KvpData.GuestIntrinsicExchangeItems) {
+					$XmlItem = [xml]$Item
+					if ($XmlItem.Instance.Property | Where-Object {$_.Name -eq 'Name' -and $_.Value -eq 'FullyQualifiedDomainName'}) {
+						$GuestFQDN = ($XmlItem.Instance.Property | Where-Object {$_.Name -eq 'Data'}).Value
+						if ($GuestFQDN -eq $FQDN) {
+							Write-Verbose "Found VM via Integration Services: $($VM.Name)"
+							$NetworkInfo = Get-VMNetworkAdapter -VM $VM | Select-Object -First 1
+							return [PSCustomObject]@{
+								VMName = $VM.Name
+								VMID = $VM.Id
+								State = $VM.State
+								FQDN = $GuestFQDN
+								IPAddresses = $NetworkInfo.IPAddresses -join ', '
+								MACAddress = $NetworkInfo.MacAddress
+								Method = 'IntegrationServices'
+								Host = $env:COMPUTERNAME
+							}
+						}
+					}
+				}
+			}
+		} catch {
+			Write-Verbose "Integration Services lookup failed for $($VM.Name): $_"
+		}
+	}
 
-    # Method 2: Fallback to IP resolution and matching
-    Write-Verbose "Falling back to IP resolution method..."
-    try {
-        $ResolvedIPs = [System.Net.Dns]::GetHostAddresses($FQDN) | Where-Object {$_.AddressFamily -eq 'InterNetwork'} | Select-Object -ExpandProperty IPAddressToString
-        Write-Verbose "Resolved $FQDN to: $($ResolvedIPs -join ', ')"
-    } catch {
-        Write-Warning "Unable to resolve FQDN: $FQDN"
-        $ResolvedIPs = @()
-    }
+	# Method 2: Fallback to IP resolution and matching
+	Write-Verbose "Falling back to IP resolution method..."
+	try {
+		$ResolvedIPs = [System.Net.Dns]::GetHostAddresses($FQDN) | Where-Object {$_.AddressFamily -eq 'InterNetwork'} | Select-Object -ExpandProperty IPAddressToString
+		Write-Verbose "Resolved $FQDN to: $($ResolvedIPs -join ', ')"
+	} catch {
+		Write-Warning "Unable to resolve FQDN: $FQDN"
+		$ResolvedIPs = @()
+	}
 
-    if ($ResolvedIPs.Count -gt 0) {
-        # Check all VMs (including stopped ones for IP matching)
-        $AllVMs = Get-VM
-        foreach ($VM in $AllVMs) {
-            $VMNetAdapters = Get-VMNetworkAdapter -VM $VM
-            foreach ($Adapter in $VMNetAdapters) {
-                $AdapterIPs = $Adapter.IPAddresses | Where-Object {$_ -notlike '*:*'}  # IPv4 only
-                foreach ($IP in $ResolvedIPs) {
-                    if ($IP -in $AdapterIPs) {
-                        Write-Verbose "Found VM via IP match: $($VM.Name)"
-                        return [PSCustomObject]@{
-                            VMName = $VM.Name
-                            VMID = $VM.Id
-                            State = $VM.State
-                            FQDN = $FQDN
-                            IPAddresses = $AdapterIPs -join ', '
-                            MACAddress = $Adapter.MacAddress
-                            Method = 'IPResolution'
-                            Host = $env:COMPUTERNAME
-                        }
-                    }
-                }
-            }
-        }
-    }
+	if ($ResolvedIPs.Count -gt 0) {
+		# Check all VMs (including stopped ones for IP matching)
+		$AllVMs = Get-VM
+		foreach ($VM in $AllVMs) {
+			$VMNetAdapters = Get-VMNetworkAdapter -VM $VM
+			foreach ($Adapter in $VMNetAdapters) {
+				$AdapterIPs = $Adapter.IPAddresses | Where-Object {$_ -notlike '*:*'}  # IPv4 only
+				foreach ($IP in $ResolvedIPs) {
+					if ($IP -in $AdapterIPs) {
+						Write-Verbose "Found VM via IP match: $($VM.Name)"
+						return [PSCustomObject]@{
+							VMName = $VM.Name
+							VMID = $VM.Id
+							State = $VM.State
+							FQDN = $FQDN
+							IPAddresses = $AdapterIPs -join ', '
+							MACAddress = $Adapter.MacAddress
+							Method = 'IPResolution'
+							Host = $env:COMPUTERNAME
+						}
+					}
+				}
+			}
+		}
+	}
 
-    # Method 3: Last resort - check if hostname matches VM name
-    Write-Verbose "Checking for hostname match..."
-    $Hostname = $FQDN.Split('.')[0]
-    $PossibleVM = Get-VM | Where-Object {$_.Name -eq $Hostname -or $_.Name -eq $Hostname.ToUpper()}
-    if ($PossibleVM) {
-        Write-Warning "Found VM with matching hostname but couldn't verify FQDN: $($PossibleVM.Name)"
-        if ($Detailed) {
-            $NetworkInfo = Get-VMNetworkAdapter -VM $PossibleVM | Select-Object -First 1
-            return [PSCustomObject]@{
-                VMName = $PossibleVM.Name
-                VMID = $PossibleVM.Id
-                State = $PossibleVM.State
-                FQDN = "$Hostname (unverified)"
-                IPAddresses = $NetworkInfo.IPAddresses -join ', '
-                MACAddress = $NetworkInfo.MacAddress
-                Method = 'HostnameOnly'
-                Host = $env:COMPUTERNAME
-            }
-        }
-    }
+	# Method 3: Last resort - check if hostname matches VM name
+	Write-Verbose "Checking for hostname match..."
+	$Hostname = $FQDN.Split('.')[0]
+	$PossibleVM = Get-VM | Where-Object {$_.Name -eq $Hostname -or $_.Name -eq $Hostname.ToUpper()}
+	if ($PossibleVM) {
+		Write-Warning "Found VM with matching hostname but couldn't verify FQDN: $($PossibleVM.Name)"
+		if ($Detailed) {
+			$NetworkInfo = Get-VMNetworkAdapter -VM $PossibleVM | Select-Object -First 1
+			return [PSCustomObject]@{
+				VMName = $PossibleVM.Name
+				VMID = $PossibleVM.Id
+				State = $PossibleVM.State
+				FQDN = "$Hostname (unverified)"
+				IPAddresses = $NetworkInfo.IPAddresses -join ', '
+				MACAddress = $NetworkInfo.MacAddress
+				Method = 'HostnameOnly'
+				Host = $env:COMPUTERNAME
+			}
+		}
+	}
 
-    return $null
+	return $null
 }
 
 Function Get-VMHostName {

@@ -37,6 +37,114 @@ Function Start-BackstageBrowser {
 	}
 }
 
+function Start-ClaudeCode {
+	<#
+	.SYNOPSIS
+		Launches Claude Code, installing or updating if needed.
+	.DESCRIPTION
+		Smart launcher for Claude Code:
+		- Installs if not present (requires admin)
+		- Checks for updates and prompts to update
+		- Launches Claude Code
+
+		Browser will open for authentication if not logged in.
+	.PARAMETER SkipUpdateCheck
+		Skip the update check and launch immediately.
+	.PARAMETER NoLaunch
+		Install/update only, don't launch Claude Code.
+	.EXAMPLE
+		Start-ClaudeCode
+	.EXAMPLE
+		Start-ClaudeCode -SkipUpdateCheck
+	.NOTES
+		When done, run Remove-ClaudeCode to logout from this machine.
+	#>
+	[CmdletBinding()]
+	param(
+		[switch]$SkipUpdateCheck,
+		[switch]$NoLaunch
+	)
+
+	# Paths
+	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+	$ClaudeFolder = "$Global:ITFolder\ClaudeCode"
+	$ClaudeExe = "$ClaudeFolder\claude.exe"
+
+	# Check if installed
+	if (-not (Test-Path $ClaudeExe)) {
+		Write-Host "`nClaude Code is not installed." -ForegroundColor Yellow
+
+		# Check admin
+		$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+		$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+		if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+			Write-Host "[!] Administrator privileges required to install." -ForegroundColor Red
+			Write-Host "    Run PowerShell as Administrator and try again." -ForegroundColor Yellow
+			return
+		}
+
+		$install = Read-Host "Install Claude Code now? (Y/N)"
+		if ($install -eq "Y" -or $install -eq "y") {
+			$result = Install-ClaudeCode
+			if (-not $result) {
+				Write-Host "[!] Installation failed." -ForegroundColor Red
+				return
+			}
+		} else {
+			return
+		}
+	}
+
+	# Ensure in PATH
+	if ($env:Path -notlike "*$ClaudeFolder*") { $env:Path = "$env:Path;$ClaudeFolder" }
+
+	# Check for updates (unless skipped)
+	if (-not $SkipUpdateCheck) {
+		Write-Host "Checking for updates..." -ForegroundColor Gray
+
+		$CurrentVersion = $null
+		$LatestVersion = $null
+
+		try {
+			$CurrentVersion = (& $ClaudeExe --version 2>$null).Trim()
+		} catch { }
+
+		try {
+			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+			$npmInfo = Invoke-RestMethod -Uri "https://registry.npmjs.org/@anthropic-ai/claude-code/latest" -UseBasicParsing -ErrorAction SilentlyContinue -TimeoutSec 5
+			if ($npmInfo.version) { $LatestVersion = $npmInfo.version }
+		} catch { }
+
+		if ($CurrentVersion -and $LatestVersion -and $CurrentVersion -ne $LatestVersion) {
+			Write-Host "Update available: $CurrentVersion -> $LatestVersion" -ForegroundColor Yellow
+
+			# Check admin for update
+			$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+			$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+			if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+				$update = Read-Host "Update now? (Y/N)"
+				if ($update -eq "Y" -or $update -eq "y") {
+					Update-ClaudeCode -Force
+				}
+			} else {
+				Write-Host "Run as Administrator to update." -ForegroundColor Gray
+			}
+		} elseif ($CurrentVersion) {
+			Write-Host "Claude Code is up to date ($CurrentVersion)" -ForegroundColor Green
+		}
+	}
+
+	# Launch
+	if (-not $NoLaunch) {
+		Write-Host "`nLaunching Claude Code..." -ForegroundColor Cyan
+		Write-Host "Browser will open for authentication if not logged in." -ForegroundColor Gray
+		Write-Host "When done, run: Remove-ClaudeCode" -ForegroundColor Yellow
+		Write-Host ""
+
+		& $ClaudeExe
+	}
+}
+
 Function Start-CleanupOfSystemDrive {
 	Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/master/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
 }

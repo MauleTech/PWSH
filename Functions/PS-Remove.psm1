@@ -187,8 +187,13 @@ Function Remove-DuplicateFiles {
 }
 
 Function Remove-ITS247InstallFolder {
-	Write-Host "Cleaning up install folder"
-	Remove-PathForcefully -Path '$ITFolder\ITS247Agent'
+	[Alias("Remove-PpkgInstallFolder")]
+	[CmdletBinding()]
+	param()
+	Write-Host "Cleaning up install folders"
+	Remove-PathForcefully -Path "$ITFolder\ITS247Agent"
+	Remove-PathForcefully -Path "$ITFolder\PPKG"
+	Remove-PathForcefully -Path "$ITFolder\Apps"
 }
 
 Function Remove-PathForcefully {

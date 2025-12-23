@@ -1,14 +1,16 @@
-Function Set-AutoLogon ([String] $SiteCode) {
+Function Set-AutoLogon {
+	param (
+		[String]$Username = 'MTLocal',
+		[String]$Password
+	)
 	Write-Host "Set autologon"
-		#Registry path declaration
-		$RegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-		[String]$DefaultUsername = 'ATGLocal'
-		[String]$DefaultPassword = $SiteCode + 'T3mpP@ss'
-		#setting registry values
-		Set-ItemProperty $RegPath "AutoAdminLogon" -Value "1" -type String
-		Set-ItemProperty $RegPath "DefaultUsername" -Value $DefaultUsername -type String
-		Set-ItemProperty $RegPath "DefaultPassword" -Value $DefaultPassword -type String
-		Set-ItemProperty $RegPath "AutoLogonCount" -Value "1" -type DWord
+	#Registry path declaration
+	$RegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+	#setting registry values
+	Set-ItemProperty $RegPath "AutoAdminLogon" -Value "1" -type String
+	Set-ItemProperty $RegPath "DefaultUsername" -Value $Username -type String
+	Set-ItemProperty $RegPath "DefaultPassword" -Value $Password -type String
+	Set-ItemProperty $RegPath "AutoLogonCount" -Value "1" -type DWord
 	Write-Host "End of Set autologon"
 }
 

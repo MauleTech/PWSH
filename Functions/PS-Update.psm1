@@ -1011,6 +1011,166 @@ Function Update-WindowTitle ([String] $PassNumber) {
 		$host.ui.RawUI.WindowTitle = "$SiteCode Provisioning | $env:computername | Pass $PassNumber | Please Wait"
 }
 
+Function Update-OEMDrivers {
+	<#
+	.SYNOPSIS
+		Detects computer manufacturer and runs appropriate driver/firmware/BIOS update utility.
+	.DESCRIPTION
+		Automatically detects the computer manufacturer and runs the appropriate update utility:
+		- Dell/Alienware: Uses Update-DellPackages (Dell Command Update)
+		- HP: Uses OSD module's Invoke-HPIA (HP Image Assistant)
+		- Lenovo: Uses OSD module's Lenovo System Updater
+		Attempts to suppress reboots where possible.
+	.PARAMETER NoReboot
+		Suppress automatic reboots after updates (where supported by the utility). This parameter is for future use; current implementation already suppresses reboots.
+	.EXAMPLE
+		Update-OEMDrivers
+		Detects manufacturer and updates drivers/firmware/BIOS
+	.EXAMPLE
+		Update-OEMDrivers -NoReboot
+		Updates drivers/firmware/BIOS without rebooting
+	.LINK
+		https://github.com/OSDeploy/OSD
+	.NOTES
+		Requires: Administrator privileges, Internet access
+	#>
+	[CmdletBinding()]
+	Param(
+		[Parameter()]
+		[switch]$NoReboot
+	)
+
+	Write-Host "`n=== OEM Driver/Firmware/BIOS Update ===" -ForegroundColor Cyan
+
+	# Detect manufacturer
+	$Manufacturer = (Get-CimInstance -Class Win32_ComputerSystem).Manufacturer
+	Write-Host "Detected Manufacturer: $Manufacturer" -ForegroundColor Yellow
+
+	# Dell/Alienware Detection
+	If ($Manufacturer -match "Dell" -or $Manufacturer -match "Alienware") {
+		Write-Host "`nUsing Dell Command Update via Update-DellPackages..." -ForegroundColor Green
+		Update-DellPackages
+		Write-Host "`nDell updates completed." -ForegroundColor Green
+		return
+	}
+
+	# For non-Dell manufacturers, use OSD module
+	Write-Host "`nUsing OSD module for manufacturer-specific updates..." -ForegroundColor Yellow
+
+	# Check if OSD module is installed
+	If (-not (Get-Module -ListAvailable -Name OSD)) {
+		Write-Host "OSD module not found. Installing from PowerShell Gallery..." -ForegroundColor Yellow
+		Try {
+			Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue
+			Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+			Install-Module -Name OSD -Force -AllowClobber -Scope CurrentUser
+			Write-Host "OSD module installed successfully." -ForegroundColor Green
+		} Catch {
+			Write-Error "Failed to install OSD module: $_"
+			Write-Host "Please install manually: Install-Module -Name OSD" -ForegroundColor Red
+			return
+		}
+	}
+
+	# Import OSD module
+	Try {
+		Import-Module OSD -Force -ErrorAction Stop
+		Write-Host "OSD module loaded successfully." -ForegroundColor Green
+	} Catch {
+		Write-Error "Failed to import OSD module: $_"
+		return
+	}
+
+	# HP Detection
+	If ($Manufacturer -match "HP" -or $Manufacturer -match "Hewlett") {
+		Write-Host "`nHP system detected. Running HP Image Assistant..." -ForegroundColor Green
+		Try {
+			# Check if HP device is supported
+			If (Get-Command Test-HPIASupport -ErrorAction SilentlyContinue) {
+				$HPSupported = Test-HPIASupport
+				If (-not $HPSupported) {
+					Write-Warning "This HP device may not be fully supported by HP Image Assistant."
+				}
+			}
+
+			# Run HPIA for drivers, firmware, and BIOS
+			# Operation: DownloadSoftPaqs to download and install
+			# Category: Drivers, Firmware, BIOS
+			# Action: Install to apply updates
+			# SilentMode: Suppress UI prompts
+			Write-Host "Installing HP Image Assistant and scanning for updates..." -ForegroundColor Cyan
+			Write-Host "This may take several minutes..." -ForegroundColor Yellow
+
+			Invoke-HPIA -Operation DownloadSoftPaqs `
+						-Category @("Drivers", "Firmware", "BIOS") `
+						-Selection All `
+						-Action Install `
+						-SilentMode `
+						-NoninteractiveMode
+
+			Write-Host "`nHP updates completed." -ForegroundColor Green
+
+			# Note: HPIA sets script-level variables for reboot status
+			# But since we're in a function, we'll just inform the user
+			Write-Host "Note: Some updates may require a system reboot to complete." -ForegroundColor Yellow
+
+		} Catch {
+			Write-Error "HP Image Assistant failed: $_"
+			Write-Host "You may need to run Windows Update manually or use HP Support Assistant." -ForegroundColor Yellow
+		}
+		return
+	}
+
+	# Lenovo Detection
+	If ($Manufacturer -match "Lenovo") {
+		Write-Host "`nLenovo system detected. Running Lenovo System Updater..." -ForegroundColor Green
+		Try {
+			# Install Lenovo System Updater if not present
+			Write-Host "Checking for Lenovo System Updater..." -ForegroundColor Cyan
+
+			If (Get-Command Install-LenovoSystemUpdater -ErrorAction SilentlyContinue) {
+				Install-LenovoSystemUpdater
+			}
+
+			# Run Lenovo System Updater (includes -noreboot flag)
+			Write-Host "Running Lenovo System Updater..." -ForegroundColor Cyan
+			Write-Host "This may take several minutes..." -ForegroundColor Yellow
+
+			If (Get-Command Invoke-LenovoSystemUpdater -ErrorAction SilentlyContinue) {
+				Invoke-LenovoSystemUpdater
+			} Else {
+				Write-Warning "Invoke-LenovoSystemUpdater command not found in OSD module."
+				Write-Host "Attempting alternative Lenovo update method..." -ForegroundColor Yellow
+
+				# Try using Install-LenovoApps as fallback
+				If (Get-Command Install-LenovoApps -ErrorAction SilentlyContinue) {
+					Install-LenovoApps
+				} Else {
+					Throw "No Lenovo update functions available in OSD module."
+				}
+			}
+
+			Write-Host "`nLenovo updates completed." -ForegroundColor Green
+			Write-Host "Note: Some updates may require a system reboot to complete." -ForegroundColor Yellow
+
+		} Catch {
+			Write-Error "Lenovo System Updater failed: $_"
+			Write-Host "You may need to run Windows Update manually or use Lenovo Vantage." -ForegroundColor Yellow
+		}
+		return
+	}
+
+	# Unsupported manufacturer
+	Write-Warning "`nManufacturer '$Manufacturer' is not currently supported by this function."
+	Write-Host "Supported manufacturers:" -ForegroundColor Yellow
+	Write-Host "  - Dell / Alienware" -ForegroundColor Cyan
+	Write-Host "  - HP / Hewlett-Packard" -ForegroundColor Cyan
+	Write-Host "  - Lenovo" -ForegroundColor Cyan
+	Write-Host "`nFor other manufacturers, please use:" -ForegroundColor Yellow
+	Write-Host "  - Windows Update (Update-Windows)" -ForegroundColor Cyan
+	Write-Host "  - Manufacturer-specific update tools" -ForegroundColor Cyan
+}
+
 Function Update-WindowsTo11 {
 	<#
 	.SYNOPSIS

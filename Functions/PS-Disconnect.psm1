@@ -36,7 +36,69 @@ Function Disconnect-NetExtender {
     This example disconnects from the VPN session.
 #>
 }
-	
+
+Function Disconnect-SophosConnect {
+	param
+	(
+		[Parameter(Mandatory = $false)]
+		[string]$ConnectionName
+	)
+
+	# Define possible paths for sccli.exe
+	$possiblePaths = @(
+		"${env:ProgramFiles(x86)}\Sophos\Connect\sccli.exe"
+		"${env:ProgramFiles}\Sophos\Connect\sccli.exe"
+		"${env:ProgramFiles(x86)}\Sophos\Sophos SSL VPN Client\sccli.exe"
+		"${env:ProgramFiles}\Sophos\Sophos SSL VPN Client\sccli.exe"
+	)
+
+	# Find the first valid path
+	$SCPath = $possiblePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+	If (!$SCPath) {
+		Write-Host "This command only works if you have Sophos Connect installed." -ForegroundColor Red
+		return
+	}
+
+	# If no connection name provided, list active connections
+	If ([string]::IsNullOrWhiteSpace($ConnectionName)) {
+		Write-Host "Listing available Sophos Connect VPN connections:" -ForegroundColor Cyan
+		& "$SCPath" list -d
+		Write-Host ""
+		$ConnectionName = Read-Host "Enter the connection name to disconnect"
+		If ([string]::IsNullOrWhiteSpace($ConnectionName)) {
+			Write-Host "Connection name is required." -ForegroundColor Red
+			return
+		}
+	}
+
+	Write-Host "Initiating VPN disconnection from: $ConnectionName" -ForegroundColor Cyan
+
+	# Disconnect from VPN
+	Try {
+		& "$SCPath" disable -n $ConnectionName
+		Start-Sleep -Seconds 2
+		Write-Host ""
+		Get-SophosConnectStatus
+	}
+	Catch {
+		Write-Host "Error disconnecting from VPN: $_" -ForegroundColor Red
+	}
+
+	<#
+	.SYNOPSIS
+		Disconnects an existing SSL VPN connection using Sophos Connect
+	.PARAMETER ConnectionName
+		The name of the Sophos Connect VPN connection to disconnect. If not provided, will list available connections.
+	.EXAMPLE
+		Disconnect-SophosConnect -ConnectionName "Company VPN"
+		Disconnects from the VPN connection named "Company VPN".
+	.EXAMPLE
+		Disconnect-SophosConnect
+		Lists available VPN connections and prompts for selection to disconnect.
+	#>
+}
+
 	Function Disconnect-O365Exchange {
 		Disconnect-ExchangeOnline -Confirm:$false
 	}

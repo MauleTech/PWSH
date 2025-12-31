@@ -126,6 +126,98 @@ Function Connect-NetExtender {
 	#>
 }
 
+Function Connect-SophosConnect {
+	param
+	(
+		[Parameter(Mandatory = $false)]
+		[string]$ConnectionName,
+		[Parameter(Mandatory = $false)]
+		[string]$VPNuser,
+		[Parameter(Mandatory = $false)]
+		[string]$VPNpassword
+	)
+
+	# Define possible paths for sccli.exe
+	$possiblePaths = @(
+		"${env:ProgramFiles(x86)}\Sophos\Connect\sccli.exe"
+		"${env:ProgramFiles}\Sophos\Connect\sccli.exe"
+		"${env:ProgramFiles(x86)}\Sophos\Sophos SSL VPN Client\sccli.exe"
+		"${env:ProgramFiles}\Sophos\Sophos SSL VPN Client\sccli.exe"
+	)
+
+	# Find the first valid path
+	$SCPath = $possiblePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+	If (!$SCPath) {
+		Write-Host "Sophos Connect is not installed or sccli.exe was not found." -ForegroundColor Red
+		Write-Host "Run 'Install-SophosConnect' to install the client." -ForegroundColor Yellow
+		return
+	}
+
+	# If no connection name provided, list available connections
+	If ([string]::IsNullOrWhiteSpace($ConnectionName)) {
+		Write-Host "Listing available Sophos Connect VPN connections:" -ForegroundColor Cyan
+		& "$SCPath" list -d
+		Write-Host ""
+		$ConnectionName = Read-Host "Enter the connection name to connect to"
+		If ([string]::IsNullOrWhiteSpace($ConnectionName)) {
+			Write-Host "Connection name is required." -ForegroundColor Red
+			return
+		}
+	}
+
+	Write-Host "Initiating VPN connection to: $ConnectionName" -ForegroundColor Cyan
+
+	# Build the enable command
+	$enableArgs = @("enable", "-n", $ConnectionName)
+
+	# Add username if provided
+	If (![string]::IsNullOrWhiteSpace($VPNuser)) {
+		$enableArgs += @("-u", $VPNuser)
+	}
+
+	# Add password if provided
+	If (![string]::IsNullOrWhiteSpace($VPNpassword)) {
+		$enableArgs += @("-p", $VPNpassword)
+	}
+
+	# Connect to VPN
+	Try {
+		& "$SCPath" $enableArgs
+		Start-Sleep -Seconds 2
+		Write-Host ""
+		Get-SophosConnectStatus
+	}
+	Catch {
+		Write-Host "Error connecting to VPN: $_" -ForegroundColor Red
+	}
+
+	Write-Host 'Try "Disconnect-SophosConnect" or "Get-SophosConnectStatus"' -ForegroundColor Yellow
+
+	<#
+	.SYNOPSIS
+		Initiates an SSL VPN connection using Sophos Connect
+	.PARAMETER ConnectionName
+		The name of the Sophos Connect VPN connection to use. If not provided, will list available connections.
+	.PARAMETER VPNuser
+		(Optional) The VPN username. If not provided, may prompt during connection.
+	.PARAMETER VPNpassword
+		(Optional) The VPN password. If not provided, may prompt during connection.
+	.EXAMPLE
+		Connect-SophosConnect -ConnectionName "Company VPN"
+		Connects to a VPN connection named "Company VPN", prompting for credentials if needed.
+	.EXAMPLE
+		Connect-SophosConnect -ConnectionName "Company VPN" -VPNuser "jdoe" -VPNpassword "MyP@ssw0rd"
+		Connects to a VPN connection with specified credentials.
+	.EXAMPLE
+		Connect-SophosConnect
+		Lists available VPN connections and prompts for selection.
+	.NOTES
+		Sophos Connect uses sccli.exe for command-line operations.
+		Connection profiles must be pre-configured before using this function.
+	#>
+}
+
 Function Connect-O365Exchange {
 	param
 	(

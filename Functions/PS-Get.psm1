@@ -1096,6 +1096,46 @@ Function Get-LoginHistory {
 	$FilteredOutput | Sort-Object -Property TimeCreated | Format-Table -AutoSize
 }
 
+Function Get-SophosConnectStatus {
+	# Define possible paths for sccli.exe
+	$possiblePaths = @(
+		"${env:ProgramFiles(x86)}\Sophos\Connect\sccli.exe"
+		"${env:ProgramFiles}\Sophos\Connect\sccli.exe"
+		"${env:ProgramFiles(x86)}\Sophos\Sophos SSL VPN Client\sccli.exe"
+		"${env:ProgramFiles}\Sophos\Sophos SSL VPN Client\sccli.exe"
+	)
+
+	# Find the first valid path
+	$SCPath = $possiblePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+	If (!$SCPath) {
+		Write-Host "This command only works if you have Sophos Connect installed." -ForegroundColor Red
+		return
+	}
+
+	Write-Host "Sophos Connect VPN Status:" -ForegroundColor Cyan
+	Write-Host ""
+
+	# Show detailed list of connections with their status
+	& "$SCPath" list -d
+
+	Write-Host ""
+	Write-Host 'Try "Connect-SophosConnect" or "Disconnect-SophosConnect"' -ForegroundColor Yellow
+
+	<#
+	.SYNOPSIS
+		Displays the connection status of Sophos Connect VPN
+	.DESCRIPTION
+		Shows detailed information about all configured Sophos Connect VPN connections
+		including their current status (connected/disconnected).
+	.EXAMPLE
+		Get-SophosConnectStatus
+		Displays the status of all Sophos Connect VPN connections.
+	.NOTES
+		Uses sccli.exe list command to display connection information.
+	#>
+}
+
 Function Get-NetExtenderStatus {
 
 	# Definte the possible paths where NetExtender can exist.
@@ -1116,7 +1156,7 @@ Function Get-NetExtenderStatus {
 		& $NEPath status
 		}
 		Write-Host 'Try "Connect-NetExtender" or "Disconnect-NetExtender"'
-	
+
 	<#
 	.SYNOPSIS
 	Displays the connection status of Sonicwall NetExtender

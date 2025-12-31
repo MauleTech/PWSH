@@ -237,6 +237,7 @@ Enable-SSL #Enables SSL Permanently
   Update-NiniteApps
   Update-NTPDateTime
   Update-O365Apps
+  Update-OEMDrivers
   Update-PowerShellModule
   Update-PowershellModules
   Update-PSWinGetPackages

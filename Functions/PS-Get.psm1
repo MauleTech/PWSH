@@ -1679,6 +1679,217 @@ Function Get-VMHostName {
 	}
 }
 
+function Get-OrphanedVhd {
+    <#
+    .SYNOPSIS
+        Finds orphaned VHD/VHDX/AVHDX files not attached to any VM.
+    .DESCRIPTION
+        Scans specified paths or all non-system drives for virtual disk files that are not
+        currently attached to any Hyper-V VM, including parent disks in differencing chains.
+        By default, searches all drives except the system drive (typically C:).
+    .PARAMETER Path
+        Specific path(s) to scan. If not specified, scans all non-system drives.
+    .PARAMETER IncludeSystemDrive
+        Include the system drive (usually C:) in the scan when no Path is specified.
+    .PARAMETER Cluster
+        Query all cluster nodes for attached VHDs instead of just the local host.
+    .PARAMETER NoWrap
+        Disable output wrapping (show full paths without truncation).
+    .EXAMPLE
+        Get-OrphanedVhd
+        Scans all non-system drives for orphaned virtual disks.
+    .EXAMPLE
+        Get-OrphanedVhd -IncludeSystemDrive
+        Scans all drives including the system drive.
+    .EXAMPLE
+        Get-OrphanedVhd -Path "V:\VMs", "W:\Storage"
+        Scans only the specified paths.
+    .EXAMPLE
+        Get-OrphanedVhd -Cluster
+        Scans all non-system drives and queries all cluster nodes for attached VHDs.
+    .EXAMPLE
+        Get-OrphanedVhd -NoWrap
+        Scans with full path display (no wrapping).
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject[]])]
+    param(
+        [Parameter(Position = 0)]
+        [string[]]$Path,
+        [switch]$IncludeSystemDrive,
+        [switch]$Cluster,
+        [switch]$NoWrap
+    )
+
+    # Check if Hyper-V module is available
+    if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
+        Write-Warning "Hyper-V PowerShell module is not available. This function requires Hyper-V to be installed."
+        return
+    }
+
+    # Determine paths to scan
+    if ($Path) {
+        # Validate specified paths exist
+        $scanPaths = @()
+        foreach ($p in $Path) {
+            if (Test-Path -Path $p -PathType Container) {
+                $scanPaths += $p
+            } else {
+                Write-Warning "Path not found or not accessible: $p"
+            }
+        }
+        if (-not $scanPaths) {
+            Write-Warning "No valid paths to scan."
+            return
+        }
+        Write-Verbose "Using specified path(s): $($scanPaths -join ', ')"
+    } else {
+        # Get system drive letter
+        $systemDrive = $env:SystemDrive
+        if (-not $systemDrive) {
+            $systemDrive = "C:"
+        }
+        $systemDriveLetter = $systemDrive.Substring(0, 1)
+        Write-Verbose "System drive detected: $systemDrive"
+
+        # Get all fixed drives
+        $allDrives = Get-Volume | Where-Object {
+            $_.DriveType -eq "Fixed" -and
+            $_.DriveLetter -and
+            $_.FileSystemType -ne "Unknown"
+        } | Select-Object -ExpandProperty DriveLetter
+
+        # Filter out system drive unless requested
+        if ($IncludeSystemDrive) {
+            $drivesToScan = $allDrives
+            Write-Verbose "Including system drive in scan"
+        } else {
+            $drivesToScan = $allDrives | Where-Object { $_ -ne $systemDriveLetter }
+            Write-Verbose "Excluding system drive from scan"
+        }
+
+        if (-not $drivesToScan) {
+            Write-Warning "No drives found to scan."
+            return
+        }
+
+        $scanPaths = $drivesToScan | ForEach-Object { "$($_):\" }
+        Write-Verbose "Drives to scan: $($scanPaths -join ', ')"
+    }
+
+    # Get all VHDs currently attached to VMs
+    $attachedVhds = [System.Collections.Generic.List[string]]::new()
+
+    if ($Cluster) {
+        # Check if FailoverClusters module is available
+        if (-not (Get-Command Get-ClusterNode -ErrorAction SilentlyContinue)) {
+            Write-Warning "FailoverClusters module is not available. Run without -Cluster or install the feature."
+            return
+        }
+
+        Write-Verbose "Querying cluster for all VM disk paths..."
+        try {
+            $clusterNodes = Get-ClusterNode -ErrorAction Stop | Select-Object -ExpandProperty Name
+        } catch {
+            Write-Warning "Failed to query cluster nodes. Ensure this is a cluster member: $_"
+            return
+        }
+
+        foreach ($node in $clusterNodes) {
+            Write-Verbose "Querying node: $node"
+            try {
+                $nodeVhds = Invoke-Command -ComputerName $node -ScriptBlock {
+                    Get-VM | Get-VMHardDiskDrive | Select-Object -ExpandProperty Path
+                } -ErrorAction SilentlyContinue
+                if ($nodeVhds) {
+                    $nodeVhds | ForEach-Object { $attachedVhds.Add($_) }
+                }
+            } catch {
+                Write-Warning "Failed to query node $node : $_"
+            }
+        }
+        # Remove duplicates
+        $attachedVhds = [System.Collections.Generic.List[string]]($attachedVhds | Select-Object -Unique)
+    } else {
+        try {
+            $vmDisks = Get-VM | Get-VMHardDiskDrive | Select-Object -ExpandProperty Path
+            if ($vmDisks) {
+                $vmDisks | ForEach-Object { $attachedVhds.Add($_) }
+            }
+        } catch {
+            Write-Warning "Failed to query local VMs: $_"
+        }
+    }
+
+    # Build list of all VHDs in use including parent chains (case-insensitive HashSet)
+    Write-Verbose "Resolving parent disk chains..."
+    $allInUse = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($vhd in $attachedVhds) {
+        $current = $vhd
+        while ($current) {
+            [void]$allInUse.Add($current)
+            try {
+                $vhdInfo = Get-VHD -Path $current -ErrorAction Stop
+                $current = $vhdInfo.ParentPath
+            } catch {
+                Write-Verbose "Could not resolve parent for: $current"
+                $current = $null
+            }
+        }
+    }
+    Write-Verbose "Total disks in use (including parents): $($allInUse.Count)"
+
+    # Find all VHD/VHDX/AVHDX files in specified paths
+    $allVhds = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    foreach ($scanPath in $scanPaths) {
+        Write-Verbose "Scanning $scanPath for virtual disk files..."
+        try {
+            $found = Get-ChildItem -Path $scanPath -Include "*.vhd", "*.vhdx", "*.avhdx" -Recurse -ErrorAction SilentlyContinue
+            if ($found) {
+                $found | ForEach-Object { $allVhds.Add($_) }
+            }
+        } catch {
+            Write-Warning "Error scanning $scanPath : $_"
+        }
+    }
+
+    Write-Verbose "Total VHD files found: $($allVhds.Count)"
+
+    # Compare to find orphans (case-insensitive comparison via HashSet)
+    $orphanedVhds = $allVhds | Where-Object { -not $allInUse.Contains($_.FullName) }
+
+    # Build output objects sorted by size descending
+    $results = $orphanedVhds | ForEach-Object {
+        [PSCustomObject]@{
+            SizeGB        = [math]::Round($_.Length / 1GB, 2)
+            Name          = $_.Name
+            FullName      = $_.FullName
+            LastWriteTime = $_.LastWriteTime
+        }
+    } | Sort-Object -Property SizeGB -Descending
+
+    # Display table and summary
+    if ($results) {
+        if ($NoWrap) {
+            $results | Format-Table SizeGB, Name, FullName -AutoSize | Out-Host
+        } else {
+            $results | Format-Table SizeGB, Name, FullName -Wrap | Out-Host
+        }
+        $totalSize = ($results | Measure-Object -Property SizeGB -Sum).Sum
+        $totalCount = @($results).Count
+        Write-Host "Summary:" -ForegroundColor Cyan
+        Write-Host "  Scanned: $($scanPaths -join ', ')" -ForegroundColor Gray
+        Write-Host "  Orphaned files: $totalCount" -ForegroundColor Yellow
+        Write-Host "  Total size: $([math]::Round($totalSize, 2)) GB" -ForegroundColor Yellow
+        Write-Host ""
+    } else {
+        Write-Host "No orphaned virtual disk files found in: $($scanPaths -join ', ')" -ForegroundColor Green
+    }
+
+    return $results
+}
+
 Function Get-VSSWriter {
 	[CmdletBinding()]
 

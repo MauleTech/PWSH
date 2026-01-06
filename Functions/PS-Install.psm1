@@ -1014,22 +1014,17 @@ Function Install-SophosConnect {
 	.SYNOPSIS
 		Installs the Sophos Connect VPN Client
 	.DESCRIPTION
-		Downloads and installs Sophos Connect SSL VPN client. Automatically detects the latest
-		version from Sophos downloads page. Can also accept a direct download URL.
+		Downloads and installs Sophos Connect SSL VPN client using Get-FileDownload.
+		Uses a default download URL that can be overridden with the -DownloadURL parameter.
 	.PARAMETER DownloadURL
-		(Optional) Direct URL to the Sophos Connect MSI installer. If not provided, the function
-		will attempt to auto-detect the latest version from Sophos downloads page.
-	.PARAMETER Manual
-		If specified, skips auto-detection and provides manual download instructions.
+		(Optional) Direct URL to the Sophos Connect MSI installer. If not provided, uses the
+		default URL for version 2.5.0.
 	.EXAMPLE
 		Install-SophosConnect
-		Automatically downloads and installs the latest Sophos Connect from Sophos downloads page.
+		Downloads and installs Sophos Connect using the default URL.
 	.EXAMPLE
 		Install-SophosConnect -DownloadURL "https://yourfirewall.com/downloads/SophosConnect_2.5_(IPsec_and_SSLVPN).msi"
 		Downloads and installs from a specific URL (useful for organization-specific versions).
-	.EXAMPLE
-		Install-SophosConnect -Manual
-		Displays manual download instructions instead of auto-installing.
 	.NOTES
 		Sophos Connect is typically downloaded from:
 		- https://www.sophos.com/en-us/support/downloads/utm-downloads (public downloads)
@@ -1039,10 +1034,7 @@ Function Install-SophosConnect {
 	[cmdletbinding()]
 	param(
 		[Parameter(Mandatory = $false)]
-		[string]$DownloadURL,
-
-		[Parameter(Mandatory = $false)]
-		[switch]$Manual
+		[string]$DownloadURL = "https://download.sophos.com/network/clients/SophosConnect_2.5.0_GA_IPsec_and_SSLVPN.msi"
 	)
 
 	# Check if Sophos Connect is already installed
@@ -1058,58 +1050,7 @@ Function Install-SophosConnect {
 	}
 	Else {
 		Write-Host "Installing Sophos Connect VPN Client" -ForegroundColor Cyan
-
-		# If Manual switch is specified, show instructions and exit
-		If ($Manual) {
-			Write-Host "`nManual installation instructions:" -ForegroundColor Cyan
-			Write-Host "  1. Your organization's Sophos Firewall VPN portal:" -ForegroundColor White
-			Write-Host "     https://your-firewall-address/userportal" -ForegroundColor Gray
-			Write-Host "     (Log in and click 'Download for Windows')" -ForegroundColor Gray
-			Write-Host "`n  2. Sophos official downloads page:" -ForegroundColor White
-			Write-Host "     https://www.sophos.com/en-us/support/downloads/utm-downloads" -ForegroundColor Gray
-			Write-Host "`n  3. Contact your IT administrator for the download link." -ForegroundColor White
-			Write-Host "`nOnce downloaded, run:" -ForegroundColor Cyan
-			Write-Host "  msiexec /i `"C:\path\to\SophosConnect_x.x_(IPsec_and_SSLVPN).msi`" /qn" -ForegroundColor White
-			return
-		}
-
-		# Auto-detect download URL if not provided
-		If ([string]::IsNullOrWhiteSpace($DownloadURL)) {
-			Write-Host "Attempting to detect latest Sophos Connect download URL..." -ForegroundColor Cyan
-
-			Try {
-				# Try to fetch the download page
-				$downloadsPage = Invoke-WebRequest -Uri "https://www.sophos.com/en-us/support/downloads/utm-downloads" -UseBasicParsing -ErrorAction Stop
-
-				# Look for SophosConnect download link pattern
-				$downloadLink = $downloadsPage.Links | Where-Object {
-					$_.href -match "download\.sophos\.com.*SophosConnect.*IPsec.*SSLVPN\.msi$"
-				} | Select-Object -First 1
-
-				If ($downloadLink) {
-					$DownloadURL = $downloadLink.href
-					# Ensure URL is absolute
-					If ($DownloadURL -notmatch "^https?://") {
-						$DownloadURL = "https://download.sophos.com" + $DownloadURL
-					}
-					Write-Host "Detected download URL: $DownloadURL" -ForegroundColor Green
-				}
-				Else {
-					Write-Host "Could not auto-detect download URL from downloads page." -ForegroundColor Yellow
-				}
-			}
-			Catch {
-				Write-Host "Failed to access Sophos downloads page: $_" -ForegroundColor Yellow
-			}
-
-			# Fallback to known current URL if auto-detection failed
-			If ([string]::IsNullOrWhiteSpace($DownloadURL)) {
-				Write-Host "Using fallback URL for latest known version..." -ForegroundColor Cyan
-				$DownloadURL = "https://download.sophos.com/network/clients/SophosConnect_2.5.0_GA_IPsec_and_SSLVPN.msi"
-				Write-Host "Fallback URL: $DownloadURL" -ForegroundColor Gray
-				Write-Host "Note: This may not be the latest version. Check https://www.sophos.com/en-us/support/downloads/utm-downloads" -ForegroundColor Yellow
-			}
-		}
+		Write-Host "Using download URL: $DownloadURL" -ForegroundColor Cyan
 
 		# Download and install
 		Try {
@@ -1141,8 +1082,8 @@ Function Install-SophosConnect {
 		Catch {
 			Write-Host "Error during installation: $_" -ForegroundColor Red
 			Write-Host "You can try:" -ForegroundColor Yellow
-			Write-Host "  1. Run with -Manual to get manual installation instructions" -ForegroundColor Gray
-			Write-Host "  2. Specify a direct URL with -DownloadURL parameter" -ForegroundColor Gray
+			Write-Host "  1. Specify a different URL with -DownloadURL parameter" -ForegroundColor Gray
+			Write-Host "  2. Check your network connection and try again" -ForegroundColor Gray
 		}
 	}
 }

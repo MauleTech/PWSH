@@ -1009,6 +1009,98 @@ Function Install-UmbrellaDnsCert {
 	}
 }
 
+Function Install-SophosConnect {
+	<#
+	.SYNOPSIS
+		Installs the Sophos Connect VPN Client
+	.DESCRIPTION
+		Downloads and installs Sophos Connect SSL VPN client. Since Sophos Connect is not available
+		via winget or chocolatey, this function requires either a direct download URL or manual
+		download from your organization's Sophos Firewall VPN portal.
+	.PARAMETER DownloadURL
+		Direct URL to the Sophos Connect MSI installer. If not provided, the function will guide
+		you to download it manually from your organization's VPN portal.
+	.EXAMPLE
+		Install-SophosConnect -DownloadURL "https://yourfirewall.com/downloads/SophosConnect_2.4_(IPsec_and_SSLVPN).msi"
+	.EXAMPLE
+		Install-SophosConnect
+		This will provide instructions to download from your VPN portal if no URL is provided.
+	.NOTES
+		Sophos Connect is typically downloaded from:
+		- Your organization's Sophos Firewall VPN portal (https://yourfirewall/userportal)
+		- https://www.sophos.com/en-us/support/downloads/utm-downloads
+		The installer is usually named: SophosConnect_x.x_(IPsec_and_SSLVPN).msi
+	#>
+	[cmdletbinding()]
+	param(
+		[Parameter(Mandatory = $false)]
+		[string]$DownloadURL
+	)
+
+	# Check if Sophos Connect is already installed
+	$App = Get-WmiObject -Class Win32_Product | Where-Object -Property "Name" -Like "*Sophos Connect*"
+	$Service = Get-Service -Name "Sophos Connect Service" -ErrorAction SilentlyContinue
+
+	If ($App -or $Service) {
+		$Name = if ($App) { $App.Name } else { "Sophos Connect" }
+		Write-Host "$Name is already installed." -ForegroundColor Green
+		$Version = if ($App) { $App.Version } else { "Unknown" }
+		Write-Host "Installed version: $Version"
+		Write-Host "To upgrade, uninstall the current version first and reboot before installing a new version."
+	}
+	Else {
+		Write-Host "Installing Sophos Connect VPN Client" -ForegroundColor Cyan
+
+		If ([string]::IsNullOrWhiteSpace($DownloadURL)) {
+			Write-Host "`nSophos Connect is not available via winget or chocolatey." -ForegroundColor Yellow
+			Write-Host "`nYou can download Sophos Connect from one of these sources:" -ForegroundColor Cyan
+			Write-Host "  1. Your organization's Sophos Firewall VPN portal:" -ForegroundColor White
+			Write-Host "     https://your-firewall-address/userportal" -ForegroundColor Gray
+			Write-Host "     (Log in and click 'Download for Windows')" -ForegroundColor Gray
+			Write-Host "`n  2. Sophos official downloads page:" -ForegroundColor White
+			Write-Host "     https://www.sophos.com/en-us/support/downloads/utm-downloads" -ForegroundColor Gray
+			Write-Host "`n  3. Contact your IT administrator for the download link." -ForegroundColor White
+			Write-Host "`nOnce you have the download URL, run:" -ForegroundColor Cyan
+			Write-Host '  Install-SophosConnect -DownloadURL "https://your-download-url/SophosConnect.msi"' -ForegroundColor White
+			Write-Host "`nOr manually download and run:" -ForegroundColor Cyan
+			Write-Host "  msiexec /i `"C:\path\to\SophosConnect_x.x_(IPsec_and_SSLVPN).msi`" /qn" -ForegroundColor White
+			return
+		}
+
+		# Download and install if URL is provided
+		Try {
+			Write-Host "Downloading Sophos Connect from: $DownloadURL" -ForegroundColor Cyan
+			$SophosInstaller = Get-FileDownload -URL $DownloadURL -SaveToFolder "$ITFolder\SophosConnect"
+			$msiPath = $SophosInstaller[1]
+
+			If (Test-Path $msiPath) {
+				Write-Host "Installing Sophos Connect..." -ForegroundColor Cyan
+				$arguments = "/i `"$msiPath`" /quiet /norestart"
+				$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+
+				if ($process.ExitCode -eq 0) {
+					Write-Host "Installation of Sophos Connect completed successfully." -ForegroundColor Green
+					Write-Host "You can now use Connect-SophosConnect to establish VPN connections."
+				}
+				else {
+					Write-Host "Installation failed with exit code: $($process.ExitCode)" -ForegroundColor Red
+					Write-Host "Common exit codes:" -ForegroundColor Yellow
+					Write-Host "  1603 - Fatal error during installation" -ForegroundColor Gray
+					Write-Host "  1618 - Another installation is already in progress" -ForegroundColor Gray
+					Write-Host "  1619 - Installation package could not be opened" -ForegroundColor Gray
+				}
+			}
+			Else {
+				Write-Host "Download failed. File not found at: $msiPath" -ForegroundColor Red
+			}
+		}
+		Catch {
+			Write-Host "Error during installation: $_" -ForegroundColor Red
+			Write-Host "Please verify the download URL and try again, or install manually." -ForegroundColor Yellow
+		}
+	}
+}
+
 Function Install-WinGet {
 	<#
 		.SYNOPSIS

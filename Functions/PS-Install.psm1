@@ -1034,7 +1034,7 @@ Function Install-SophosConnect {
 	[cmdletbinding()]
 	param(
 		[Parameter(Mandatory = $false)]
-		[string]$DownloadURL = "https://download.sophos.com/network/clients/SophosConnect_2.5.0_GA_IPsec_and_SSLVPN.msi"
+		[string]$DownloadURL = "https://files.mauletech.com/files/Utilities/SophosConnect_2.5.0_GA(IPsec_and_SSLVPN).msi?dl"
 	)
 
 	# Check if Sophos Connect is already installed

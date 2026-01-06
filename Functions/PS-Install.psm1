@@ -1014,27 +1014,35 @@ Function Install-SophosConnect {
 	.SYNOPSIS
 		Installs the Sophos Connect VPN Client
 	.DESCRIPTION
-		Downloads and installs Sophos Connect SSL VPN client. Since Sophos Connect is not available
-		via winget or chocolatey, this function requires either a direct download URL or manual
-		download from your organization's Sophos Firewall VPN portal.
+		Downloads and installs Sophos Connect SSL VPN client. Automatically detects the latest
+		version from Sophos downloads page. Can also accept a direct download URL.
 	.PARAMETER DownloadURL
-		Direct URL to the Sophos Connect MSI installer. If not provided, the function will guide
-		you to download it manually from your organization's VPN portal.
-	.EXAMPLE
-		Install-SophosConnect -DownloadURL "https://yourfirewall.com/downloads/SophosConnect_2.4_(IPsec_and_SSLVPN).msi"
+		(Optional) Direct URL to the Sophos Connect MSI installer. If not provided, the function
+		will attempt to auto-detect the latest version from Sophos downloads page.
+	.PARAMETER Manual
+		If specified, skips auto-detection and provides manual download instructions.
 	.EXAMPLE
 		Install-SophosConnect
-		This will provide instructions to download from your VPN portal if no URL is provided.
+		Automatically downloads and installs the latest Sophos Connect from Sophos downloads page.
+	.EXAMPLE
+		Install-SophosConnect -DownloadURL "https://yourfirewall.com/downloads/SophosConnect_2.5_(IPsec_and_SSLVPN).msi"
+		Downloads and installs from a specific URL (useful for organization-specific versions).
+	.EXAMPLE
+		Install-SophosConnect -Manual
+		Displays manual download instructions instead of auto-installing.
 	.NOTES
 		Sophos Connect is typically downloaded from:
+		- https://www.sophos.com/en-us/support/downloads/utm-downloads (public downloads)
 		- Your organization's Sophos Firewall VPN portal (https://yourfirewall/userportal)
-		- https://www.sophos.com/en-us/support/downloads/utm-downloads
-		The installer is usually named: SophosConnect_x.x_(IPsec_and_SSLVPN).msi
+		The installer is usually named: SophosConnect_x.x_GA_IPsec_and_SSLVPN.msi
 	#>
 	[cmdletbinding()]
 	param(
 		[Parameter(Mandatory = $false)]
-		[string]$DownloadURL
+		[string]$DownloadURL,
+
+		[Parameter(Mandatory = $false)]
+		[switch]$Manual
 	)
 
 	# Check if Sophos Connect is already installed
@@ -1051,23 +1059,59 @@ Function Install-SophosConnect {
 	Else {
 		Write-Host "Installing Sophos Connect VPN Client" -ForegroundColor Cyan
 
-		If ([string]::IsNullOrWhiteSpace($DownloadURL)) {
-			Write-Host "`nSophos Connect is not available via winget or chocolatey." -ForegroundColor Yellow
-			Write-Host "`nYou can download Sophos Connect from one of these sources:" -ForegroundColor Cyan
+		# If Manual switch is specified, show instructions and exit
+		If ($Manual) {
+			Write-Host "`nManual installation instructions:" -ForegroundColor Cyan
 			Write-Host "  1. Your organization's Sophos Firewall VPN portal:" -ForegroundColor White
 			Write-Host "     https://your-firewall-address/userportal" -ForegroundColor Gray
 			Write-Host "     (Log in and click 'Download for Windows')" -ForegroundColor Gray
 			Write-Host "`n  2. Sophos official downloads page:" -ForegroundColor White
 			Write-Host "     https://www.sophos.com/en-us/support/downloads/utm-downloads" -ForegroundColor Gray
 			Write-Host "`n  3. Contact your IT administrator for the download link." -ForegroundColor White
-			Write-Host "`nOnce you have the download URL, run:" -ForegroundColor Cyan
-			Write-Host '  Install-SophosConnect -DownloadURL "https://your-download-url/SophosConnect.msi"' -ForegroundColor White
-			Write-Host "`nOr manually download and run:" -ForegroundColor Cyan
+			Write-Host "`nOnce downloaded, run:" -ForegroundColor Cyan
 			Write-Host "  msiexec /i `"C:\path\to\SophosConnect_x.x_(IPsec_and_SSLVPN).msi`" /qn" -ForegroundColor White
 			return
 		}
 
-		# Download and install if URL is provided
+		# Auto-detect download URL if not provided
+		If ([string]::IsNullOrWhiteSpace($DownloadURL)) {
+			Write-Host "Attempting to detect latest Sophos Connect download URL..." -ForegroundColor Cyan
+
+			Try {
+				# Try to fetch the download page
+				$downloadsPage = Invoke-WebRequest -Uri "https://www.sophos.com/en-us/support/downloads/utm-downloads" -UseBasicParsing -ErrorAction Stop
+
+				# Look for SophosConnect download link pattern
+				$downloadLink = $downloadsPage.Links | Where-Object {
+					$_.href -match "download\.sophos\.com.*SophosConnect.*IPsec.*SSLVPN\.msi$"
+				} | Select-Object -First 1
+
+				If ($downloadLink) {
+					$DownloadURL = $downloadLink.href
+					# Ensure URL is absolute
+					If ($DownloadURL -notmatch "^https?://") {
+						$DownloadURL = "https://download.sophos.com" + $DownloadURL
+					}
+					Write-Host "Detected download URL: $DownloadURL" -ForegroundColor Green
+				}
+				Else {
+					Write-Host "Could not auto-detect download URL from downloads page." -ForegroundColor Yellow
+				}
+			}
+			Catch {
+				Write-Host "Failed to access Sophos downloads page: $_" -ForegroundColor Yellow
+			}
+
+			# Fallback to known current URL if auto-detection failed
+			If ([string]::IsNullOrWhiteSpace($DownloadURL)) {
+				Write-Host "Using fallback URL for latest known version..." -ForegroundColor Cyan
+				$DownloadURL = "https://download.sophos.com/network/clients/SophosConnect_2.5.0_GA_IPsec_and_SSLVPN.msi"
+				Write-Host "Fallback URL: $DownloadURL" -ForegroundColor Gray
+				Write-Host "Note: This may not be the latest version. Check https://www.sophos.com/en-us/support/downloads/utm-downloads" -ForegroundColor Yellow
+			}
+		}
+
+		# Download and install
 		Try {
 			Write-Host "Downloading Sophos Connect from: $DownloadURL" -ForegroundColor Cyan
 			$SophosInstaller = Get-FileDownload -URL $DownloadURL -SaveToFolder "$ITFolder\SophosConnect"
@@ -1096,7 +1140,9 @@ Function Install-SophosConnect {
 		}
 		Catch {
 			Write-Host "Error during installation: $_" -ForegroundColor Red
-			Write-Host "Please verify the download URL and try again, or install manually." -ForegroundColor Yellow
+			Write-Host "You can try:" -ForegroundColor Yellow
+			Write-Host "  1. Run with -Manual to get manual installation instructions" -ForegroundColor Gray
+			Write-Host "  2. Specify a direct URL with -DownloadURL parameter" -ForegroundColor Gray
 		}
 	}
 }

@@ -134,7 +134,9 @@ Function Connect-SophosConnect {
 		[Parameter(Mandatory = $false)]
 		[string]$VPNuser,
 		[Parameter(Mandatory = $false)]
-		[string]$VPNpassword
+		[string]$VPNpassword,
+		[Parameter(Mandatory = $false)]
+		[string]$OvpnFilePath
 	)
 
 	# Define possible paths for sccli.exe
@@ -152,6 +154,48 @@ Function Connect-SophosConnect {
 		Write-Host "Sophos Connect is not installed or sccli.exe was not found." -ForegroundColor Red
 		Write-Host "Run 'Install-SophosConnect' to install the client." -ForegroundColor Yellow
 		return
+	}
+
+	# Handle .ovpn file import if provided
+	If (![string]::IsNullOrWhiteSpace($OvpnFilePath)) {
+		# Validate file exists
+		If (!(Test-Path -Path $OvpnFilePath)) {
+			Write-Host "Error: The specified .ovpn file does not exist: $OvpnFilePath" -ForegroundColor Red
+			return
+		}
+
+		# Validate file extension
+		If ([System.IO.Path]::GetExtension($OvpnFilePath) -ne ".ovpn") {
+			Write-Host "Error: The specified file is not a .ovpn file: $OvpnFilePath" -ForegroundColor Red
+			return
+		}
+
+		# If ConnectionName not provided, derive from filename
+		If ([string]::IsNullOrWhiteSpace($ConnectionName)) {
+			$ConnectionName = [System.IO.Path]::GetFileNameWithoutExtension($OvpnFilePath)
+			Write-Host "Using connection name from filename: $ConnectionName" -ForegroundColor Cyan
+		}
+
+		Write-Host "Importing .ovpn configuration file: $OvpnFilePath" -ForegroundColor Cyan
+		Write-Host "Connection name: $ConnectionName" -ForegroundColor Cyan
+
+		# Import the .ovpn file
+		Try {
+			$importArgs = @("import", "-c", $ConnectionName, "-f", $OvpnFilePath)
+			$result = & "$SCPath" $importArgs 2>&1
+
+			If ($LASTEXITCODE -eq 0) {
+				Write-Host "Successfully imported VPN configuration." -ForegroundColor Green
+			}
+			Else {
+				Write-Host "Import completed with warnings or the connection may already exist." -ForegroundColor Yellow
+				Write-Host "Result: $result" -ForegroundColor Yellow
+			}
+		}
+		Catch {
+			Write-Host "Error importing .ovpn file: $_" -ForegroundColor Red
+			return
+		}
 	}
 
 	# If no connection name provided, list available connections
@@ -199,10 +243,15 @@ Function Connect-SophosConnect {
 		Initiates an SSL VPN connection using Sophos Connect
 	.PARAMETER ConnectionName
 		The name of the Sophos Connect VPN connection to use. If not provided, will list available connections.
+		When importing an .ovpn file, this will be the name assigned to the imported connection.
+		If not provided with an .ovpn file, the filename will be used as the connection name.
 	.PARAMETER VPNuser
 		(Optional) The VPN username. If not provided, may prompt during connection.
 	.PARAMETER VPNpassword
 		(Optional) The VPN password. If not provided, may prompt during connection.
+	.PARAMETER OvpnFilePath
+		(Optional) Path to a .ovpn configuration file to import before connecting.
+		If provided, the file will be imported and then a connection will be attempted.
 	.EXAMPLE
 		Connect-SophosConnect -ConnectionName "Company VPN"
 		Connects to a VPN connection named "Company VPN", prompting for credentials if needed.
@@ -212,9 +261,16 @@ Function Connect-SophosConnect {
 	.EXAMPLE
 		Connect-SophosConnect
 		Lists available VPN connections and prompts for selection.
+	.EXAMPLE
+		Connect-SophosConnect -OvpnFilePath "C:\VPN\client-vpn.ovpn"
+		Imports the .ovpn file as a connection named "client-vpn" and connects to it.
+	.EXAMPLE
+		Connect-SophosConnect -OvpnFilePath "C:\VPN\client-vpn.ovpn" -ConnectionName "Company VPN" -VPNuser "jdoe" -VPNpassword "MyP@ssw0rd"
+		Imports the .ovpn file as "Company VPN" and connects with specified credentials.
 	.NOTES
 		Sophos Connect uses sccli.exe for command-line operations.
-		Connection profiles must be pre-configured before using this function.
+		Connection profiles can be pre-configured or imported using .ovpn files.
+		When importing an .ovpn file, if the connection name already exists, it may be overwritten or cause an error.
 	#>
 }
 

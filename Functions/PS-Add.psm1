@@ -546,10 +546,10 @@ Function Add-RDPShortcut {
 		# FIX 1: Changed gatewaycredentialssource from 4 to 0
 		# FIX 2: Changed use redirection server name from 0 to 1
 		$Template = @"
-session bpp:i:32
+session bpp:i:24
 compression:i:1
 keyboardhook:i:2
-audiocapturemode:i:0
+audiocapturemode:i:1
 videoplaybackmode:i:1
 connection type:i:7
 networkautodetect:i:1
@@ -566,8 +566,8 @@ disable cursor setting:i:0
 bitmapcachepersistenable:i:1
 audiomode:i:0
 redirectprinters:i:1
-redirectcomports:i:1
-redirectsmartcards:i:1
+redirectcomports:i:0
+redirectsmartcards:i:0
 redirectwebauthn:i:0
 redirectclipboard:i:1
 redirectposdevices:i:0
@@ -706,8 +706,8 @@ server port:i:3389
 
 			Write-Host "Creating Shortcut at $_"
 
-			# FIX 5: Changed encoding from UTF8 to Unicode (UTF-16 LE)
-			$CurrentRDPFile | Out-File $_ -Encoding Unicode
+			# Write RDP file with UTF8 encoding
+			$CurrentRDPFile | Out-File $_ -Encoding UTF8
 
 			if (!(Test-Path $_ -ErrorAction SilentlyContinue)) {
 				Write-Error "Unable to create Shortcut at $_"

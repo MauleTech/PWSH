@@ -702,7 +702,7 @@ server port:i:3389
 			$CurrentRDPFile.Add("winposstr:s:0,3,0,0,800,600")
 
 			# Add remote app mouse move inject
-			$CurrentRDPFile.Add("remoteappmousemoveinjec:i:1")
+			$CurrentRDPFile.Add("remoteappmousemoveinject:i:1")
 
 			Write-Host "Creating Shortcut at $_"
 

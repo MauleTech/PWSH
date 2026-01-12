@@ -1769,6 +1769,79 @@ Function Get-VSSWriter {
 	END { } #END
 }
 
+function Get-ADUsersPasswordExpiring {
+	<#
+	.SYNOPSIS
+		Retrieves Active Directory users whose passwords will expire within a specified number of days.
+	.DESCRIPTION
+		This function queries Active Directory for enabled user accounts that have password expiration
+		enabled and whose passwords will expire within the specified threshold. It returns details
+		including the user's name, when their password was last set, when it expires, and how many
+		days remain until expiration.
+
+		The function uses the msDS-UserPasswordExpiryTimeComputed attribute which is a constructed
+		attribute that calculates the actual expiration time based on domain password policy.
+	.PARAMETER DaysUntilExpiration
+		The number of days to look ahead for expiring passwords. Users whose passwords expire
+		within this many days from today will be included in the results. Defaults to 60 days.
+	.EXAMPLE
+		Get-ADUsersPasswordExpiring
+		Returns all users whose passwords expire within the next 60 days.
+	.EXAMPLE
+		Get-ADUsersPasswordExpiring -DaysUntilExpiration 14
+		Returns all users whose passwords expire within the next 14 days.
+	.EXAMPLE
+		Get-ADUsersPasswordExpiring -DaysUntilExpiration 7 | Export-Csv -Path ".\ExpiringSoon.csv" -NoTypeInformation
+		Exports users with passwords expiring in the next week to a CSV file.
+	.OUTPUTS
+		PSCustomObject with properties:
+		- SamAccountName: The user's login name
+		- Name: The user's display name
+		- PasswordLastSet: When the password was last changed
+		- ExpiresOn: The date/time the password will expire
+		- DaysRemaining: Number of days until expiration
+	.NOTES
+		Requires the ActiveDirectory PowerShell module.
+		Must be run with permissions to query AD user objects.
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(HelpMessage = "Number of days to look ahead for expiring passwords")]
+		[ValidateRange(1, 365)]
+		[int]$DaysUntilExpiration = 60
+	)
+
+	# Verify Active Directory module is available
+	if (-not (Get-Command ActiveDirectory\Get-ADUser -ErrorAction SilentlyContinue)) {
+		Write-Error "This function requires the ActiveDirectory PowerShell module. Please run on a domain controller or install RSAT."
+		return
+	}
+
+	# Calculate date range for password expiration check
+	$today = Get-Date
+	$threshold = $today.AddDays($DaysUntilExpiration)
+
+	# Query AD for enabled users with password expiration enabled
+	Get-ADUser -Filter {Enabled -eq $true -and PasswordNeverExpires -eq $false} `
+		-Properties PasswordLastSet, PasswordNeverExpires, msDS-UserPasswordExpiryTimeComputed |
+	Where-Object { $_.'msDS-UserPasswordExpiryTimeComputed' } |
+	ForEach-Object {
+		# Convert the FileTime format to DateTime
+		$expiryDate = [DateTime]::FromFileTime($_.'msDS-UserPasswordExpiryTimeComputed')
+
+		# Only include users whose passwords expire within the threshold
+		if ($expiryDate -gt $today -and $expiryDate -le $threshold) {
+			[PSCustomObject]@{
+				SamAccountName  = $_.SamAccountName
+				Name            = $_.Name
+				PasswordLastSet = $_.PasswordLastSet
+				ExpiresOn       = $expiryDate
+				DaysRemaining   = ($expiryDate - $today).Days
+			}
+		}
+	} | Sort-Object DaysRemaining
+}
+
 
 # SIG # Begin signature block
 # MIIF0AYJKoZIhvcNAQcCoIIFwTCCBb0CAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB

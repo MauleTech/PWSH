@@ -503,6 +503,7 @@ $FoldersToDeDuplicate | ForEach-Object {
 	Write-Host "Removing Restore Points" ;Remove-WindowsRestorePoints
 	Write-Host "Clearing Event Logs" ;Remove-EventLogs
 	Write-Host "Removing Duplicate Drivers" ;Remove-DuplicateDrivers
+	Write-Host "Removing Orphaned Installer Files" ;Remove-OrphanedInstallerFiles
 	Invoke-WindowsCleanMgr
 #)
 

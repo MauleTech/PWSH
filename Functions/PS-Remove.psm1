@@ -361,6 +361,273 @@ Function Remove-StaleObjects {
 	}
 }
 
+function Remove-OrphanedInstallerFiles {
+    <#
+    .SYNOPSIS
+        Identifies and removes orphaned MSI/MSP files from the Windows Installer cache.
+
+    .DESCRIPTION
+        Compares files in C:\Windows\Installer against registry-registered packages.
+        Files not registered are considered orphaned and removed by default.
+        Displays associated product names where possible.
+
+    .PARAMETER WhatIf
+        Shows what would be deleted without actually removing files.
+
+    .PARAMETER Verbose
+        Shows detailed progress information.
+
+    .EXAMPLE
+        Remove-OrphanedInstallerFiles
+        Deletes all orphaned installer files.
+
+    .EXAMPLE
+        Remove-OrphanedInstallerFiles -WhatIf
+        Shows what would be deleted without removing anything.
+
+    .NOTES
+        Requires administrator privileges.
+        Assumes backups exist for disaster recovery.
+    #>
+
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    # Check for admin
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Warning "This function requires administrator privileges. Please run as admin."
+        return
+    }
+
+    function Get-MsiProductName {
+        param([string]$MsiPath)
+
+        try {
+            $installer = New-Object -ComObject WindowsInstaller.Installer
+            $database = $installer.GetType().InvokeMember(
+                "OpenDatabase",
+                [System.Reflection.BindingFlags]::InvokeMethod,
+                $null, $installer, @($MsiPath, 0)
+            )
+
+            $query = "SELECT Value FROM Property WHERE Property = 'ProductName'"
+            $view = $database.GetType().InvokeMember(
+                "OpenView",
+                [System.Reflection.BindingFlags]::InvokeMethod,
+                $null, $database, @($query)
+            )
+
+            $view.GetType().InvokeMember("Execute", [System.Reflection.BindingFlags]::InvokeMethod, $null, $view, $null)
+            $record = $view.GetType().InvokeMember("Fetch", [System.Reflection.BindingFlags]::InvokeMethod, $null, $view, $null)
+
+            if ($record) {
+                $productName = $record.GetType().InvokeMember("StringData", [System.Reflection.BindingFlags]::GetProperty, $null, $record, @(1))
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($record) | Out-Null
+            }
+
+            $view.GetType().InvokeMember("Close", [System.Reflection.BindingFlags]::InvokeMethod, $null, $view, $null)
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($view) | Out-Null
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($database) | Out-Null
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($installer) | Out-Null
+
+            return $productName
+        } catch {
+            return $null
+        }
+    }
+
+    function Get-MspProductName {
+        param([string]$MspPath)
+
+        try {
+            $installer = New-Object -ComObject WindowsInstaller.Installer
+            $summaryInfo = $installer.GetType().InvokeMember(
+                "SummaryInformation",
+                [System.Reflection.BindingFlags]::GetProperty,
+                $null, $installer, @($MspPath, 0)
+            )
+
+            $title = $summaryInfo.GetType().InvokeMember("Property", [System.Reflection.BindingFlags]::GetProperty, $null, $summaryInfo, @(2))
+
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($summaryInfo) | Out-Null
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($installer) | Out-Null
+
+            return $title
+        } catch {
+            return $null
+        }
+    }
+
+    # Build hashtable of registered packages with their product names
+    Write-Verbose "Enumerating registered packages from registry..."
+    $registeredPackages = @{}
+
+    # Get products and their names
+    $productBase = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products"
+    Get-ChildItem $productBase -ErrorAction SilentlyContinue | ForEach-Object {
+        $installProps = Join-Path $_.PSPath "InstallProperties"
+
+        if (Test-Path $installProps) {
+            $props = Get-ItemProperty $installProps -ErrorAction SilentlyContinue
+            $localPkg = $props.LocalPackage
+            $displayName = $props.DisplayName
+
+            if ($localPkg) {
+                $registeredPackages[$localPkg.ToLower()] = @{
+                    Path = $localPkg
+                    ProductName = $displayName
+                    Type = "Product"
+                }
+            }
+        }
+    }
+
+    # Get patches
+    $patchBase = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Patches"
+    Get-ChildItem $patchBase -ErrorAction SilentlyContinue | ForEach-Object {
+        $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+        $localPkg = $props.LocalPackage
+        $displayName = $props.DisplayName
+
+        if ($localPkg) {
+            $registeredPackages[$localPkg.ToLower()] = @{
+                Path = $localPkg
+                ProductName = $displayName
+                Type = "Patch"
+            }
+        }
+    }
+
+    Write-Verbose "Found $($registeredPackages.Count) registered packages"
+
+    # Get all installer files
+    Write-Verbose "Scanning C:\Windows\Installer..."
+    $installerFiles = Get-ChildItem "C:\Windows\Installer\*.msi", "C:\Windows\Installer\*.msp" -ErrorAction SilentlyContinue
+
+    # Separate into registered and orphaned
+    $orphanedFiles = @()
+    $registeredFiles = @()
+
+    foreach ($file in $installerFiles) {
+        $filePath = $file.FullName.ToLower()
+
+        if ($registeredPackages.ContainsKey($filePath)) {
+            $info = $registeredPackages[$filePath]
+            $registeredFiles += [PSCustomObject]@{
+                Name = $file.Name
+                FullName = $file.FullName
+                SizeMB = [math]::Round($file.Length / 1MB, 2)
+                ProductName = $info.ProductName
+                Type = $info.Type
+                Status = "Registered"
+            }
+        } else {
+            # Orphaned - try to extract product name from the file itself
+            $productName = $null
+            if ($file.Extension -eq ".msi") {
+                $productName = Get-MsiProductName -MsiPath $file.FullName
+            } elseif ($file.Extension -eq ".msp") {
+                $productName = Get-MspProductName -MspPath $file.FullName
+            }
+
+            $orphanedFiles += [PSCustomObject]@{
+                Name = $file.Name
+                FullName = $file.FullName
+                SizeMB = [math]::Round($file.Length / 1MB, 2)
+                ProductName = if ($productName) { $productName } else { "(Unknown)" }
+                Type = if ($file.Extension -eq ".msi") { "Product" } else { "Patch" }
+                Status = "Orphaned"
+            }
+        }
+    }
+
+    # Display summary
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "  Windows Installer Cache Analysis" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+
+    $totalFiles = $installerFiles.Count
+    $totalSizeMB = [math]::Round(($installerFiles | Measure-Object Length -Sum).Sum / 1MB, 2)
+    $orphanedSizeMB = [math]::Round(($orphanedFiles | Measure-Object SizeMB -Sum).Sum, 2)
+    $registeredSizeMB = [math]::Round(($registeredFiles | Measure-Object SizeMB -Sum).Sum, 2)
+
+    Write-Host "`nTotal files in Installer folder: " -NoNewline
+    Write-Host "$totalFiles" -ForegroundColor Yellow -NoNewline
+    Write-Host " ($totalSizeMB MB)"
+
+    Write-Host "Registered (in use):             " -NoNewline
+    Write-Host "$($registeredFiles.Count)" -ForegroundColor Green -NoNewline
+    Write-Host " ($registeredSizeMB MB)"
+
+    Write-Host "Orphaned (safe to remove):       " -NoNewline
+    Write-Host "$($orphanedFiles.Count)" -ForegroundColor Red -NoNewline
+    Write-Host " ($orphanedSizeMB MB)"
+
+    if ($orphanedFiles.Count -eq 0) {
+        Write-Host "`nNo orphaned files found. Nothing to clean up." -ForegroundColor Green
+        return
+    }
+
+    # Display orphaned files with product names
+    Write-Host "`n----------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  Orphaned Files to Remove" -ForegroundColor Yellow
+    Write-Host "----------------------------------------" -ForegroundColor DarkGray
+
+    $orphanedFiles | Sort-Object SizeMB -Descending | ForEach-Object {
+        $sizeStr = "{0,8:N2} MB" -f $_.SizeMB
+        $typeStr = if ($_.Type -eq "Product") { "[MSI]" } else { "[MSP]" }
+
+        Write-Host "  $typeStr " -ForegroundColor DarkCyan -NoNewline
+        Write-Host $sizeStr -ForegroundColor White -NoNewline
+        Write-Host "  $($_.Name)" -ForegroundColor Gray -NoNewline
+        Write-Host "  ->  " -ForegroundColor DarkGray -NoNewline
+        Write-Host $_.ProductName -ForegroundColor Cyan
+    }
+
+    Write-Host "`n----------------------------------------" -ForegroundColor DarkGray
+
+    # Process deletions
+    $deletedCount = 0
+    $deletedSize = 0
+    $failedCount = 0
+
+    if ($WhatIfPreference) {
+        Write-Host "`n[WhatIf] Would delete $($orphanedFiles.Count) files, freeing $orphanedSizeMB MB" -ForegroundColor Magenta
+    } else {
+        Write-Host "`nDeleting orphaned files..." -ForegroundColor Yellow
+
+        foreach ($file in $orphanedFiles) {
+            if ($PSCmdlet.ShouldProcess($file.FullName, "Delete")) {
+                try {
+                    Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+                    $deletedCount++
+                    $deletedSize += $file.SizeMB
+                    Write-Verbose "Deleted: $($file.Name)"
+                } catch {
+                    $failedCount++
+                    Write-Warning "Failed to delete $($file.Name): $($_.Exception.Message)"
+                }
+            }
+        }
+
+        Write-Host "`n========================================" -ForegroundColor Cyan
+        Write-Host "  Cleanup Complete" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "Files deleted:  " -NoNewline
+        Write-Host $deletedCount -ForegroundColor Green
+        Write-Host "Space freed:    " -NoNewline
+        Write-Host "$([math]::Round($deletedSize, 2)) MB" -ForegroundColor Green
+
+        if ($failedCount -gt 0) {
+            Write-Host "Failed:         " -NoNewline
+            Write-Host $failedCount -ForegroundColor Red
+        }
+    }
+
+    Write-Host ""
+}
+
 # SIG # Begin signature block
 # MIIF0AYJKoZIhvcNAQcCoIIFwTCCBb0CAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR

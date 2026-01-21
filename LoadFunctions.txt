@@ -358,7 +358,22 @@ if (Test-Path $PWSHFolder) {
         # Run git commands as jobs to prevent keypress interference
         Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
         Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/master") -WorkingDirectory $PWSHFolder
+
+        # Detect current branch instead of hardcoding
+        $branchOutput = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
+        $CurrentBranch = ($branchOutput -join "").Trim()
+
+        # Validate branch name (handle detached HEAD state or errors)
+        if ([string]::IsNullOrWhiteSpace($CurrentBranch) -or $CurrentBranch -match '(fatal|error|warning):') {
+            if ($CurrentBranch -match '(fatal|error):') {
+                Write-Warning "Failed to detect current branch: $CurrentBranch"
+            }
+            $CurrentBranch = "main"
+            Write-Warning "Defaulting to main branch"
+        }
+
+        # Reset to the detected branch
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder
 
         Write-Host "Repository updated successfully!" -ForegroundColor Green
         Pop-Location
@@ -413,8 +428,8 @@ Function Update-ITPS {
         if ($CurrentBranch -match '(fatal|error):') {
             Write-Warning "Failed to detect current branch: $CurrentBranch"
         }
-        $CurrentBranch = "master"
-        Write-Warning "Defaulting to master branch"
+        $CurrentBranch = "main"
+        Write-Warning "Defaulting to main branch"
     }
     # Reset to the remote version of current branch
     Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder | Out-Null
@@ -457,8 +472,8 @@ Function Global:Update-ITFunctions {
 				if ($CurrentBranch -match '(fatal|error):') {
 					Write-Host "Failed to detect current branch: $CurrentBranch" -ForegroundColor Yellow
 				}
-				$CurrentBranch = "master"
-				Write-Host "Defaulting to master branch" -ForegroundColor Yellow
+				$CurrentBranch = "main"
+				Write-Host "Defaulting to main branch" -ForegroundColor Yellow
 			}
 			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
 

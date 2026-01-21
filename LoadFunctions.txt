@@ -240,7 +240,6 @@ Function Invoke-GitAsJob {
             $processedOutput = @()
             foreach ($item in $rawOutput) {
                 if ($item -is [System.Management.Automation.ErrorRecord]) {
-                    # Convert ErrorRecord to string to prevent deserialization issues
                     $processedOutput += $item.ToString()
                 } else {
                     # Keep other types as-is for performance
@@ -260,13 +259,14 @@ Function Invoke-GitAsJob {
 
         # Check for job errors
         if ($job.State -eq 'Failed') {
-            throw "Git job failed: $($job.ChildJobs[0].JobStateInfo.Reason.Message)"
+            throw "Git job failed for command 'git $($Arguments -join ' ')': $($job.ChildJobs[0].JobStateInfo.Reason.Message)"
         }
 
         # Propagate git exit code
         if ($result.ExitCode -ne 0) {
-            $errorMsg = if ($result.Output) { $result.Output -join "`n" } else { "Git command failed with exit code $($result.ExitCode)" }
-            Write-Warning "Git command failed: $errorMsg"
+            $cmdString = "git $($Arguments -join ' ')"
+            $errorMsg = if ($result.Output) { $result.Output -join "`n" } else { "Exit code $($result.ExitCode)" }
+            Write-Warning "Git command '$cmdString' failed: $errorMsg"
             # For some operations, non-zero exit is acceptable (e.g., empty status)
             # Return output but don't throw for better compatibility
         }
@@ -407,10 +407,14 @@ Function Update-ITPS {
     # Check what branch we're on
     $branchOutput = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
     $CurrentBranch = ($branchOutput -join "").Trim()
-    # Validate branch name (handle detached HEAD state)
-    if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
+
+    # Validate branch name (handle detached HEAD state or errors)
+    if ([string]::IsNullOrWhiteSpace($CurrentBranch) -or $CurrentBranch -match '(fatal|error|warning):') {
+        if ($CurrentBranch -match '(fatal|error):') {
+            Write-Warning "Failed to detect current branch: $CurrentBranch"
+        }
         $CurrentBranch = "master"
-        Write-Warning "Detached HEAD detected, defaulting to master branch"
+        Write-Warning "Defaulting to master branch"
     }
     # Reset to the remote version of current branch
     Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder | Out-Null
@@ -447,10 +451,14 @@ Function Global:Update-ITFunctions {
 			# Check what branch we're on
 			$branchOutput = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
 			$CurrentBranch = ($branchOutput -join "").Trim()
-			# Validate branch name (handle detached HEAD state)
-			if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
+
+			# Validate branch name (handle detached HEAD state or errors)
+			if ([string]::IsNullOrWhiteSpace($CurrentBranch) -or $CurrentBranch -match '(fatal|error|warning):') {
+				if ($CurrentBranch -match '(fatal|error):') {
+					Write-Host "Failed to detect current branch: $CurrentBranch" -ForegroundColor Yellow
+				}
 				$CurrentBranch = "master"
-				Write-Host "Detached HEAD detected, defaulting to master branch" -ForegroundColor Yellow
+				Write-Host "Defaulting to master branch" -ForegroundColor Yellow
 			}
 			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
 

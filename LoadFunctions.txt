@@ -171,6 +171,8 @@ Function Invoke-GitAsJob {
         Wraps git command execution in a PowerShell job to isolate it from user input.
         This prevents keypresses during git operations from being interpreted as git commands.
         Captures both stdout and stderr, propagates exit codes, and handles errors.
+        Jobs run in a new process and don't inherit the current directory, so WorkingDirectory
+        parameter must be specified if the git command needs to run in a specific directory.
 
     .PARAMETER GitPath
         Path to the git executable. Can be full path or 'git' for system PATH.
@@ -178,18 +180,22 @@ Function Invoke-GitAsJob {
     .PARAMETER Arguments
         Array of arguments to pass to git command.
 
+    .PARAMETER WorkingDirectory
+        Optional working directory for the git command. Must be an absolute path.
+        Defaults to current directory ($PWD) if not specified.
+
     .PARAMETER ShowOutput
         If specified, outputs the git command results to the console.
 
     .EXAMPLE
-        Invoke-GitAsJob -GitPath "git" -Arguments @("status", "--porcelain") -ShowOutput
+        Invoke-GitAsJob -GitPath "git" -Arguments @("status", "--porcelain") -WorkingDirectory $PWSHFolder -ShowOutput
 
     .EXAMPLE
-        $branch = (Invoke-GitAsJob -GitPath $GitExePath -Arguments @("branch", "--show-current")).Trim()
+        $branch = (Invoke-GitAsJob -GitPath $GitExePath -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder).Trim()
 
     .OUTPUTS
         Returns the output from the git command as a string or array of strings.
-        Throws an error if the git command exits with non-zero status.
+        Warns if the git command exits with non-zero status.
     #>
     param(
         [Parameter(Mandatory=$true)]
@@ -200,33 +206,67 @@ Function Invoke-GitAsJob {
         [ValidateNotNullOrEmpty()]
         [string[]]$Arguments,
 
+        [Parameter(Mandatory=$false)]
+        [string]$WorkingDirectory,
+
         [switch]$ShowOutput
     )
+
+    # Default to current directory if not specified for backward compatibility
+    if (-not $WorkingDirectory) {
+        $WorkingDirectory = $PWD.Path
+    }
+
+    # Validate working directory path
+    if (-not [System.IO.Path]::IsPathRooted($WorkingDirectory)) {
+        throw "WorkingDirectory must be an absolute path: $WorkingDirectory"
+    }
 
     $job = $null
     try {
         $job = Start-Job -ScriptBlock {
-            param($gitExe, $gitArgs)
-            $output = & $gitExe @gitArgs 2>&1
+            param($gitExe, $gitArgs, $workDir)
+
+            # Change to working directory
+            if (-not (Test-Path $workDir)) {
+                throw "Working directory does not exist: $workDir"
+            }
+            Set-Location $workDir
+
+            # Execute git command and capture all output
+            $rawOutput = & $gitExe @gitArgs 2>&1
+
+            # Convert ErrorRecords to strings to prevent deserialization issues
+            $processedOutput = @()
+            foreach ($item in $rawOutput) {
+                if ($item -is [System.Management.Automation.ErrorRecord]) {
+                    $processedOutput += $item.ToString()
+                } else {
+                    # Keep other types as-is for performance
+                    $processedOutput += $item
+                }
+            }
+
             # Return both output and exit code
             return @{
-                Output = $output
+                Output = $processedOutput
                 ExitCode = $LASTEXITCODE
             }
-        } -ArgumentList $GitPath, $Arguments
+        } -ArgumentList $GitPath, $Arguments, $WorkingDirectory
 
         $job | Wait-Job | Out-Null
         $result = $job | Receive-Job
 
         # Check for job errors
         if ($job.State -eq 'Failed') {
-            throw "Git job failed: $($job.ChildJobs[0].JobStateInfo.Reason.Message)"
+            throw "Git job failed for command 'git $($Arguments -join ' ')': $($job.ChildJobs[0].JobStateInfo.Reason.Message)"
         }
 
         # Propagate git exit code
         if ($result.ExitCode -ne 0) {
-            $errorMsg = if ($result.Output) { $result.Output -join "`n" } else { "Git command failed with exit code $($result.ExitCode)" }
-            Write-Warning "Git command failed: $errorMsg"
+            $cmdString = "git $($Arguments -join ' ')"
+            $errorMsg = if ($result.Output) { $result.Output -join "`n" } else { "Exit code $($result.ExitCode)" }
+            Write-Warning "Git command '$cmdString' failed: $errorMsg"
             # For some operations, non-zero exit is acceptable (e.g., empty status)
             # Return output but don't throw for better compatibility
         }
@@ -316,9 +356,9 @@ if (Test-Path $PWSHFolder) {
         $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
 
         # Run git commands as jobs to prevent keypress interference
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder)
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin")
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/master")
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/master") -WorkingDirectory $PWSHFolder
 
         Write-Host "Repository updated successfully!" -ForegroundColor Green
         Pop-Location
@@ -337,8 +377,8 @@ if (Test-Path $PWSHFolder) {
         $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
 
         # Run git commands as jobs to prevent keypress interference
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("clone", "https://github.com/MauleTech/PWSH.git", $PWSHFolder)
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder)
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("clone", "https://github.com/MauleTech/PWSH.git", $PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
 
         Write-Host "Repository cloned successfully!" -ForegroundColor Green
     }
@@ -361,20 +401,25 @@ Function Update-ITPS {
     $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
     # Run git commands as jobs to prevent keypress interference
     # Show current status
-    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("status", "--porcelain") | Out-Null
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("status", "--porcelain") -WorkingDirectory $PWSHFolder | Out-Null
     # Fetch all remotes
-    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") | Out-Null
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder | Out-Null
     # Check what branch we're on
-    $CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current")).Trim()
-    # Validate branch name (handle detached HEAD state)
-    if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
+    $branchOutput = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
+    $CurrentBranch = ($branchOutput -join "").Trim()
+
+    # Validate branch name (handle detached HEAD state or errors)
+    if ([string]::IsNullOrWhiteSpace($CurrentBranch) -or $CurrentBranch -match '(fatal|error|warning):') {
+        if ($CurrentBranch -match '(fatal|error):') {
+            Write-Warning "Failed to detect current branch: $CurrentBranch"
+        }
         $CurrentBranch = "master"
-        Write-Warning "Detached HEAD detected, defaulting to master branch"
+        Write-Warning "Defaulting to master branch"
     }
     # Reset to the remote version of current branch
-    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") | Out-Null
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder | Out-Null
     # Show final status
-    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("log", "--oneline", "-1") | Out-Null
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("log", "--oneline", "-1") -WorkingDirectory $PWSHFolder | Out-Null
     Pop-Location
     # Reload functions
     $FunctionFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
@@ -397,28 +442,33 @@ Function Global:Update-ITFunctions {
 			# Run git commands as jobs to prevent keypress interference
 			# Show current status
 			Write-Host "Current status:" -ForegroundColor Yellow
-			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("status", "--porcelain") -ShowOutput
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("status", "--porcelain") -WorkingDirectory $PWSHFolder -ShowOutput
 
 			# Fetch all remotes
 			Write-Host "Fetching latest changes..." -ForegroundColor Yellow
-			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -ShowOutput
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder -ShowOutput
 
 			# Check what branch we're on
-			$CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current")).Trim()
-			# Validate branch name (handle detached HEAD state)
-			if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
+			$branchOutput = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
+			$CurrentBranch = ($branchOutput -join "").Trim()
+
+			# Validate branch name (handle detached HEAD state or errors)
+			if ([string]::IsNullOrWhiteSpace($CurrentBranch) -or $CurrentBranch -match '(fatal|error|warning):') {
+				if ($CurrentBranch -match '(fatal|error):') {
+					Write-Host "Failed to detect current branch: $CurrentBranch" -ForegroundColor Yellow
+				}
 				$CurrentBranch = "master"
-				Write-Host "Detached HEAD detected, defaulting to master branch" -ForegroundColor Yellow
+				Write-Host "Defaulting to master branch" -ForegroundColor Yellow
 			}
 			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
 
 			# Reset to the remote version of current branch
 			Write-Host "Resetting to origin/$CurrentBranch..." -ForegroundColor Yellow
-			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -ShowOutput
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder -ShowOutput
 
 			# Show final status
 			Write-Host "Updated successfully! Current commit:" -ForegroundColor Green
-			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("log", "--oneline", "-1") -ShowOutput
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("log", "--oneline", "-1") -WorkingDirectory $PWSHFolder -ShowOutput
 			
 			Pop-Location
 			

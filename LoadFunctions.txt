@@ -181,7 +181,8 @@ Function Invoke-GitAsJob {
         Array of arguments to pass to git command.
 
     .PARAMETER WorkingDirectory
-        Optional working directory for the git command. If not specified, uses job default.
+        Optional working directory for the git command. Must be an absolute path.
+        Defaults to current directory ($PWD) if not specified.
 
     .PARAMETER ShowOutput
         If specified, outputs the git command results to the console.
@@ -211,31 +212,39 @@ Function Invoke-GitAsJob {
         [switch]$ShowOutput
     )
 
+    # Default to current directory if not specified for backward compatibility
+    if (-not $WorkingDirectory) {
+        $WorkingDirectory = $PWD.Path
+    }
+
+    # Validate working directory path
+    if (-not [System.IO.Path]::IsPathRooted($WorkingDirectory)) {
+        throw "WorkingDirectory must be an absolute path: $WorkingDirectory"
+    }
+
     $job = $null
     try {
         $job = Start-Job -ScriptBlock {
             param($gitExe, $gitArgs, $workDir)
 
-            # Change to working directory if specified
-            if ($workDir) {
-                if (-not (Test-Path $workDir)) {
-                    throw "Working directory does not exist: $workDir"
-                }
-                Set-Location $workDir
+            # Change to working directory
+            if (-not (Test-Path $workDir)) {
+                throw "Working directory does not exist: $workDir"
             }
+            Set-Location $workDir
 
             # Execute git command and capture all output
             $rawOutput = & $gitExe @gitArgs 2>&1
 
-            # Convert all output to strings to prevent deserialization issues and ensure consistent types
+            # Convert ErrorRecords to strings to prevent deserialization issues
             $processedOutput = @()
             foreach ($item in $rawOutput) {
                 if ($item -is [System.Management.Automation.ErrorRecord]) {
-                    # Convert ErrorRecord to string
+                    # Convert ErrorRecord to string to prevent deserialization issues
                     $processedOutput += $item.ToString()
                 } else {
-                    # Convert all other types to string for consistency
-                    $processedOutput += $item.ToString()
+                    # Keep other types as-is for performance
+                    $processedOutput += $item
                 }
             }
 
@@ -396,8 +405,8 @@ Function Update-ITPS {
     # Fetch all remotes
     Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder | Out-Null
     # Check what branch we're on
-    $CurrentBranch = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
-    $CurrentBranch = if ($CurrentBranch) { $CurrentBranch.Trim() } else { "" }
+    $branchOutput = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
+    $CurrentBranch = ($branchOutput -join "").Trim()
     # Validate branch name (handle detached HEAD state)
     if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
         $CurrentBranch = "master"
@@ -436,8 +445,8 @@ Function Global:Update-ITFunctions {
 			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder -ShowOutput
 
 			# Check what branch we're on
-			$CurrentBranch = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
-			$CurrentBranch = if ($CurrentBranch) { $CurrentBranch.Trim() } else { "" }
+			$branchOutput = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
+			$CurrentBranch = ($branchOutput -join "").Trim()
 			# Validate branch name (handle detached HEAD state)
 			if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
 				$CurrentBranch = "master"

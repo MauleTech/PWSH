@@ -161,6 +161,30 @@ Function Install-GitPortable {
     }
 }
 
+# Function to run git commands as jobs to prevent keypress interference
+Function Invoke-GitAsJob {
+    param(
+        [string]$GitPath,
+        [string[]]$Arguments,
+        [switch]$ShowOutput
+    )
+
+    $job = Start-Job -ScriptBlock {
+        param($gitExe, $args)
+        & $gitExe @args 2>&1
+    } -ArgumentList $GitPath, $Arguments
+
+    $job | Wait-Job | Out-Null
+    $output = $job | Receive-Job
+    $job | Remove-Job
+
+    if ($ShowOutput -and $output) {
+        $output | Write-Output
+    }
+
+    return $output
+}
+
 # Check PowerShell version to handle certificate validation appropriately
 if ($PSVersionTable.PSVersion.Major -lt 6) {
     # PowerShell 5.1 and below - Use the original method
@@ -228,14 +252,14 @@ if (Test-Path $PWSHFolder) {
     Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
     try {
         Push-Location $PWSHFolder
-        if (Test-Path $GitExePath) {
-            & $GitExePath config --global --add safe.directory $PWSHFolder
-            & $GitExePath fetch origin 2>$null
-            & $GitExePath reset --hard origin/master 2>$null
-        } else {
-            git fetch origin 2>$null
-            git reset --hard origin/master 2>$null
-        }
+        # Determine which git to use
+        $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
+
+        # Run git commands as jobs to prevent keypress interference
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder)
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin")
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/master")
+
         Write-Host "Repository updated successfully!" -ForegroundColor Green
         Pop-Location
     }
@@ -249,12 +273,13 @@ if (Test-Path $PWSHFolder) {
     Write-Host "Cloning PowerShell Functions repository..." -ForegroundColor Yellow
     try {
         New-Item -ItemType Directory -Force -Path "$ITFolder\GitHub" | Out-Null
-        if (Test-Path $GitExePath) {
-            & $GitExePath clone https://github.com/MauleTech/PWSH.git $PWSHFolder 2>$null
-        } else {
-            git clone https://github.com/MauleTech/PWSH.git $PWSHFolder 2>$null
-        }
-        & $GitExePath config --global --add safe.directory $PWSHFolder
+        # Determine which git to use
+        $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
+
+        # Run git commands as jobs to prevent keypress interference
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("clone", "https://github.com/MauleTech/PWSH.git", $PWSHFolder)
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder)
+
         Write-Host "Repository cloned successfully!" -ForegroundColor Green
     }
     catch {
@@ -274,16 +299,17 @@ Function Update-ITPS {
     Push-Location $PWSHFolder
     # Determine which git to use
     $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
+    # Run git commands as jobs to prevent keypress interference
     # Show current status
-    & $GitCommand status --porcelain > $null
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("status", "--porcelain") | Out-Null
     # Fetch all remotes
-    & $GitCommand fetch origin > $null 2>&1
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") | Out-Null
     # Check what branch we're on
-    $CurrentBranch = (& $GitCommand branch --show-current).Trim()
+    $CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current")).Trim()
     # Reset to the remote version of current branch
-    & $GitCommand reset --hard "origin/$CurrentBranch" > $null 2>&1
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") | Out-Null
     # Show final status
-    & $GitCommand log --oneline -1 > $null
+    Invoke-GitAsJob -GitPath $GitCommand -Arguments @("log", "--oneline", "-1") | Out-Null
     Pop-Location
     # Reload functions
     $FunctionFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
@@ -302,26 +328,27 @@ Function Global:Update-ITFunctions {
 			
 			# Determine which git to use
 			$GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
-			
+
+			# Run git commands as jobs to prevent keypress interference
 			# Show current status
 			Write-Host "Current status:" -ForegroundColor Yellow
-			& $GitCommand status --porcelain
-			
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("status", "--porcelain") -ShowOutput
+
 			# Fetch all remotes
 			Write-Host "Fetching latest changes..." -ForegroundColor Yellow
-			& $GitCommand fetch origin
-			
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -ShowOutput
+
 			# Check what branch we're on
-			$CurrentBranch = (& $GitCommand branch --show-current).Trim()
+			$CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current")).Trim()
 			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
-			
+
 			# Reset to the remote version of current branch
 			Write-Host "Resetting to origin/$CurrentBranch..." -ForegroundColor Yellow
-			& $GitCommand reset --hard "origin/$CurrentBranch"
-			
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -ShowOutput
+
 			# Show final status
 			Write-Host "Updated successfully! Current commit:" -ForegroundColor Green
-			& $GitCommand log --oneline -1
+			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("log", "--oneline", "-1") -ShowOutput
 			
 			Pop-Location
 			

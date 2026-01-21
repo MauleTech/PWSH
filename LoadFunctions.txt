@@ -163,26 +163,86 @@ Function Install-GitPortable {
 
 # Function to run git commands as jobs to prevent keypress interference
 Function Invoke-GitAsJob {
+    <#
+    .SYNOPSIS
+        Runs git commands as PowerShell jobs to prevent keypress interference.
+
+    .DESCRIPTION
+        Wraps git command execution in a PowerShell job to isolate it from user input.
+        This prevents keypresses during git operations from being interpreted as git commands.
+        Captures both stdout and stderr, propagates exit codes, and handles errors.
+
+    .PARAMETER GitPath
+        Path to the git executable. Can be full path or 'git' for system PATH.
+
+    .PARAMETER Arguments
+        Array of arguments to pass to git command.
+
+    .PARAMETER ShowOutput
+        If specified, outputs the git command results to the console.
+
+    .EXAMPLE
+        Invoke-GitAsJob -GitPath "git" -Arguments @("status", "--porcelain") -ShowOutput
+
+    .EXAMPLE
+        $branch = (Invoke-GitAsJob -GitPath $GitExePath -Arguments @("branch", "--show-current")).Trim()
+
+    .OUTPUTS
+        Returns the output from the git command as a string or array of strings.
+        Throws an error if the git command exits with non-zero status.
+    #>
     param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
         [string]$GitPath,
+
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
         [string[]]$Arguments,
+
         [switch]$ShowOutput
     )
 
-    $job = Start-Job -ScriptBlock {
-        param($gitExe, $args)
-        & $gitExe @args 2>&1
-    } -ArgumentList $GitPath, $Arguments
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($gitExe, $gitArgs)
+            $output = & $gitExe @gitArgs 2>&1
+            # Return both output and exit code
+            return @{
+                Output = $output
+                ExitCode = $LASTEXITCODE
+            }
+        } -ArgumentList $GitPath, $Arguments
 
-    $job | Wait-Job | Out-Null
-    $output = $job | Receive-Job
-    $job | Remove-Job
+        $job | Wait-Job | Out-Null
+        $result = $job | Receive-Job
 
-    if ($ShowOutput -and $output) {
-        $output | Write-Output
+        # Check for job errors
+        if ($job.State -eq 'Failed') {
+            throw "Git job failed: $($job.ChildJobs[0].JobStateInfo.Reason.Message)"
+        }
+
+        # Propagate git exit code
+        if ($result.ExitCode -ne 0) {
+            $errorMsg = if ($result.Output) { $result.Output -join "`n" } else { "Git command failed with exit code $($result.ExitCode)" }
+            Write-Warning "Git command failed: $errorMsg"
+            # For some operations, non-zero exit is acceptable (e.g., empty status)
+            # Return output but don't throw for better compatibility
+        }
+
+        if ($ShowOutput -and $result.Output) {
+            $result.Output | Write-Output
+        }
+
+        return $result.Output
     }
-
-    return $output
+    finally {
+        # Ensure job cleanup even if errors occur
+        if ($job) {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 # Check PowerShell version to handle certificate validation appropriately
@@ -306,6 +366,11 @@ Function Update-ITPS {
     Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") | Out-Null
     # Check what branch we're on
     $CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current")).Trim()
+    # Validate branch name (handle detached HEAD state)
+    if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
+        $CurrentBranch = "master"
+        Write-Warning "Detached HEAD detected, defaulting to master branch"
+    }
     # Reset to the remote version of current branch
     Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") | Out-Null
     # Show final status
@@ -340,6 +405,11 @@ Function Global:Update-ITFunctions {
 
 			# Check what branch we're on
 			$CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current")).Trim()
+			# Validate branch name (handle detached HEAD state)
+			if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
+				$CurrentBranch = "master"
+				Write-Host "Detached HEAD detected, defaulting to master branch" -ForegroundColor Yellow
+			}
 			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
 
 			# Reset to the remote version of current branch

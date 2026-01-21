@@ -217,21 +217,25 @@ Function Invoke-GitAsJob {
             param($gitExe, $gitArgs, $workDir)
 
             # Change to working directory if specified
-            if ($workDir -and (Test-Path $workDir)) {
+            if ($workDir) {
+                if (-not (Test-Path $workDir)) {
+                    throw "Working directory does not exist: $workDir"
+                }
                 Set-Location $workDir
             }
 
             # Execute git command and capture all output
             $rawOutput = & $gitExe @gitArgs 2>&1
 
-            # Convert ErrorRecords to strings to prevent deserialization issues
+            # Convert all output to strings to prevent deserialization issues and ensure consistent types
             $processedOutput = @()
             foreach ($item in $rawOutput) {
                 if ($item -is [System.Management.Automation.ErrorRecord]) {
                     # Convert ErrorRecord to string
                     $processedOutput += $item.ToString()
                 } else {
-                    $processedOutput += $item
+                    # Convert all other types to string for consistency
+                    $processedOutput += $item.ToString()
                 }
             }
 
@@ -343,7 +347,7 @@ if (Test-Path $PWSHFolder) {
         $GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
 
         # Run git commands as jobs to prevent keypress interference
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder)
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
         Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder
         Invoke-GitAsJob -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/master") -WorkingDirectory $PWSHFolder
 
@@ -365,7 +369,7 @@ if (Test-Path $PWSHFolder) {
 
         # Run git commands as jobs to prevent keypress interference
         Invoke-GitAsJob -GitPath $GitCommand -Arguments @("clone", "https://github.com/MauleTech/PWSH.git", $PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
-        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder)
+        Invoke-GitAsJob -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
 
         Write-Host "Repository cloned successfully!" -ForegroundColor Green
     }
@@ -392,7 +396,8 @@ Function Update-ITPS {
     # Fetch all remotes
     Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder | Out-Null
     # Check what branch we're on
-    $CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder).Trim()
+    $CurrentBranch = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
+    $CurrentBranch = if ($CurrentBranch) { $CurrentBranch.Trim() } else { "" }
     # Validate branch name (handle detached HEAD state)
     if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
         $CurrentBranch = "master"
@@ -431,7 +436,8 @@ Function Global:Update-ITFunctions {
 			Invoke-GitAsJob -GitPath $GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $PWSHFolder -ShowOutput
 
 			# Check what branch we're on
-			$CurrentBranch = (Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder).Trim()
+			$CurrentBranch = Invoke-GitAsJob -GitPath $GitCommand -Arguments @("branch", "--show-current") -WorkingDirectory $PWSHFolder
+			$CurrentBranch = if ($CurrentBranch) { $CurrentBranch.Trim() } else { "" }
 			# Validate branch name (handle detached HEAD state)
 			if ([string]::IsNullOrWhiteSpace($CurrentBranch)) {
 				$CurrentBranch = "master"

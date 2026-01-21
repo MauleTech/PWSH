@@ -472,8 +472,8 @@ Function Global:Update-ITFunctions {
 				if ($CurrentBranch -match '(fatal|error):') {
 					Write-Host "Failed to detect current branch: $CurrentBranch" -ForegroundColor Yellow
 				}
-				$CurrentBranch = "master"
-				Write-Host "Defaulting to master branch" -ForegroundColor Yellow
+				$CurrentBranch = "main"
+				Write-Host "Defaulting to main branch" -ForegroundColor Yellow
 			}
 			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
 

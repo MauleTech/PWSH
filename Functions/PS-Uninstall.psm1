@@ -64,26 +64,178 @@ Function Uninstall-Application {
 		}
 	}
 
-	Function Uninstall-MsiApp {
-		Write-Host -NoNewLine "Attempting MSI UninstallString method. "
-		$uninstallString=""
-		$uninstall32 = (Get-ChildItem $uninstallX86RegPath | ForEach-Object { Get-ItemProperty $_.PSPath } | ? { $_ -Match $AppToUninstall }).UninstallString
-		$uninstall64 = (Get-ChildItem $uninstallX64RegPath | ForEach-Object { Get-ItemProperty $_.PSPath } | ? { $_ -Match $AppToUninstall }).UninstallString
-		If($uninstall64) {$uninstallString=$uninstall64}
-		If($uninstall32) {$uninstallString=$uninstall32}
-		If(!$uninstallString) {
-			Write-Error "Application was is not found"
+	Function Uninstall-RegistryApp {
+		Write-Host -NoNewLine "Attempting Registry UninstallString method. "
+
+		# Get registry entries for the application
+		$regEntry32 = Get-ChildItem $uninstallX86RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall }
+		$regEntry64 = Get-ChildItem $uninstallX64RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall }
+
+		$regEntry = $null
+		If ($regEntry64) { $regEntry = $regEntry64 }
+		If ($regEntry32) { $regEntry = $regEntry32 }
+
+		If (-not $regEntry) {
+			Write-Host -ForegroundColor Yellow "Application not found in registry."
+			return
 		}
-		$uninstallString = $uninstallString -Replace "msiexec.exe","" -Replace "/I","" -Replace "/X",""
-		$uninstallString = $uninstallString.Trim()
-		Start-Process "msiexec.exe" -arg "/X $uninstallString /qn" -Wait
-		$MsiApps = (Get-ChildItem $uninstallX86RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
-		$MsiApps += (Get-ChildItem $uninstallX64RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
+
+		# Prefer QuietUninstallString if available
+		$uninstallString = $null
+		$isQuietString = $false
+
+		If ($regEntry.QuietUninstallString) {
+			$uninstallString = $regEntry.QuietUninstallString
+			$isQuietString = $true
+			Write-Host -NoNewLine "(Using QuietUninstallString) "
+		} ElseIf ($regEntry.UninstallString) {
+			$uninstallString = $regEntry.UninstallString
+		}
+
+		If (-not $uninstallString) {
+			Write-Host -ForegroundColor Yellow "No uninstall string found."
+			return
+		}
+
+		# Determine if this is an MSI or EXE uninstaller
+		$isMsi = $uninstallString -match 'msiexec|\.msi|^{[A-F0-9-]+}$' -or $uninstallString -match '^\s*{?[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}}?\s*$'
+
+		If ($isMsi) {
+			# Handle MSI uninstaller
+			Write-Host -NoNewLine "(MSI detected) "
+			$guid = $uninstallString -Replace "msiexec.exe","" -Replace "/I","" -Replace "/X","" -Replace '"',''
+			$guid = $guid.Trim()
+
+			# Extract GUID if present
+			If ($guid -match '({[A-F0-9-]+})') {
+				$guid = $Matches[1]
+			}
+
+			Start-Process "msiexec.exe" -ArgumentList "/X $guid /qn /norestart" -Wait -NoNewWindow
+		} Else {
+			# Handle EXE uninstaller
+			Write-Host -NoNewLine "(EXE detected) "
+
+			# If we already have a quiet string, use it directly
+			If ($isQuietString) {
+				Invoke-UninstallString -UninstallString $uninstallString
+			} Else {
+				# Try to add silent switches for common installer types
+				Invoke-SilentExeUninstall -UninstallString $uninstallString
+			}
+		}
+
+		# Verify uninstall success
+		Start-Sleep -Seconds 2
+		$MsiApps = (Get-ChildItem $uninstallX86RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
+		$MsiApps += (Get-ChildItem $uninstallX64RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
 		If (-not ($MsiApps -Match $AppToUninstall)) {
-			Write-Host -ForegroundColor Green "$AppToUninstall appears to have been successfully uninstalled via MSI UninstallString method.`n$MsiApps"
+			Write-Host -ForegroundColor Green "$AppToUninstall appears to have been successfully uninstalled via Registry method."
 			$Global:Uninstalled = $True
 		} Else {
-			Write-Host -ForegroundColor Yellow "Uninstalling via Msi UninstallString method didn't work."
+			Write-Host -ForegroundColor Yellow "Uninstalling via Registry UninstallString method didn't work."
+		}
+	}
+
+	Function Invoke-UninstallString {
+		param([string]$UninstallString)
+
+		# Parse the uninstall string to separate executable from arguments
+		If ($UninstallString -match '^"([^"]+)"\s*(.*)$') {
+			$exe = $Matches[1]
+			$args = $Matches[2]
+		} ElseIf ($UninstallString -match '^(\S+\.exe)\s*(.*)$') {
+			$exe = $Matches[1]
+			$args = $Matches[2]
+		} Else {
+			# Fallback: run as-is via cmd
+			Start-Process "cmd.exe" -ArgumentList "/c `"$UninstallString`"" -Wait -NoNewWindow
+			return
+		}
+
+		If ($args) {
+			Start-Process $exe -ArgumentList $args -Wait -NoNewWindow
+		} Else {
+			Start-Process $exe -Wait -NoNewWindow
+		}
+	}
+
+	Function Invoke-SilentExeUninstall {
+		param([string]$UninstallString)
+
+		# Parse executable path from uninstall string
+		$exe = $null
+		$existingArgs = ""
+
+		If ($UninstallString -match '^"([^"]+)"\s*(.*)$') {
+			$exe = $Matches[1]
+			$existingArgs = $Matches[2]
+		} ElseIf ($UninstallString -match '^(\S+\.exe)\s*(.*)$') {
+			$exe = $Matches[1]
+			$existingArgs = $Matches[2]
+		}
+
+		If (-not $exe -or -not (Test-Path $exe -ErrorAction SilentlyContinue)) {
+			# Fallback to running the string as-is
+			Invoke-UninstallString -UninstallString $UninstallString
+			return
+		}
+
+		# Common silent uninstall switches for different installer types
+		$silentSwitches = @(
+			# NSIS (Nullsoft Scriptable Install System)
+			'/S',
+			# Inno Setup
+			'/VERYSILENT /SUPPRESSMSGBOXES /NORESTART',
+			# InstallShield
+			'/s /f1"C:\WINDOWS\Temp\uninstall.iss"',
+			'-s',
+			# WiX Burn
+			'/quiet /uninstall',
+			# Generic attempts
+			'/silent',
+			'--silent',
+			'-silent',
+			'/q',
+			'-q',
+			'--quiet',
+			'/passive'
+		)
+
+		# First, try to detect installer type from the executable
+		$exeContent = $null
+		Try {
+			$exeContent = [System.IO.File]::ReadAllText($exe, [System.Text.Encoding]::ASCII) 2>$null
+		} Catch { }
+
+		$preferredSwitch = $null
+		If ($exeContent) {
+			If ($exeContent -match 'Nullsoft|NSIS') {
+				$preferredSwitch = '/S'
+			} ElseIf ($exeContent -match 'Inno Setup') {
+				$preferredSwitch = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
+			} ElseIf ($exeContent -match 'InstallShield') {
+				$preferredSwitch = '/s'
+			}
+		}
+
+		# Build the argument list
+		$argsToUse = $existingArgs
+		If ($preferredSwitch) {
+			If ($argsToUse -and $argsToUse -notmatch [regex]::Escape($preferredSwitch)) {
+				$argsToUse = "$argsToUse $preferredSwitch"
+			} ElseIf (-not $argsToUse) {
+				$argsToUse = $preferredSwitch
+			}
+			Write-Host -NoNewLine "(Detected installer type, using: $preferredSwitch) "
+			Start-Process $exe -ArgumentList $argsToUse -Wait -NoNewWindow
+		} Else {
+			# Try common silent switches in order
+			Write-Host -NoNewLine "(Trying common silent switches) "
+
+			# First attempt: just add /S (most common)
+			$argsToUse = If ($existingArgs) { "$existingArgs /S" } Else { "/S" }
+			Start-Process $exe -ArgumentList $argsToUse -Wait -NoNewWindow
 		}
 	}
 
@@ -100,7 +252,7 @@ Function Uninstall-Application {
 			Write-Host "$AppToUninstall found. Attempting uninstall. "
 			If ($WmiApps -Match $AppToUninstall) {Uninstall-WmiApp}
 			If ((-Not $Uninstalled) -and ($PowershellApps -Match $AppToUninstall)) {Uninstall-PowershellApp}
-			If ((-Not $Uninstalled) -and ($MsiApps -Match $AppToUninstall)) {Uninstall-MsiApp}
+			If ((-Not $Uninstalled) -and ($MsiApps -Match $AppToUninstall)) {Uninstall-RegistryApp}
 			If (-Not $Uninstalled) {Write-Host -ForegroundColor Red "Uninstall Failed. Please try uninstalling via Windows Settings Menus."}
 		} Else {
 			Write-Host -ForegroundColor Yellow "$AppToUninstall was not found."

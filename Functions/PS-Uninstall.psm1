@@ -67,14 +67,12 @@ Function Uninstall-Application {
 	Function Uninstall-RegistryApp {
 		Write-Host -NoNewLine "Attempting Registry UninstallString method. "
 
-		# Get registry entries for the application
-		$regEntry32 = Get-ChildItem $uninstallX86RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall }
-		$regEntry64 = Get-ChildItem $uninstallX64RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall }
+		# Get registry entries for the application (Select-Object -First 1 ensures single entry)
+		$regEntry32 = Get-ChildItem $uninstallX86RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall } | Select-Object -First 1
+		$regEntry64 = Get-ChildItem $uninstallX64RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall } | Select-Object -First 1
 
-		# Prefer 64-bit entry over 32-bit if both exist
-		$regEntry = $null
-		If ($regEntry32) { $regEntry = $regEntry32 }
-		If ($regEntry64) { $regEntry = $regEntry64 }
+		# Prefer 64-bit entry over 32-bit if available
+		$regEntry = If ($regEntry64) { $regEntry64 } ElseIf ($regEntry32) { $regEntry32 } Else { $null }
 
 		If (-not $regEntry) {
 			Write-Host -ForegroundColor Yellow "Application not found in registry."
@@ -98,8 +96,8 @@ Function Uninstall-Application {
 			return
 		}
 
-		# Determine if this is an MSI or EXE uninstaller (case-insensitive GUID matching)
-		$IsMsi = $uninstallString -match '(?i)msiexec|\.msi|^\{[A-Fa-f0-9-]+\}$' -or $uninstallString -match '(?i)^\s*\{?[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}?\s*$'
+		# Determine if this is an MSI or EXE uninstaller (case-insensitive, match GUID anywhere in string)
+		$IsMsi = $uninstallString -match '(?i)msiexec|\.msi|\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}'
 
 		If ($IsMsi) {
 			# Handle MSI uninstaller
@@ -108,11 +106,16 @@ Function Uninstall-Application {
 			$guid = $guid.Trim()
 
 			# Extract GUID if present (case-insensitive)
-			If ($guid -match '(?i)(\{[A-Fa-f0-9-]+\})') {
+			If ($guid -match '(?i)(\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\})') {
 				$guid = $Matches[1]
 			}
 
-			Start-Process "msiexec.exe" -ArgumentList "/X $guid /qn /norestart" -Wait -NoNewWindow
+			$process = Start-Process "msiexec.exe" -ArgumentList "/X $guid /qn /norestart" -Wait -NoNewWindow -PassThru
+			If ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {
+				Write-Host -NoNewLine "(Exit code: $($process.ExitCode)) "
+			} Else {
+				Write-Host -ForegroundColor Yellow "(Exit code: $($process.ExitCode)) "
+			}
 		} Else {
 			# Handle EXE uninstaller
 			Write-Host -NoNewLine "(EXE detected) "
@@ -142,6 +145,7 @@ Function Uninstall-Application {
 		param([string]$UninstallString)
 
 		# Parse the uninstall string to separate executable from arguments
+		$process = $null
 		If ($UninstallString -match '^"([^"]+)"\s*(.*)$') {
 			$exe = $Matches[1]
 			$argList = $Matches[2]
@@ -150,15 +154,16 @@ Function Uninstall-Application {
 			$argList = $Matches[2]
 		} Else {
 			# Fallback: run as-is via cmd
-			Start-Process "cmd.exe" -ArgumentList "/c `"$UninstallString`"" -Wait -NoNewWindow
-			return
+			$process = Start-Process "cmd.exe" -ArgumentList "/c `"$UninstallString`"" -Wait -NoNewWindow -PassThru
+			return $process.ExitCode
 		}
 
 		If ($argList) {
-			Start-Process $exe -ArgumentList $argList -Wait -NoNewWindow
+			$process = Start-Process $exe -ArgumentList $argList -Wait -NoNewWindow -PassThru
 		} Else {
-			Start-Process $exe -Wait -NoNewWindow
+			$process = Start-Process $exe -Wait -NoNewWindow -PassThru
 		}
+		return $process.ExitCode
 	}
 
 	Function Invoke-SilentExeUninstall {
@@ -176,14 +181,16 @@ Function Uninstall-Application {
 			$existingArgs = $Matches[2]
 		}
 
-		If (-not $exe -or -not (Test-Path $exe -ErrorAction SilentlyContinue)) {
+		# Validate executable exists and has .exe extension
+		If (-not $exe -or -not ($exe -match '\.exe$') -or -not (Test-Path $exe -ErrorAction SilentlyContinue)) {
 			# Fallback to running the string as-is
-			Invoke-UninstallString -UninstallString $UninstallString
-			return
+			$exitCode = Invoke-UninstallString -UninstallString $UninstallString
+			return $exitCode
 		}
 
 		# Try to detect installer type by reading first 10MB of the executable (memory-safe)
 		$preferredSwitch = $null
+		$detectedType = $null
 		$maxBytesToRead = 10MB
 		Try {
 			$fileStream = [System.IO.File]::OpenRead($exe)
@@ -197,12 +204,16 @@ Function Uninstall-Application {
 				# Detect installer type from signatures in the binary
 				If ($exeContent -match 'Nullsoft|NSIS') {
 					$preferredSwitch = '/S'
+					$detectedType = 'NSIS'
 				} ElseIf ($exeContent -match 'Inno Setup') {
 					$preferredSwitch = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
+					$detectedType = 'Inno Setup'
 				} ElseIf ($exeContent -match 'InstallShield') {
 					$preferredSwitch = '/s'
+					$detectedType = 'InstallShield'
 				} ElseIf ($exeContent -match 'WiX') {
 					$preferredSwitch = '/quiet /uninstall'
+					$detectedType = 'WiX'
 				}
 			} Finally {
 				$fileStream.Close()
@@ -212,47 +223,41 @@ Function Uninstall-Application {
 			# If we can't read the file, continue without detection
 		}
 
-		# Build the argument list with case-insensitive check for existing switches
+		# Build the argument list
 		$argsToUse = $existingArgs
+
 		If ($preferredSwitch) {
-			# Check if switch already exists (case-insensitive)
-			If ($argsToUse -and $argsToUse -notmatch "(?i)$([regex]::Escape($preferredSwitch))") {
-				$argsToUse = "$argsToUse $preferredSwitch"
-			} ElseIf (-not $argsToUse) {
-				$argsToUse = $preferredSwitch
+			# Check if key silent flags already exist (case-insensitive, check individual flags)
+			$flagsToAdd = @()
+			ForEach ($flag in ($preferredSwitch -split '\s+')) {
+				If (-not $argsToUse -or $argsToUse -notmatch "(?i)$([regex]::Escape($flag))") {
+					$flagsToAdd += $flag
+				}
 			}
-			Write-Host -NoNewLine "(Detected installer type, using: $preferredSwitch) "
-			Start-Process $exe -ArgumentList $argsToUse -Wait -NoNewWindow
+			If ($flagsToAdd.Count -gt 0) {
+				$argsToUse = ("$argsToUse " + ($flagsToAdd -join ' ')).Trim()
+			}
+			Write-Host -NoNewLine "(Detected: $detectedType, using: $preferredSwitch) "
 		} Else {
-			# Try multiple common silent switches in order of likelihood
-			Write-Host -NoNewLine "(Trying common silent switches) "
-
-			# Ordered list of silent switches to try
-			$switchesToTry = @(
-				'/S',                                          # NSIS (most common)
-				'/VERYSILENT /SUPPRESSMSGBOXES /NORESTART',   # Inno Setup
-				'/silent',                                     # Generic
-				'/quiet',                                      # WiX/Generic
-				'-s'                                           # InstallShield
-			)
-
-			ForEach ($silentSwitch in $switchesToTry) {
-				$argsToUse = If ($existingArgs) { "$existingArgs $silentSwitch" } Else { $silentSwitch }
-				Start-Process $exe -ArgumentList $argsToUse -Wait -NoNewWindow
-
-				# Check if uninstall succeeded by looking in registry
-				Start-Sleep -Seconds 2
-				$stillExists = (Get-ChildItem $uninstallX86RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall })
-				If (-not $stillExists) {
-					$stillExists = (Get-ChildItem $uninstallX64RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -Match $AppToUninstall })
-				}
-
-				If (-not $stillExists) {
-					# Uninstall succeeded
-					break
-				}
+			# Unknown installer type - use /S as most common silent switch (single attempt only)
+			Write-Host -NoNewLine "(Unknown installer type, trying /S) "
+			If (-not $argsToUse -or $argsToUse -notmatch '(?i)/S\b') {
+				$argsToUse = ("$argsToUse /S").Trim()
 			}
 		}
+
+		# Execute the uninstaller once and capture exit code
+		$process = Start-Process $exe -ArgumentList $argsToUse -Wait -NoNewWindow -PassThru
+		$exitCode = $process.ExitCode
+
+		# Report exit code (0 = success, 3010 = reboot required, 1605 = not installed)
+		If ($exitCode -eq 0 -or $exitCode -eq 3010 -or $exitCode -eq 1605) {
+			Write-Host -NoNewLine "(Exit code: $exitCode) "
+		} Else {
+			Write-Host -ForegroundColor Yellow "(Exit code: $exitCode - may indicate failure) "
+		}
+
+		return $exitCode
 	}
 
 	If (-Not $AppToUninstall) {

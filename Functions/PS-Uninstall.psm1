@@ -24,12 +24,12 @@ Function Uninstall-Application {
 	$Global:WmiApps = (Get-WmiObject -Class Win32_Product).Name | Select-Object -Unique | Sort-Object
 	Write-Host '--[Scanning Native Powershell Repository]'
 	$Global:PowershellApps = (Get-Package -Provider Programs -IncludeWindowsInstaller).Name | Select-Object -Unique | Sort-Object
-	Write-Host '--[Scanning MSIExec UninstallString Repository]'
-	$Global:uninstallX86RegPath="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" | Select-Object -Unique | Sort-Object
-	$Global:uninstallX64RegPath="HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall" | Select-Object -Unique | Sort-Object
-	$Global:MsiApps = (Get-ChildItem $uninstallX86RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
-	$MsiApps += (Get-ChildItem $uninstallX64RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
-	$Global:AllApps = $WmiApps + $PowershellApps + $MsiApps | Select-Object -Unique | Sort-Object
+	Write-Host '--[Scanning Registry UninstallString Repository]'
+	$Global:uninstallX86RegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+	$Global:uninstallX64RegPath = "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+	$Global:RegistryApps = (Get-ChildItem $uninstallX86RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
+	$RegistryApps += (Get-ChildItem $uninstallX64RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
+	$Global:AllApps = $WmiApps + $PowershellApps + $RegistryApps | Select-Object -Unique | Sort-Object
 	$Global:Uninstalled = $False
 
 
@@ -122,7 +122,12 @@ Function Uninstall-Application {
 
 			# If we already have a quiet string, use it directly
 			If ($IsQuietString) {
-				Invoke-UninstallString -UninstallString $uninstallString
+				$exitCode = Invoke-UninstallString -UninstallString $uninstallString
+				If ($exitCode -eq 0 -or $exitCode -eq 3010 -or $exitCode -eq 1605) {
+					Write-Host -NoNewLine "(Exit code: $exitCode) "
+				} Else {
+					Write-Host -ForegroundColor Yellow "(Exit code: $exitCode - may indicate failure) "
+				}
 			} Else {
 				# Try to add silent switches for common installer types
 				Invoke-SilentExeUninstall -UninstallString $uninstallString
@@ -131,9 +136,9 @@ Function Uninstall-Application {
 
 		# Verify uninstall success (wait for registry to update)
 		Start-Sleep -Seconds 5
-		$MsiApps = (Get-ChildItem $uninstallX86RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
-		$MsiApps += (Get-ChildItem $uninstallX64RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
-		If (-not ($MsiApps -Match $AppToUninstall)) {
+		$RegistryApps = (Get-ChildItem $uninstallX86RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
+		$RegistryApps += (Get-ChildItem $uninstallX64RegPath -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
+		If (-not ($RegistryApps -Match $AppToUninstall)) {
 			Write-Host -ForegroundColor Green "$AppToUninstall appears to have been successfully uninstalled via Registry method."
 			$Global:Uninstalled = $True
 		} Else {
@@ -273,7 +278,7 @@ Function Uninstall-Application {
 			Write-Host "$AppToUninstall found. Attempting uninstall. "
 			If ($WmiApps -Match $AppToUninstall) {Uninstall-WmiApp}
 			If ((-Not $Uninstalled) -and ($PowershellApps -Match $AppToUninstall)) {Uninstall-PowershellApp}
-			If ((-Not $Uninstalled) -and ($MsiApps -Match $AppToUninstall)) {Uninstall-RegistryApp}
+			If ((-Not $Uninstalled) -and ($RegistryApps -Match $AppToUninstall)) {Uninstall-RegistryApp}
 			If (-Not $Uninstalled) {Write-Host -ForegroundColor Red "Uninstall Failed. Please try uninstalling via Windows Settings Menus."}
 		} Else {
 			Write-Host -ForegroundColor Yellow "$AppToUninstall was not found."
@@ -282,7 +287,7 @@ Function Uninstall-Application {
 		Write-Host -ForegroundColor Red "No application specified."
 	}
 	#Cleanup!
-	@("WmiApps", "PowershellApps", "uninstallX86RegPath", "uninstallX64RegPath", "MsiApps", "AllApps", "Uninstalled") | ForEach-Object {
+	@("WmiApps", "PowershellApps", "uninstallX86RegPath", "uninstallX64RegPath", "RegistryApps", "AllApps", "Uninstalled") | ForEach-Object {
 		Clear-Variable $_ -Force -ErrorAction SilentlyContinue
 	}
 }

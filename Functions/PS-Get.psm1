@@ -1779,8 +1779,10 @@ function Get-ADUsersPasswordExpiring {
 		including the user's name, when their password was last set, when it expires, and how many
 		days remain until expiration.
 
-		The function uses the msDS-UserPasswordExpiryTimeComputed attribute which is a constructed
-		attribute that calculates the actual expiration time based on domain password policy.
+		When the Specops.SpecopsPasswordPolicy module is available, the function uses the SpecOps
+		password policy MaximumPasswordAge setting for accurate expiration calculation. Otherwise,
+		it falls back to the standard msDS-UserPasswordExpiryTimeComputed attribute which calculates
+		expiration based on the default domain password policy.
 	.PARAMETER DaysUntilExpiration
 		The number of days to look ahead for expiring passwords. Users whose passwords expire
 		within this many days from today will be included in the results. Defaults to 60 days.
@@ -1803,6 +1805,7 @@ function Get-ADUsersPasswordExpiring {
 	.NOTES
 		Requires the ActiveDirectory PowerShell module.
 		Must be run with permissions to query AD user objects.
+		Supports SpecOps Password Policy when the Specops.SpecopsPasswordPolicy module is installed.
 	#>
 	[CmdletBinding()]
 	param(
@@ -1817,29 +1820,61 @@ function Get-ADUsersPasswordExpiring {
 		return
 	}
 
-	# Calculate date range for password expiration check
 	$today = Get-Date
 	$threshold = $today.AddDays($DaysUntilExpiration)
 
-	# Query AD for enabled users with password expiration enabled
-	Get-ADUser -Filter {Enabled -eq $true -and PasswordNeverExpires -eq $false} `
-		-Properties PasswordLastSet, PasswordNeverExpires, msDS-UserPasswordExpiryTimeComputed |
-	Where-Object { $_.'msDS-UserPasswordExpiryTimeComputed' } |
-	ForEach-Object {
-		# Convert the FileTime format to DateTime
-		$expiryDate = [DateTime]::FromFileTime($_.'msDS-UserPasswordExpiryTimeComputed')
-
-		# Only include users whose passwords expire within the threshold
-		if ($expiryDate -gt $today -and $expiryDate -le $threshold) {
-			[PSCustomObject]@{
-				SamAccountName  = $_.SamAccountName
-				Name            = $_.Name
-				PasswordLastSet = $_.PasswordLastSet
-				ExpiresOn       = $expiryDate
-				DaysRemaining   = ($expiryDate - $today).Days
+	# Check if SpecOps Password Policy module is available
+	$useSpecOps = $false
+	$specopsMaxAge = $null
+	if (Get-Module -ListAvailable -Name "Specops.SpecopsPasswordPolicy" -ErrorAction SilentlyContinue) {
+		try {
+			Import-Module Specops.SpecopsPasswordPolicy -ErrorAction Stop
+			$specopsPolicy = Get-PasswordPolicy -ErrorAction Stop
+			if ($specopsPolicy -and $specopsPolicy.Policy -and $specopsPolicy.Policy.MaximumPasswordAge) {
+				$specopsMaxAge = $specopsPolicy.Policy.MaximumPasswordAge
+				$useSpecOps = $true
+				Write-Verbose "Using SpecOps Password Policy. MaximumPasswordAge: $specopsMaxAge days"
 			}
+		} catch {
+			Write-Verbose "SpecOps module found but failed to get policy: $_. Falling back to standard AD method."
 		}
-	} | Sort-Object DaysRemaining
+	}
+
+	if ($useSpecOps) {
+		# Use SpecOps password policy for expiration calculation
+		Get-ADUser -Filter {Enabled -eq $true -and PasswordNeverExpires -eq $false} -Properties PasswordLastSet |
+		Where-Object { $_.PasswordLastSet } |
+		ForEach-Object {
+			$expiryDate = $_.PasswordLastSet.AddDays($specopsMaxAge)
+			if ($expiryDate -gt $today -and $expiryDate -le $threshold) {
+				[PSCustomObject]@{
+					SamAccountName  = $_.SamAccountName
+					Name            = $_.Name
+					PasswordLastSet = $_.PasswordLastSet
+					ExpiresOn       = $expiryDate
+					DaysRemaining   = ($expiryDate - $today).Days
+				}
+			}
+		} | Sort-Object DaysRemaining
+	} else {
+		# Standard AD method using msDS-UserPasswordExpiryTimeComputed
+		Write-Verbose "Using standard AD password expiration (msDS-UserPasswordExpiryTimeComputed)"
+		Get-ADUser -Filter {Enabled -eq $true -and PasswordNeverExpires -eq $false} `
+			-Properties PasswordLastSet, PasswordNeverExpires, msDS-UserPasswordExpiryTimeComputed |
+		Where-Object { $_.'msDS-UserPasswordExpiryTimeComputed' } |
+		ForEach-Object {
+			$expiryDate = [DateTime]::FromFileTime($_.'msDS-UserPasswordExpiryTimeComputed')
+			if ($expiryDate -gt $today -and $expiryDate -le $threshold) {
+				[PSCustomObject]@{
+					SamAccountName  = $_.SamAccountName
+					Name            = $_.Name
+					PasswordLastSet = $_.PasswordLastSet
+					ExpiresOn       = $expiryDate
+					DaysRemaining   = ($expiryDate - $today).Days
+				}
+			}
+		} | Sort-Object DaysRemaining
+	}
 }
 
 

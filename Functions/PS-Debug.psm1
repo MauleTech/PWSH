@@ -1,8 +1,8 @@
 Function Debug-UmbrellaDNS {
 
 	#Policy exposer:
-	$Lookup = Resolve-DnsName -Name debug.opendns.com -Type txt
-	$OrgID = ($Lookup | Where-Object -Property Strings -Match "orgid").Strings -replace "[^0-9]" , ''
+	$Lookup = Resolve-DnsName -Name debug.opendns.com -Type txt
+	$OrgID = ($Lookup | Where-Object -Property Strings -Match "orgid").Strings -replace "[^0-9]" , ''
 	$Bundle = ($Lookup | Where-Object -Property Strings -Match "bundle").Strings -replace "[^0-9]" , ''
 	$PolicyURL = 'https://dashboard.umbrella.com/o/' + $OrgID + '/#/configuration/policy/' + $Bundle
 	Write-Output "Organization ID: $OrgID"

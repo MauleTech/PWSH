@@ -1,4 +1,25 @@
 Function Connect-O365AzureAD {
+	<#
+	.SYNOPSIS
+		[DEPRECATED] Initiates an Office 365 Azure AD connection using the legacy AzureAD module.
+	.DESCRIPTION
+		This function is DEPRECATED. The AzureAD PowerShell module is retired as of March 30, 2024.
+		Microsoft recommends migrating to Microsoft Graph PowerShell SDK.
+		Use Connect-MgGraph from the Microsoft.Graph module instead.
+		See: https://learn.microsoft.com/en-us/powershell/azure/active-directory/migration-faq
+	.LINK
+		https://docs.microsoft.com/en-us/microsoft-365/enterprise/connect-to-microsoft-365-powershell?view=o365-worldwide
+	.EXAMPLE
+		Connect-O365AzureAD
+		Connects using the deprecated AzureAD module.
+	.EXAMPLE
+		# Recommended replacement:
+		# Install-Module Microsoft.Graph -Scope CurrentUser
+		# Connect-MgGraph -Scopes "User.Read.All","Group.Read.All"
+	#>
+	Write-Warning "DEPRECATED: The AzureAD module is retired. Please migrate to Microsoft.Graph module."
+	Write-Warning "Use 'Connect-MgGraph' instead. See: https://learn.microsoft.com/en-us/powershell/microsoftgraph/migration-steps"
+
 	If (-not (Get-Command Connect-AzureAD -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing the Azure AD module"
 		Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
@@ -6,13 +27,11 @@ Function Connect-O365AzureAD {
 		$ModVer = (Get-Command Connect-AzureAD).Version
 		If ($ModVer) {
 			Write-Host "Azure AD module version $ModVer has been installed."
-		}
-		Else {
+		} Else {
 			Write-Host "Azure AD module failed to install."
 			Break
 		}
-	}
- Else {
+	} Else {
 		$Readhost = 'N'
 		$Readhost = Read-Host "Do you want to check for module updates? This should be done periodically. `n(y/N)"
 		Switch ($ReadHost) {
@@ -23,8 +42,7 @@ Function Connect-O365AzureAD {
 					Write-host "AzureAD has an update from $ModVer to $AvailableModVer.`nInstalling the update."
 					Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
 					Install-Module -Name AzureAD -AllowClobber -Force
-				}
-				Else {
+				} Else {
 					Write-host "AzureAD is already up to date at version $AvailableModVer."
 				}
 			}
@@ -35,7 +53,6 @@ Function Connect-O365AzureAD {
 
 	Connect-AzureAD
 
-
 	Write-Host -ForegroundColor White -BackgroundColor DarkRed @"
 		Be sure to disconnect the remote PowerShell session when you're finished.
 		If you close the Windows PowerShell window without disconnecting the session,
@@ -45,18 +62,6 @@ Function Connect-O365AzureAD {
 
 		Disconnect-AzureAD
 "@
-
-	<#
-	.SYNOPSIS
-		Initiates an Office 365 Azure AD connection.
-
-	.LINK
-		https://docs.microsoft.com/en-us/microsoft-365/enterprise/connect-to-microsoft-365-powershell?view=o365-worldwide
-
-	.EXAMPLE
-		Connect-O365AzureAD
-		Yup, that's it!
-#>
 }
 
 Function Connect-NetExtender {

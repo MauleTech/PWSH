@@ -960,7 +960,18 @@ Function Get-InstalledApplication {
 	# Note: Win32_Product can be slow and may trigger MSI repairs
 	Write-Verbose '--[Scanning CIM Repository (this may take a moment)]'
 	Try {
-		$CimApps = Get-CimInstance -Class Win32_Product -ErrorAction SilentlyContinue |
+		$CimParams = @{
+			Class       = 'Win32_Product'
+			ErrorAction = 'SilentlyContinue'
+		}
+		# When -Name is provided, use WMI filter to reduce scan time and avoid unnecessary MSI repairs
+		If ($Name) {
+			# Escape single quotes for WMI and use LIKE for substring match
+			$WmiEscapedName = $Name -replace "'", "''"
+			$CimParams['Filter'] = "Name LIKE '%$WmiEscapedName%'"
+			Write-Verbose "  Using WMI filter: $($CimParams['Filter'])"
+		}
+		$CimApps = Get-CimInstance @CimParams |
 			Where-Object { $_.Name } |
 			ForEach-Object {
 				[PSCustomObject]@{
@@ -1016,10 +1027,14 @@ Function Get-InstalledApplication {
 		}
 	}
 
-	# Remove duplicates and sort by name
+	# Remove duplicates by Name|Version key and sort by name
+	# Note: Sort-Object -Unique doesn't work correctly for PSCustomObjects,
+	# so we use Group-Object to deduplicate by a composite key
 	$AllApps = $AllApps |
 		Where-Object { $_.Name } |
-		Sort-Object Name, Version -Unique
+		Group-Object { "$($_.Name)|$($_.Version)" } |
+		ForEach-Object { $_.Group[0] } |
+		Sort-Object Name
 
 	If ($Name) {
 		Try {

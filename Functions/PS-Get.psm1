@@ -919,49 +919,129 @@ Function Get-InternetHealth {
 }
 
 Function Get-InstalledApplication {
-	param(
+	<#
+	.SYNOPSIS
+		Gets installed applications from multiple sources including WMI, PowerShell Package Provider, and Registry.
 
-	  [Parameter(Mandatory=$False, ValueFromPipeline=$True,
-	  ValueFromPipelineByPropertyName=$True, HelpMessage='Enter the name of the application to check.')]
-	  [Alias('Application')]
-	  [string] $Name
+	.DESCRIPTION
+		Scans multiple application repositories to find installed applications.
+		Returns application names and versions. When -Name is specified, writes matching
+		applications to host and returns $True if found, $False otherwise.
+
+	.PARAMETER Name
+		Optional. The name (or partial name) of the application to check.
+		Supports regex matching.
+
+	.EXAMPLE
+		Get-InstalledApplication
+		Returns all installed applications with their versions.
+
+	.EXAMPLE
+		Get-InstalledApplication -Name "Chrome"
+		Writes matching applications to host and returns $True if found.
+
+	.EXAMPLE
+		Get-InstalledApplication -Name "Office" -Verbose
+		Shows verbose output while searching for Office applications.
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $False, ValueFromPipeline = $True,
+			ValueFromPipelineByPropertyName = $True, HelpMessage = 'Enter the name of the application to check.')]
+		[Alias('Application')]
+		[string] $Name
 	)
 
-	If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) {
-		Write-Verbose '[Scanning All App sources]'
-		Write-Verbose '--[Scanning Wmi Repository]'
+	$AllApps = @()
+
+	Write-Verbose '[Scanning All App sources]'
+
+	# Scan CIM/WMI Repository (using Get-CimInstance instead of deprecated Get-WmiObject)
+	# Note: Win32_Product can be slow and may trigger MSI repairs
+	Write-Verbose '--[Scanning CIM Repository (this may take a moment)]'
+	Try {
+		$CimApps = Get-CimInstance -Class Win32_Product -ErrorAction SilentlyContinue |
+			Where-Object { $_.Name } |
+			ForEach-Object {
+				[PSCustomObject]@{
+					Name    = $_.Name
+					Version = $_.Version
+				}
+			}
+		If ($CimApps) { $AllApps += $CimApps }
+	} Catch {
+		Write-Verbose "Failed to query CIM repository: $_"
 	}
-	$Global:WmiApps = (Get-WmiObject -Class Win32_Product).Name | Select-Object -Unique | Sort-Object
-	If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) {
-		Write-Verbose '--[Scanning Native Powershell Repository]'
+
+	# Scan Native PowerShell Package Repository
+	Write-Verbose '--[Scanning Native PowerShell Repository]'
+	Try {
+		$PowershellApps = Get-Package -Provider Programs -IncludeWindowsInstaller -ErrorAction SilentlyContinue |
+			Where-Object { $_.Name } |
+			ForEach-Object {
+				[PSCustomObject]@{
+					Name    = $_.Name
+					Version = $_.Version
+				}
+			}
+		If ($PowershellApps) { $AllApps += $PowershellApps }
+	} Catch {
+		Write-Verbose "Failed to query PowerShell Package repository: $_"
 	}
-	$Global:PowershellApps = (Get-Package -Provider Programs -IncludeWindowsInstaller).Name | Select-Object -Unique | Sort-Object
-	If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) {
-		Write-Verbose '--[Scanning MSIExec UninstallString Repository]'
+
+	# Scan Registry Uninstall Keys (both machine-wide and current user)
+	Write-Verbose '--[Scanning Registry Uninstall Keys]'
+	$RegistryPaths = @(
+		"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+		"HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+		"HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+	)
+
+	ForEach ($RegPath in $RegistryPaths) {
+		If (Test-Path $RegPath) {
+			Try {
+				$RegApps = Get-ChildItem $RegPath -ErrorAction SilentlyContinue | ForEach-Object {
+					$Props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+					If ($Props.DisplayName) {
+						[PSCustomObject]@{
+							Name    = $Props.DisplayName
+							Version = $Props.DisplayVersion
+						}
+					}
+				}
+				If ($RegApps) { $AllApps += $RegApps }
+			} Catch {
+				Write-Verbose "Failed to query registry path ${RegPath}: $_"
+			}
+		}
 	}
-	$Global:uninstallX86RegPath="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" | Select-Object -Unique | Sort-Object
-	$Global:uninstallX64RegPath="HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall" | Select-Object -Unique | Sort-Object
-	$Global:MsiApps = (Get-ChildItem $uninstallX86RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
-	$MsiApps += (Get-ChildItem $uninstallX64RegPath | ForEach-Object { Get-ItemProperty $_.PSPath }).DisplayName
-	$Global:AllApps = $WmiApps + $PowershellApps + $MsiApps | Select-Object -Unique | Sort-Object
-	$Global:Uninstalled = $False
+
+	# Remove duplicates and sort by name
+	$AllApps = $AllApps |
+		Where-Object { $_.Name } |
+		Sort-Object Name, Version -Unique
 
 	If ($Name) {
-		If ($AllApps -match $Name) {
-			If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) {
-				Write-Verbose "$($AllApps -match $Name) is installed."
+		Try {
+			$MatchedApps = $AllApps | Where-Object { $_.Name -match $Name }
+		} Catch {
+			Write-Host "Invalid search pattern '$Name'. Error: $_" -ForegroundColor Red
+			Return $False
+		}
+
+		If ($MatchedApps) {
+			Write-Host "Found installed application(s) matching '$Name':" -ForegroundColor Green
+			ForEach ($App in $MatchedApps) {
+				$VersionDisplay = If ($App.Version) { $App.Version } Else { "(version unknown)" }
+				Write-Host "  - $($App.Name) [$VersionDisplay]" -ForegroundColor Cyan
 			}
 			Return $True
 		} Else {
-			If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) {
-				Write-Verbose "$Name is NOT installed."
-			}
+			Write-Host "No installed application found matching '$Name'." -ForegroundColor Yellow
 			Return $False
 		}
 	} Else {
-		If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) {
-				Write-Verbose "Installed Applications:`n`n"
-			}
+		Write-Verbose "Returning all installed applications ($($AllApps.Count) found)"
 		Return $AllApps
 	}
 }

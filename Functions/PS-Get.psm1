@@ -925,20 +925,26 @@ Function Get-InstalledApplication {
 
 	.DESCRIPTION
 		Scans multiple application repositories to find installed applications.
-		Returns application names and versions. When -Name is specified, writes matching
-		applications to host and returns $True if found, $False otherwise.
+		Returns PSCustomObjects with Name and Version properties. When -Name is specified,
+		writes matching applications to host and returns $True if found, $False otherwise.
+
+		Note: This is a breaking change from earlier versions which returned plain strings.
 
 	.PARAMETER Name
 		Optional. The name (or partial name) of the application to check.
-		Supports regex matching.
+		Supports PowerShell regex matching (e.g., "Office.*365", "Chrome|Firefox").
 
 	.EXAMPLE
 		Get-InstalledApplication
-		Returns all installed applications with their versions.
+		Returns all installed applications with their versions as PSCustomObjects.
 
 	.EXAMPLE
 		Get-InstalledApplication -Name "Chrome"
 		Writes matching applications to host and returns $True if found.
+
+	.EXAMPLE
+		Get-InstalledApplication -Name "Office.*365"
+		Uses regex to find Office 365 applications.
 
 	.EXAMPLE
 		Get-InstalledApplication -Name "Office" -Verbose
@@ -946,40 +952,28 @@ Function Get-InstalledApplication {
 	#>
 	[CmdletBinding()]
 	param(
-		[Parameter(Mandatory = $False, ValueFromPipeline = $True,
-			ValueFromPipelineByPropertyName = $True, HelpMessage = 'Enter the name of the application to check.')]
+		[Parameter(Mandatory = $False, HelpMessage = 'Enter the name of the application to check (supports regex).')]
 		[Alias('Application')]
 		[string] $Name
 	)
 
-	$AllApps = @()
+	# Use List<T> for efficient collection building
+	$AllApps = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 	Write-Verbose '[Scanning All App sources]'
 
 	# Scan CIM/WMI Repository (using Get-CimInstance instead of deprecated Get-WmiObject)
-	# Note: Win32_Product can be slow and may trigger MSI repairs
+	# Note: Win32_Product can be slow and may trigger MSI repairs on scanned applications
 	Write-Verbose '--[Scanning CIM Repository (this may take a moment)]'
 	Try {
-		$CimParams = @{
-			Class       = 'Win32_Product'
-			ErrorAction = 'SilentlyContinue'
-		}
-		# When -Name is provided, use WMI filter to reduce scan time and avoid unnecessary MSI repairs
-		If ($Name) {
-			# Escape single quotes for WMI and use LIKE for substring match
-			$WmiEscapedName = $Name -replace "'", "''"
-			$CimParams['Filter'] = "Name LIKE '%$WmiEscapedName%'"
-			Write-Verbose "  Using WMI filter: $($CimParams['Filter'])"
-		}
-		$CimApps = Get-CimInstance @CimParams |
+		Get-CimInstance -Class Win32_Product -ErrorAction SilentlyContinue |
 			Where-Object { $_.Name } |
 			ForEach-Object {
-				[PSCustomObject]@{
+				$AllApps.Add([PSCustomObject]@{
 					Name    = $_.Name
 					Version = $_.Version
-				}
+				})
 			}
-		If ($CimApps) { $AllApps += $CimApps }
 	} Catch {
 		Write-Verbose "Failed to query CIM repository: $_"
 	}
@@ -987,15 +981,14 @@ Function Get-InstalledApplication {
 	# Scan Native PowerShell Package Repository
 	Write-Verbose '--[Scanning Native PowerShell Repository]'
 	Try {
-		$PowershellApps = Get-Package -Provider Programs -IncludeWindowsInstaller -ErrorAction SilentlyContinue |
+		Get-Package -Provider Programs -IncludeWindowsInstaller -ErrorAction SilentlyContinue |
 			Where-Object { $_.Name } |
 			ForEach-Object {
-				[PSCustomObject]@{
+				$AllApps.Add([PSCustomObject]@{
 					Name    = $_.Name
 					Version = $_.Version
-				}
+				})
 			}
-		If ($PowershellApps) { $AllApps += $PowershellApps }
 	} Catch {
 		Write-Verbose "Failed to query PowerShell Package repository: $_"
 	}
@@ -1011,16 +1004,15 @@ Function Get-InstalledApplication {
 	ForEach ($RegPath in $RegistryPaths) {
 		If (Test-Path $RegPath) {
 			Try {
-				$RegApps = Get-ChildItem $RegPath -ErrorAction SilentlyContinue | ForEach-Object {
+				Get-ChildItem $RegPath -ErrorAction SilentlyContinue | ForEach-Object {
 					$Props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
 					If ($Props.DisplayName) {
-						[PSCustomObject]@{
+						$AllApps.Add([PSCustomObject]@{
 							Name    = $Props.DisplayName
 							Version = $Props.DisplayVersion
-						}
+						})
 					}
 				}
-				If ($RegApps) { $AllApps += $RegApps }
 			} Catch {
 				Write-Verbose "Failed to query registry path ${RegPath}: $_"
 			}

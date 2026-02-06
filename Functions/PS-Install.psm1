@@ -1266,16 +1266,21 @@ Function Install-SSLInspectionCert {
 		Return
 	}
 
-	Write-Host "Connecting to $TestUrl to inspect the SSL certificate chain..."
-
-	# Use .NET TcpClient + SslStream to grab the cert chain, bypassing validation
-	$uri = [System.Uri]$TestUrl
+	# Validate URL
+	Try {
+		$uri = [System.Uri]$TestUrl
+	} Catch {
+		Write-Warning "Invalid URL: $TestUrl"
+		Return
+	}
 	If ($uri.Scheme -ne 'https') {
 		Write-Warning "TestUrl must use the https scheme. Got: $($uri.Scheme)"
 		Return
 	}
 	$hostname = $uri.Host
 	$port = $uri.Port
+
+	Write-Host "Connecting to ${hostname}:${port} to inspect the SSL certificate chain..."
 
 	$tcpClient = $null
 	$sslStream = $null
@@ -1287,7 +1292,13 @@ Function Install-SSLInspectionCert {
 
 	Try {
 		$tcpClient = New-Object System.Net.Sockets.TcpClient
-		$tcpClient.Connect($hostname, $port)
+		$connectTask = $tcpClient.ConnectAsync($hostname, $port)
+		If (-not $connectTask.Wait(10000)) {
+			Throw "Connection to ${hostname}:${port} timed out after 10 seconds."
+		}
+		If ($connectTask.IsFaulted) {
+			Throw $connectTask.Exception.InnerException
+		}
 
 		# Accept all certs during the handshake so we can inspect them
 		$callback = [System.Net.Security.RemoteCertificateValidationCallback]{
@@ -1408,10 +1419,17 @@ Function Install-SSLInspectionCert {
 			Remove-Item $tempIntPath -Force -ea SilentlyContinue
 		}
 
-		# Configure Firefox if present
-		If (Test-Path "C:\Program Files\Mozilla Firefox\defaults\pref\") {
-			Write-Host "Configuring Firefox to use the Windows certificate store"
-			Set-Content "C:\Program Files\Mozilla Firefox\defaults\pref\firefox-windows-truststore.js" "pref('security.enterprise_roots.enabled', true);"
+		# Configure Firefox if present (check both 64-bit and 32-bit paths)
+		$firefoxPrefPaths = @(
+			"C:\Program Files\Mozilla Firefox\defaults\pref\"
+			"C:\Program Files (x86)\Mozilla Firefox\defaults\pref\"
+		)
+		ForEach ($firefoxPrefPath in $firefoxPrefPaths) {
+			If (Test-Path $firefoxPrefPath) {
+				Write-Host "Configuring Firefox to use the Windows certificate store"
+				Set-Content (Join-Path $firefoxPrefPath "firefox-windows-truststore.js") "pref('security.enterprise_roots.enabled', true);"
+				Break
+			}
 		}
 
 		Write-Host ""

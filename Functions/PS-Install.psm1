@@ -1251,6 +1251,225 @@ Function Install-WinRepairToolbox {
 	Write-Host "The command to launch Windows Repair Toolbox has been put in your clipboard."
 }
 
+Function Install-SSLInspectionCert {
+	param(
+		[Parameter(Mandatory=$false)]
+		[string]$TestUrl = "https://dl.google.com",
+
+		[Parameter(Mandatory=$false)]
+		[switch]$Force
+	)
+
+	# Require elevation
+	If (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Write-Warning "This function must be run as Administrator to install certificates."
+		Return
+	}
+
+	# Validate URL
+	Try {
+		$uri = [System.Uri]$TestUrl
+	} Catch {
+		Write-Warning "Invalid URL: $TestUrl"
+		Return
+	}
+	If ($uri.Scheme -ne 'https') {
+		Write-Warning "TestUrl must use the https scheme. Got: $($uri.Scheme)"
+		Return
+	}
+	$hostname = $uri.Host
+	$port = $uri.Port
+
+	Write-Host "Connecting to ${hostname}:${port} to inspect the SSL certificate chain..."
+
+	$tcpClient = $null
+	$sslStream = $null
+	$serverCert = $null
+	$certChain = $null
+	$interceptCert = $null
+	$interceptThumbprint = $null
+	$untrustedIntermediates = @()
+
+	Try {
+		$tcpClient = New-Object System.Net.Sockets.TcpClient
+		$connectTask = $tcpClient.ConnectAsync($hostname, $port)
+		If (-not $connectTask.Wait(10000)) {
+			Throw "Connection to ${hostname}:${port} timed out after 10 seconds."
+		}
+		If ($connectTask.IsFaulted) {
+			Throw $connectTask.Exception.InnerException
+		}
+
+		# Accept all certs during the handshake so we can inspect them
+		$callback = [System.Net.Security.RemoteCertificateValidationCallback]{
+			param($cbSender, $cbCertificate, $cbChain, $cbSslPolicyErrors)
+			Return $true
+		}
+
+		$sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, $callback)
+		$sslStream.AuthenticateAsClient($hostname)
+
+		$serverCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($sslStream.RemoteCertificate)
+
+		# Build the chain ourselves to get all intermediate/root certs
+		$certChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+		$certChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+		$certChain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllFlags
+		$null = $certChain.Build($serverCert)
+
+		# Display the full chain
+		Write-Host ""
+		Write-Host "=== Certificate Chain for $hostname ===" -ForegroundColor Cyan
+		For ($i = 0; $i -lt $certChain.ChainElements.Count; $i++) {
+			$cert = $certChain.ChainElements[$i].Certificate
+			$prefix = If ($i -eq 0) { "Leaf" } ElseIf ($i -eq ($certChain.ChainElements.Count - 1)) { "Root" } Else { "Intermediate" }
+			Write-Host ""
+			Write-Host "  [$prefix] $($cert.Subject)" -ForegroundColor Yellow
+			Write-Host "    Issuer     : $($cert.Issuer)"
+			Write-Host "    Thumbprint : $($cert.Thumbprint)"
+			Write-Host "    Not Before : $($cert.NotBefore)"
+			Write-Host "    Not After  : $($cert.NotAfter)"
+		}
+		Write-Host ""
+
+		# Check if the root cert is already in the trusted store
+		$rootElement = $certChain.ChainElements[$certChain.ChainElements.Count - 1]
+		$rootCert = $rootElement.Certificate
+		$rootThumbprint = $rootCert.Thumbprint
+		$rootStorePath = "Cert:\LocalMachine\Root\$rootThumbprint"
+
+		If (Test-Path $rootStorePath) {
+			Write-Host -ForegroundColor Green "The root certificate ($($rootCert.Subject)) is already trusted. No SSL inspection certificate detected or it is already installed."
+			Return
+		}
+
+		# Root is NOT trusted - likely SSL inspection
+		Write-Host -ForegroundColor Red "The root certificate is NOT in the trusted root store."
+		Write-Host -ForegroundColor Red "This likely indicates SSL inspection is active."
+		Write-Host ""
+		Write-Host "=== SSL Inspection Root Certificate ===" -ForegroundColor Cyan
+		Write-Host "  Subject    : $($rootCert.Subject)" -ForegroundColor White
+		Write-Host "  Issuer     : $($rootCert.Issuer)" -ForegroundColor White
+		Write-Host "  Thumbprint : $rootThumbprint" -ForegroundColor White
+		Write-Host "  Not Before : $($rootCert.NotBefore)" -ForegroundColor White
+		Write-Host "  Not After  : $($rootCert.NotAfter)" -ForegroundColor White
+		Write-Host "  Serial     : $($rootCert.SerialNumber)" -ForegroundColor White
+		Write-Host ""
+
+		# Clone the root cert so it survives chain disposal
+		$interceptCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($rootCert.RawData)
+		$interceptThumbprint = $interceptCert.Thumbprint
+
+		# Also check for untrusted intermediate certs and clone them
+		For ($i = 1; $i -lt ($certChain.ChainElements.Count - 1); $i++) {
+			$intCert = $certChain.ChainElements[$i].Certificate
+			$intStorePath = "Cert:\LocalMachine\CA\$($intCert.Thumbprint)"
+			If (-not (Test-Path $intStorePath)) {
+				$untrustedIntermediates += New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($intCert.RawData)
+			}
+		}
+
+	} Catch {
+		Write-Warning "Failed to connect to ${hostname}:${port} - $_"
+		# Clean up cloned certs on error before returning
+		If ($interceptCert) { $interceptCert.Dispose(); $interceptCert = $null }
+		ForEach ($intCert in $untrustedIntermediates) { If ($intCert) { $intCert.Dispose() } }
+		$untrustedIntermediates = @()
+		Return
+	} Finally {
+		If ($serverCert) { $serverCert.Dispose() }
+		If ($certChain) { $certChain.Dispose() }
+		If ($sslStream) { $sslStream.Dispose() }
+		If ($tcpClient) { $tcpClient.Dispose() }
+	}
+
+	If ($null -eq $interceptCert) {
+		Write-Host -ForegroundColor Green "No SSL inspection certificate detected."
+		Return
+	}
+
+	# Prompt for confirmation unless -Force
+	If (-not $Force) {
+		Write-Host -ForegroundColor Yellow "Do you want to install this certificate into the Trusted Root Certification Authorities store?"
+		$response = Read-Host "Type 'YES' to confirm"
+		If ($response -ne 'YES') {
+			Write-Host "Aborted. No certificates were installed."
+			If ($interceptCert) { $interceptCert.Dispose() }
+			ForEach ($intCert in $untrustedIntermediates) { If ($intCert) { $intCert.Dispose() } }
+			Return
+		}
+	}
+
+	# Export and install the root cert
+	Try {
+		$tempCertPath = Join-Path $env:TEMP "SSLInspectionRoot_$interceptThumbprint.cer"
+		$certBytes = $interceptCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+		[System.IO.File]::WriteAllBytes($tempCertPath, $certBytes)
+		Import-Certificate -FilePath $tempCertPath -CertStoreLocation Cert:\LocalMachine\Root\
+		Write-Host -ForegroundColor Green "Root certificate installed successfully: $($interceptCert.Subject)"
+		Remove-Item $tempCertPath -Force -ea SilentlyContinue
+
+		# Install any untrusted intermediates
+		ForEach ($intCert in $untrustedIntermediates) {
+			$tempIntPath = Join-Path $env:TEMP "SSLInspectionInt_$($intCert.Thumbprint).cer"
+			$intBytes = $intCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+			[System.IO.File]::WriteAllBytes($tempIntPath, $intBytes)
+			Import-Certificate -FilePath $tempIntPath -CertStoreLocation Cert:\LocalMachine\CA\
+			Write-Host -ForegroundColor Green "Intermediate certificate installed: $($intCert.Subject)"
+			Remove-Item $tempIntPath -Force -ea SilentlyContinue
+		}
+
+		# Configure Firefox if present (check both 64-bit and 32-bit paths)
+		$firefoxPrefPaths = @(
+			"C:\Program Files\Mozilla Firefox\defaults\pref\"
+			"C:\Program Files (x86)\Mozilla Firefox\defaults\pref\"
+		)
+		ForEach ($firefoxPrefPath in $firefoxPrefPaths) {
+			If (Test-Path $firefoxPrefPath) {
+				Write-Host "Configuring Firefox to use the Windows certificate store"
+				Set-Content (Join-Path $firefoxPrefPath "firefox-windows-truststore.js") "pref('security.enterprise_roots.enabled', true);"
+				Break
+			}
+		}
+
+		Write-Host ""
+		Write-Host -ForegroundColor Green "Done. You may need to restart your browser for the changes to take effect."
+	} Catch {
+		Write-Warning "Failed to install certificate: $_"
+	} Finally {
+		If ($interceptCert) { $interceptCert.Dispose() }
+		ForEach ($intCert in $untrustedIntermediates) {
+			If ($intCert) { $intCert.Dispose() }
+		}
+	}
+
+	<#
+	.SYNOPSIS
+		Detects and installs SSL inspection certificates by probing a remote HTTPS site.
+
+	.DESCRIPTION
+		Connects to a known-good HTTPS site and inspects the certificate chain.
+		If the root certificate is not in the trusted store (indicating SSL inspection
+		such as Sophos, Zscaler, or similar), the certificate details are displayed
+		for review and the user is prompted to install it into the Trusted Root
+		Certification Authorities store.
+
+	.PARAMETER TestUrl
+		The HTTPS URL to probe for SSL inspection. Defaults to https://dl.google.com.
+
+	.PARAMETER Force
+		Skip the confirmation prompt and install the certificate immediately.
+
+	.EXAMPLE
+		Install-SSLInspectionCert
+		Probes dl.google.com, detects any SSL inspection cert, and prompts to install it.
+
+	.EXAMPLE
+		Install-SSLInspectionCert -TestUrl "https://www.microsoft.com" -Force
+		Probes microsoft.com and installs the SSL inspection cert without prompting.
+	#>
+}
+
 
 # SIG # Begin signature block
 # MIIF0AYJKoZIhvcNAQcCoIIFwTCCBb0CAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB

@@ -535,24 +535,65 @@ Function Install-ScreenConnect {
 }
 
 Function Install-SophosDnsCert {
-	Write-Host "Checking Root Certificate"
-	$RootCertPath = "Cert:\LocalMachine\Root\F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD" #Thumbprint of the Cert set to expire in 2036
-	If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
-		$certFilePath = "$Env:SystemDrive\IT\GitHub\PWSH\OneOffs\Sophos_certificate.pem"
-		If (!(Test-Path $certFilePath -ea SilentlyContinue)) {
-			Write-Host "Downloading the Sophos Root Cert"
-			irm 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt' | iex
-			Update-ITFunctions
-		}
-		Write-Host "Installing the Sophos Root Cert"
-		Import-Certificate -FilePath $certFilePath -CertStoreLocation Cert:\LocalMachine\Root\
-		If(Test-Path "C:\Program Files\Mozilla Firefox\defaults\pref\") {
-			Write-Host "Configuring Firefox to use the Cert"
-			Set-Content "C:\Program Files\Mozilla Firefox\defaults\pref\firefox-windows-truststore.js" "pref('security.enterprise_roots.enabled', true);"
-		}
-	} Else {
-		Write-Host -ForegroundColor Green "The Umbrella Root Cert is already installed."
-	}
+    [CmdletBinding()]
+    param(
+        [switch]$Force
+    )
+
+    Write-Host "Checking Root Certificates"
+    $expectedThumbprints = @(
+        "F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD"  # Sophos cert expiring 2036
+        "BCDD30059715B32E64B79DBC37688C60CEF4F965" #PHX DataCenter early 2026
+		# Add more thumbprints here as needed
+    )
+
+    $missingCerts = $expectedThumbprints | Where-Object {
+        !(Test-Path "Cert:\LocalMachine\Root\$_" -ea SilentlyContinue)
+    }
+
+    If (!$Force -and $missingCerts.Count -eq 0) {
+        Write-Host -ForegroundColor Green "All Sophos Root Certs are already installed. Use -Force to reinstall."
+        return
+    }
+
+    If ($Force) {
+        Write-Host "Force mode: will attempt to install all certificates."
+    } else {
+        Write-Host "$($missingCerts.Count) certificate(s) missing. Proceeding with install."
+    }
+
+    $certFilePath = "$Env:SystemDrive\IT\GitHub\PWSH\OneOffs\Sophos_certificate.pem"
+    If (!(Test-Path $certFilePath -ea SilentlyContinue)) {
+        Write-Host "Downloading the Sophos Root Cert"
+        irm 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt' | iex
+        Update-ITFunctions
+    }
+
+    Write-Host "Installing Sophos Root Certs"
+    $pemContent = Get-Content -Path $certFilePath -Raw
+    $certMatches = [regex]::Matches($pemContent, '(?s)-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----')
+
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine')
+    $store.Open('ReadWrite')
+    try {
+        foreach ($match in $certMatches) {
+            $certBytes = [Convert]::FromBase64String($match.Groups[1].Value.Trim())
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes)
+            if ($Force -or $cert.Thumbprint -in $missingCerts) {
+                Write-Host "Installing: $($cert.Subject) [$($cert.Thumbprint)]"
+                $store.Add($cert)
+            } else {
+                Write-Host "Skipping (already installed): $($cert.Subject)"
+            }
+        }
+    } finally {
+        $store.Close()
+    }
+
+    If (Test-Path "C:\Program Files\Mozilla Firefox\defaults\pref\") {
+        Write-Host "Configuring Firefox to use the Cert"
+        Set-Content "C:\Program Files\Mozilla Firefox\defaults\pref\firefox-windows-truststore.js" "pref('security.enterprise_roots.enabled', true);"
+    }
 }
 
 Function Install-SophosEndpoint {
@@ -1573,3 +1614,4 @@ Function Install-SSLInspectionCert {
 # 6VFj+EOYSkCl8uCZhNJotAOFD0BwRuXfh9MUuzciL5/laUy8QwV45bUjh3X9XpA7
 # FA4ENQ==
 # SIG # End signature block
+

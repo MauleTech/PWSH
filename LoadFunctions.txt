@@ -510,7 +510,6 @@ Function Global:Update-ITFunctions {
 # Load functions
 if ($FunctionFiles.Count -gt 0) {
     Write-Host "Loading PowerShell Functions..." -ForegroundColor Yellow
-    Update-ITPS
     Update-ITFunctions
     
     # Check if modules were loaded successfully

@@ -1322,7 +1322,10 @@ Function Install-SSLInspectionCert {
 		Write-Host "=== Certificate Chain for $hostname ===" -ForegroundColor Cyan
 		For ($i = 0; $i -lt $certChain.ChainElements.Count; $i++) {
 			$cert = $certChain.ChainElements[$i].Certificate
-			$prefix = If ($i -eq 0) { "Leaf" } ElseIf ($i -eq ($certChain.ChainElements.Count - 1)) { "Root" } Else { "Intermediate" }
+			$isFirst = ($i -eq 0)
+			$isLast = ($i -eq ($certChain.ChainElements.Count - 1))
+			$isSelfSigned = ($cert.Subject -eq $cert.Issuer)
+			$prefix = If ($isFirst -and $isLast -and -not $isSelfSigned) { "Leaf" } ElseIf ($isFirst) { "Leaf" } ElseIf ($isLast -and $isSelfSigned) { "Root" } ElseIf ($isLast) { "Intermediate" } Else { "Intermediate" }
 			Write-Host ""
 			Write-Host "  [$prefix] $($cert.Subject)" -ForegroundColor Yellow
 			Write-Host "    Issuer     : $($cert.Issuer)"
@@ -1332,40 +1335,105 @@ Function Install-SSLInspectionCert {
 		}
 		Write-Host ""
 
-		# Check if the root cert is already in the trusted store
-		$rootElement = $certChain.ChainElements[$certChain.ChainElements.Count - 1]
-		$rootCert = $rootElement.Certificate
-		$rootThumbprint = $rootCert.Thumbprint
-		$rootStorePath = "Cert:\LocalMachine\Root\$rootThumbprint"
+		# Identify the top-of-chain cert (root or last available)
+		$topElement = $certChain.ChainElements[$certChain.ChainElements.Count - 1]
+		$topCert = $topElement.Certificate
+		$topThumbprint = $topCert.Thumbprint
+		$topIsSelfSigned = ($topCert.Subject -eq $topCert.Issuer)
 
-		If (Test-Path $rootStorePath) {
-			Write-Host -ForegroundColor Green "The root certificate ($($rootCert.Subject)) is already trusted. No SSL inspection certificate detected or it is already installed."
+		# Check if the top-of-chain cert is already trusted
+		If ($topIsSelfSigned -and (Test-Path "Cert:\LocalMachine\Root\$topThumbprint")) {
+			Write-Host -ForegroundColor Green "The root certificate ($($topCert.Subject)) is already trusted. No SSL inspection certificate detected or it is already installed."
 			Return
 		}
 
-		# Root is NOT trusted - likely SSL inspection
-		Write-Host -ForegroundColor Red "The root certificate is NOT in the trusted root store."
-		Write-Host -ForegroundColor Red "This likely indicates SSL inspection is active."
-		Write-Host ""
-		Write-Host "=== SSL Inspection Root Certificate ===" -ForegroundColor Cyan
-		Write-Host "  Subject    : $($rootCert.Subject)" -ForegroundColor White
-		Write-Host "  Issuer     : $($rootCert.Issuer)" -ForegroundColor White
-		Write-Host "  Thumbprint : $rootThumbprint" -ForegroundColor White
-		Write-Host "  Not Before : $($rootCert.NotBefore)" -ForegroundColor White
-		Write-Host "  Not After  : $($rootCert.NotAfter)" -ForegroundColor White
-		Write-Host "  Serial     : $($rootCert.SerialNumber)" -ForegroundColor White
-		Write-Host ""
+		# Incomplete chain: proxy sent leaf/intermediate but not the CA root
+		# Try to fetch the issuing CA cert via AIA (Authority Information Access)
+		If (-not $topIsSelfSigned) {
+			Write-Host -ForegroundColor Yellow "The certificate chain is incomplete - the issuing CA certificate was not provided."
+			Write-Host -ForegroundColor Yellow "Issuer: $($topCert.Issuer)"
+			Write-Host ""
 
-		# Clone the root cert so it survives chain disposal
-		$interceptCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($rootCert.RawData)
-		$interceptThumbprint = $interceptCert.Thumbprint
+			# Look for AIA caIssuers URL in the top cert's extensions
+			$aiaUrl = $null
+			ForEach ($ext in $topCert.Extensions) {
+				If ($ext.Oid.Value -eq '1.3.6.1.5.5.7.1.1') {
+					# Authority Information Access extension
+					$aiaText = $ext.Format($false)
+					# Extract the CA Issuers URL
+					If ($aiaText -match 'URL=([^\s,]+\.(?:cer|crt|der|pem|p7c))') {
+						$aiaUrl = $Matches[1]
+					} ElseIf ($aiaText -match 'URL=(http[^\s,]+)') {
+						$aiaUrl = $Matches[1]
+					}
+					Break
+				}
+			}
 
-		# Also check for untrusted intermediate certs and clone them
+			If ($aiaUrl) {
+				Write-Host "Found CA issuer URL in certificate: $aiaUrl"
+				Write-Host "Downloading the issuing CA certificate..."
+				Try {
+					$aiaBytes = (New-Object System.Net.WebClient).DownloadData($aiaUrl)
+					$aiaCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,$aiaBytes)
+					Write-Host ""
+					Write-Host "=== Downloaded CA Certificate ===" -ForegroundColor Cyan
+					Write-Host "  Subject    : $($aiaCert.Subject)" -ForegroundColor White
+					Write-Host "  Issuer     : $($aiaCert.Issuer)" -ForegroundColor White
+					Write-Host "  Thumbprint : $($aiaCert.Thumbprint)" -ForegroundColor White
+					Write-Host "  Not Before : $($aiaCert.NotBefore)" -ForegroundColor White
+					Write-Host "  Not After  : $($aiaCert.NotAfter)" -ForegroundColor White
+					Write-Host "  Serial     : $($aiaCert.SerialNumber)" -ForegroundColor White
+					Write-Host ""
+
+					If (Test-Path "Cert:\LocalMachine\Root\$($aiaCert.Thumbprint)") {
+						Write-Host -ForegroundColor Green "The issuing CA certificate ($($aiaCert.Subject)) is already trusted."
+						$aiaCert.Dispose()
+						Return
+					}
+
+					$interceptCert = $aiaCert
+					$interceptThumbprint = $aiaCert.Thumbprint
+				} Catch {
+					Write-Warning "Failed to download CA certificate from AIA URL: $_"
+				}
+			}
+
+			# If AIA didn't work, we can't get the CA cert automatically
+			If ($null -eq $interceptCert) {
+				Write-Host -ForegroundColor Red "Could not automatically obtain the SSL inspection CA certificate."
+				Write-Host -ForegroundColor Red "The proxy is not including its CA certificate in the chain and no AIA URL was found."
+				Write-Host ""
+				Write-Host "To resolve this manually:"
+				Write-Host "  1. Ask your network administrator for the SSL inspection root certificate"
+				Write-Host "  2. Or use: Install-SophosDnsCert (if this is a known Sophos deployment)"
+				Return
+			}
+		} Else {
+			# Full chain available - the root is self-signed and untrusted
+			Write-Host -ForegroundColor Red "The root certificate is NOT in the trusted root store."
+			Write-Host -ForegroundColor Red "This likely indicates SSL inspection is active."
+			Write-Host ""
+			Write-Host "=== SSL Inspection Root Certificate ===" -ForegroundColor Cyan
+			Write-Host "  Subject    : $($topCert.Subject)" -ForegroundColor White
+			Write-Host "  Issuer     : $($topCert.Issuer)" -ForegroundColor White
+			Write-Host "  Thumbprint : $topThumbprint" -ForegroundColor White
+			Write-Host "  Not Before : $($topCert.NotBefore)" -ForegroundColor White
+			Write-Host "  Not After  : $($topCert.NotAfter)" -ForegroundColor White
+			Write-Host "  Serial     : $($topCert.SerialNumber)" -ForegroundColor White
+			Write-Host ""
+
+			# Clone the root cert so it survives chain disposal
+			$interceptCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,$topCert.RawData)
+			$interceptThumbprint = $interceptCert.Thumbprint
+		}
+
+		# Check for untrusted intermediate certs and clone them
 		For ($i = 1; $i -lt ($certChain.ChainElements.Count - 1); $i++) {
 			$intCert = $certChain.ChainElements[$i].Certificate
 			$intStorePath = "Cert:\LocalMachine\CA\$($intCert.Thumbprint)"
 			If (-not (Test-Path $intStorePath)) {
-				$untrustedIntermediates += New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($intCert.RawData)
+				$untrustedIntermediates += New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,$intCert.RawData)
 			}
 		}
 

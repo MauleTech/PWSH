@@ -1270,12 +1270,20 @@ Function Install-SSLInspectionCert {
 
 	# Use .NET TcpClient + SslStream to grab the cert chain, bypassing validation
 	$uri = [System.Uri]$TestUrl
+	If ($uri.Scheme -ne 'https') {
+		Write-Warning "TestUrl must use the https scheme. Got: $($uri.Scheme)"
+		Return
+	}
 	$hostname = $uri.Host
-	$port = If ($uri.Port -gt 0 -and $uri.Port -ne 80) { $uri.Port } Else { 443 }
+	$port = $uri.Port
 
 	$tcpClient = $null
 	$sslStream = $null
+	$serverCert = $null
+	$certChain = $null
 	$interceptCert = $null
+	$interceptThumbprint = $null
+	$untrustedIntermediates = @()
 
 	Try {
 		$tcpClient = New-Object System.Net.Sockets.TcpClient
@@ -1283,7 +1291,7 @@ Function Install-SSLInspectionCert {
 
 		# Accept all certs during the handshake so we can inspect them
 		$callback = [System.Net.Security.RemoteCertificateValidationCallback]{
-			param($sender, $certificate, $chain, $sslPolicyErrors)
+			param($cbSender, $cbCertificate, $cbChain, $cbSslPolicyErrors)
 			Return $true
 		}
 
@@ -1293,17 +1301,17 @@ Function Install-SSLInspectionCert {
 		$serverCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($sslStream.RemoteCertificate)
 
 		# Build the chain ourselves to get all intermediate/root certs
-		$chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-		$chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-		$chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllFlags
-		$null = $chain.Build($serverCert)
+		$certChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+		$certChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+		$certChain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllFlags
+		$null = $certChain.Build($serverCert)
 
 		# Display the full chain
 		Write-Host ""
 		Write-Host "=== Certificate Chain for $hostname ===" -ForegroundColor Cyan
-		For ($i = 0; $i -lt $chain.ChainElements.Count; $i++) {
-			$cert = $chain.ChainElements[$i].Certificate
-			$prefix = If ($i -eq 0) { "Leaf" } ElseIf ($i -eq ($chain.ChainElements.Count - 1)) { "Root" } Else { "Intermediate" }
+		For ($i = 0; $i -lt $certChain.ChainElements.Count; $i++) {
+			$cert = $certChain.ChainElements[$i].Certificate
+			$prefix = If ($i -eq 0) { "Leaf" } ElseIf ($i -eq ($certChain.ChainElements.Count - 1)) { "Root" } Else { "Intermediate" }
 			Write-Host ""
 			Write-Host "  [$prefix] $($cert.Subject)" -ForegroundColor Yellow
 			Write-Host "    Issuer     : $($cert.Issuer)"
@@ -1314,7 +1322,7 @@ Function Install-SSLInspectionCert {
 		Write-Host ""
 
 		# Check if the root cert is already in the trusted store
-		$rootElement = $chain.ChainElements[$chain.ChainElements.Count - 1]
+		$rootElement = $certChain.ChainElements[$certChain.ChainElements.Count - 1]
 		$rootCert = $rootElement.Certificate
 		$rootThumbprint = $rootCert.Thumbprint
 		$rootStorePath = "Cert:\LocalMachine\Root\$rootThumbprint"
@@ -1337,22 +1345,29 @@ Function Install-SSLInspectionCert {
 		Write-Host "  Serial     : $($rootCert.SerialNumber)" -ForegroundColor White
 		Write-Host ""
 
-		$interceptCert = $rootCert
+		# Clone the root cert so it survives chain disposal
+		$interceptCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($rootCert.RawData)
+		$interceptThumbprint = $interceptCert.Thumbprint
 
-		# Also check for untrusted intermediate certs and offer to install them
-		$untrustedIntermediates = @()
-		For ($i = 1; $i -lt ($chain.ChainElements.Count - 1); $i++) {
-			$intCert = $chain.ChainElements[$i].Certificate
+		# Also check for untrusted intermediate certs and clone them
+		For ($i = 1; $i -lt ($certChain.ChainElements.Count - 1); $i++) {
+			$intCert = $certChain.ChainElements[$i].Certificate
 			$intStorePath = "Cert:\LocalMachine\CA\$($intCert.Thumbprint)"
 			If (-not (Test-Path $intStorePath)) {
-				$untrustedIntermediates += $intCert
+				$untrustedIntermediates += New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($intCert.RawData)
 			}
 		}
 
 	} Catch {
 		Write-Warning "Failed to connect to ${hostname}:${port} - $_"
+		# Clean up cloned certs on error before returning
+		If ($interceptCert) { $interceptCert.Dispose(); $interceptCert = $null }
+		ForEach ($intCert in $untrustedIntermediates) { If ($intCert) { $intCert.Dispose() } }
+		$untrustedIntermediates = @()
 		Return
 	} Finally {
+		If ($serverCert) { $serverCert.Dispose() }
+		If ($certChain) { $certChain.Dispose() }
 		If ($sslStream) { $sslStream.Dispose() }
 		If ($tcpClient) { $tcpClient.Dispose() }
 	}
@@ -1368,13 +1383,15 @@ Function Install-SSLInspectionCert {
 		$response = Read-Host "Type 'YES' to confirm"
 		If ($response -ne 'YES') {
 			Write-Host "Aborted. No certificates were installed."
+			If ($interceptCert) { $interceptCert.Dispose() }
+			ForEach ($intCert in $untrustedIntermediates) { If ($intCert) { $intCert.Dispose() } }
 			Return
 		}
 	}
 
 	# Export and install the root cert
 	Try {
-		$tempCertPath = Join-Path $env:TEMP "SSLInspectionRoot_$rootThumbprint.cer"
+		$tempCertPath = Join-Path $env:TEMP "SSLInspectionRoot_$interceptThumbprint.cer"
 		$certBytes = $interceptCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
 		[System.IO.File]::WriteAllBytes($tempCertPath, $certBytes)
 		Import-Certificate -FilePath $tempCertPath -CertStoreLocation Cert:\LocalMachine\Root\
@@ -1401,6 +1418,11 @@ Function Install-SSLInspectionCert {
 		Write-Host -ForegroundColor Green "Done. You may need to restart your browser for the changes to take effect."
 	} Catch {
 		Write-Warning "Failed to install certificate: $_"
+	} Finally {
+		If ($interceptCert) { $interceptCert.Dispose() }
+		ForEach ($intCert in $untrustedIntermediates) {
+			If ($intCert) { $intCert.Dispose() }
+		}
 	}
 
 	<#

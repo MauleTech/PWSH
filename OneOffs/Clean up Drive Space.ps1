@@ -1,4 +1,3 @@
-$ErrorActionPreference = "silentlycontinue"
 #[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192 ; Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/master/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
 #Clean up Drive Space
 #Enable SSL/TLS
@@ -22,46 +21,51 @@ $PreClean = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object -Propert
 
 #Show what we're working with
 Write-Host "`nBefore Clean-up:`n$(($PreClean | Format-Table | Out-String).Trim())"
-Write-Host $((Get-Date).DateTime)
-Write-Host $($env:computername)
+Write-Host ((Get-Date).DateTime)
+Write-Host $env:COMPUTERNAME
 Start-Sleep -Seconds 10
 
 # Assign the local and global paths to their own variables for easier path building.
-	$GlobalAppData = $Env:APPDATA.Replace($($Env:USERPROFILE),$(($Env:Public).Replace('Public','*')))
-	$LocalAppData = $Env:LOCALAPPDATA.Replace($($Env:USERPROFILE),$(($Env:Public).Replace('Public','*')))
-	$RootAppData = "$(Split-Path -Path $LocalAppData)\*"
+$GlobalAppData = $Env:APPDATA.Replace($Env:USERPROFILE, ($Env:Public).Replace('Public', '*'))
+$LocalAppData = $Env:LOCALAPPDATA.Replace($Env:USERPROFILE, ($Env:Public).Replace('Public', '*'))
+$RootAppData = "$(Split-Path -Path $LocalAppData)\*"
 
 Function Invoke-WindowsCleanMgr {
 	# Set registry keys to check all Disk Cleanup boxes
 	$SageSet = "StateFlags0097"
-	$StateFlags = "Stateflags0097"
+	$StateFlags = "StateFlags0097"
 	$Base = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\"
 	$VolCaches = Get-ChildItem $Base
 	$Locations = @($VolCaches.PSChildName)
-	ForEach ($VC in $VolCaches) {New-ItemProperty -Path "$($VC.PSPath)" -Name $StateFlags -Value 1 -Type DWORD -Force | Out-Null}
-	ForEach ($Location in $Locations) {Set-ItemProperty -Path $($Base + $Location) -Name $SageSet -Type DWORD -Value 2 | Out-Null}
-	$Argss = "/sagerun:$([string]([int]$SageSet.Substring($SageSet.Length - 4)))"
+	ForEach ($VC in $VolCaches) { New-ItemProperty -Path "$($VC.PSPath)" -Name $StateFlags -Value 1 -Type DWORD -Force | Out-Null }
+	ForEach ($Location in $Locations) { Set-ItemProperty -Path $($Base + $Location) -Name $SageSet -Type DWORD -Value 2 | Out-Null }
+	$CleanMgrArgs = "/sagerun:$([string]([int]$SageSet.Substring($SageSet.Length - 4)))"
 	function Watch-CleanMgr {
 		$prevTicks = 0
 		$sameTickCount = 0
 		$WaitInterval = 30
 		$SameTickMax = 8
-		$process = Get-Process cleanmgr
+		$process = Get-Process cleanmgr -ErrorAction SilentlyContinue
 
 		if ($null -eq $process) {
 			Write-Host "cleanmgr.exe is not running."
 			return $false
 		}
 
-		for ($i = 0; $i -lt 3; $i++) {
+		while ($true) {
 			Start-Sleep -Seconds $WaitInterval
-			
-			$currentTicks = (Get-Process cleanmgr).TotalProcessorTime.Ticks
-			Write-Host "Checking on cleanmgr CPU usage:$currentTicks"
+
+			$process = Get-Process cleanmgr -ErrorAction SilentlyContinue
+			if ($null -eq $process) {
+				Write-Host "cleanmgr.exe has exited."
+				return $false
+			}
+			$currentTicks = $process.TotalProcessorTime.Ticks
+			Write-Host "Checking on cleanmgr CPU usage: $currentTicks"
 			if ($currentTicks -eq $prevTicks) {
 				$sameTickCount++
 				Write-Host "Cleanmgr hasn't used the CPU in the last $WaitInterval seconds. If it does this $($SameTickMax - $sameTickCount) more times, we'll move on."
-				if ($sameTickCount -eq $SameTickMax) { #CPU count hasn't changed for 2 minutes (30 seconds * 4)
+				if ($sameTickCount -eq $SameTickMax) { #CPU count hasn't changed for 4 minutes (30 seconds * 8)
 					Write-Host "cleanmgr.exe appears to be inactive. Terminating process."
 					Stop-Process -Name cleanmgr -Force
 					return $true
@@ -72,8 +76,6 @@ Function Invoke-WindowsCleanMgr {
 
 			$prevTicks = $currentTicks
 		}
-
-		return $false
 	}
 	Write-Host "Starting cleanmgr.exe /verylowdisk for a first attempt."
 	Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList "/verylowdisk /d c" -WindowStyle Hidden
@@ -85,15 +87,15 @@ Function Invoke-WindowsCleanMgr {
 		Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList "/verylowdisk /d c" -WindowStyle Hidden
 		Watch-CleanMgr
 	}
-	
-	Write-Host "Starting cleanmgr.exe $Argss for a first attempt."
-	Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList $Argss -WindowStyle Hidden
+
+	Write-Host "Starting cleanmgr.exe $CleanMgrArgs for a first attempt."
+	Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList $CleanMgrArgs -WindowStyle Hidden
 	$terminated = Watch-CleanMgr
 
 	# Second attempt if the first one was terminated
 	if ($terminated) {
-		Write-Host "Restarting cleanmgr.exe $Argss for a second attempt."
-		Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList $Argss -WindowStyle Hidden
+		Write-Host "Restarting cleanmgr.exe $CleanMgrArgs for a second attempt."
+		Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList $CleanMgrArgs -WindowStyle Hidden
 		Watch-CleanMgr
 	}
 }
@@ -122,7 +124,7 @@ Function Remove-EventLogs {
 Function Remove-DuplicateDrivers {
 	# Remove all outdated and duplicate drivers if the -Include parameter with the 'DuplicateDrivers' value is used.
 	Write-Verbose "Compiling a list of any outdated and duplicate system drivers." -Verbose
-	$AllDrivers = Get-WindowsDriver -Online -All | Where-Object -Property Driver -Like oem*inf | Select-Object -Property @{ Name = 'OriginalFileName'; Expression = { $PSItem.OriginalFileName | Split-Path -Leaf } } Driver ClassDescription ProviderName Date Version
+	$AllDrivers = Get-WindowsDriver -Online -All | Where-Object -Property Driver -Like oem*inf | Select-Object -Property @{ Name = 'OriginalFileName'; Expression = { $PSItem.OriginalFileName | Split-Path -Leaf } }, Driver, ClassDescription, ProviderName, Date, Version
 	$DuplicateDrivers = $AllDrivers | Group-Object -Property OriginalFileName | Where-Object -Property Count -GT 1 | ForEach-Object -Process { $PSItem.Group | Sort-Object -Property Date -Descending | Select-Object -Skip 1 }
 	If ($DuplicateDrivers) {
 		$DuplicateDrivers | Out-GridView -Title 'Remove Duplicate Drivers' -PassThru | ForEach-Object -Process {
@@ -137,16 +139,14 @@ Function Remove-StaleProfiles {
 	$thresholdDays = 731 #Days
 	Write-Host "Checking for stale profiles to clean up"
 	# Get a list of user profiles
-	$profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object{$_.CreationTime -lt (get-date).adddays(-$thresholdDays)} | Where-Object{$_.Loaded -eq $False} | Where-Object { $_.LocalPath -notmatch 'atg|Remote Support|admin' }
+	$profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$thresholdDays) } | Where-Object { $_.Loaded -eq $False } | Where-Object { $_.LocalPath -notmatch 'atg|Remote Support|admin' }
 	If ($profiles) {
 		foreach ($profile in $profiles) {
-			
 			$localPath = $profile.LocalPath
-			Write-Host "Assessing $localpath"
-			$localPath.FullName
+			Write-Host "Assessing $localPath"
 			$directories = Get-ChildItem -Path $localPath -Directory
 			if ($directories.Count -gt 0) {
-			# Find the most recently modified directory
+				# Find the most recently modified directory
 				$mostRecentDir = $directories | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 				# Calculate the age in days
 				$ageInDays = (Get-Date) - $mostRecentDir.LastWriteTime
@@ -155,13 +155,11 @@ Function Remove-StaleProfiles {
 					Write-Host "Deleting $localPath (Last modified: $($mostRecentDir.LastWriteTime))"
 					Write-Host "Deleting inactive profile: $($profile.LocalPath)"
 					Write-Host "$profile"
-					Write-Host $lastWriteTime
-					Remove-CimInstance $profile -Verbose -Confirm:$false 
-					# Replace 'S-1-5-21-2552263123-1652881823-690255818-2139' with the actual SID you want to delete
+					Remove-CimInstance $profile -Verbose -Confirm:$false
 					$targetSID = $profile.SID
 
 					# Construct the registry path for the user profile
-					$registryPath = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ProfileList\$targetSID"
+					$registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ProfileList\$targetSID"
 
 					# Delete the registry key
 					Remove-Item -Path $registryPath -Force
@@ -172,12 +170,12 @@ Function Remove-StaleProfiles {
 			}
 		}
 	} Else {
-		Write-Host "No profiles older then $thresholdDays found."
+		Write-Host "No profiles older than $thresholdDays days found."
 	}
 }
 
 #$PreReqCommandsToRun = @(
-	Write-Host "Reclaim space from .NET Native Images" ; Get-Item "$Env:windir\Microsoft.NET\Framework\*\ngen.exe" -Force | ForEach-Object { & $($_.FullName) update} | Out-Null## Reclaim space from .NET Native Images	
+	Write-Host "Reclaim space from .NET Native Images" ; Get-Item "$Env:windir\Microsoft.NET\Framework\*\ngen.exe" -Force | ForEach-Object { & $($_.FullName) update } | Out-Null
 	Get-Service -Name wuauserv | Stop-Service -Force -Verbose #Stops Windows Update so we can clean it out.
 	powercfg -h off
 	$EdgePackageName = Get-AppxPackage -Name Microsoft.MicrosoftEdge | Select-Object -ExpandProperty PackageFamilyName
@@ -194,14 +192,14 @@ $FoldersToClean = @(
 	(Join-Path -Path $Env:SystemRoot -ChildPath "SoftwareDistribution\DataStore\Logs")
 	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\WindowsUpdate")
 	(Join-Path -Path $Env:ProgramData -ChildPath "USOShared\Logs")
-	(Join-Path -Path $Env:ProgramData -ChildPath "\Microsoft\Windows\WER\ReportArchive")
-	(Join-Path -Path $Env:ProgramData -ChildPath "\Microsoft\Windows\WER\ReportQueue")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\WER\ReportArchive")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\WER\ReportQueue")
 	(Join-Path -Path $LocalAppData -ChildPath "Temp") ## Deletes all files and folders in user's Temp folder.
 	(Join-Path -Path $Env:SystemDrive -ChildPath "Temp")
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Windows\Temporary Internet Files") ## Remove all files and folders in user's Temporary Internet Files.
 	(Join-Path -Path $GlobalAppData -ChildPath "Microsoft\Windows\Cookies")
 	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "inetpub\logs\LogFiles") ## Cleans IIS Logs
-	(Join-Path -Path $(($Env:Public).Replace('Public','*')) -ChildPath "AppData\Locallow\sun\java\deployment\cache") ## Remove all files and folders in user's Java Cache.
+	(Join-Path -Path ($Env:Public).Replace('Public', '*') -ChildPath "AppData\Locallow\sun\java\deployment\cache") ## Remove all files and folders in user's Java Cache.
 	(Join-Path -Path $LocalAppData -ChildPath "Mozilla\Firefox\Profiles\*.default\Cache") ## Remove all files and folders in user's Firefox Cache.
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\Cache") ## Remove all files and folders in user's Chrome Cache.
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Default\Cache") ## Remove all files and folders in user's Edge Cache.
@@ -211,7 +209,6 @@ $FoldersToClean = @(
 	(Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Common Files\Adobe\Reader\Temp") ##Adobe Installer
 	(Join-Path -Path $env:ProgramData -ChildPath "Adobe\ARM") ## https://community.adobe.com/t5/acrobat-reader-discussions/can-arm-folders-be-deleted/td-p/5141447
 	(Join-Path -Path $RootAppData -ChildPath "Microsoft\Windows\WER")
-	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Terminal Server Client\Cache")
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Terminal Server Client\Cache")
 	(Join-Path -Path $RootAppData -ChildPath "Microsoft\Terminal Server Client\Cache")
 	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\RetailDemo")
@@ -235,8 +232,8 @@ $PathsToDelete = @(
 		(Join-Path -Path $Env:SystemDrive -ChildPath '$WINDOWS.~BT')
 		(Join-Path -Path $Env:SystemDrive -ChildPath '$WINDOWS.~WS')
 		(Join-Path -Path $Env:SystemDrive -ChildPath '$WinREAgent')
-	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.ost")-Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST files that haven't been used in more then 30 days
-	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.bak")-Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST backup files that haven't been used in more then 30 days
+	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.ost") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST files that haven't been used in more than 30 days
+	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.bak") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST backup files that haven't been used in more than 30 days
 	(Join-Path -Path $Env:SystemDrive -ChildPath "Windows.old") ##Old windows install
 	(Join-Path -Path $Env:SystemDrive -ChildPath "Ambitions\NiniteDownloads")
 	(Join-Path -Path $Env:SystemDrive -ChildPath "adobeTemp")
@@ -295,7 +292,6 @@ $PathsToDelete = @(
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\CURRENT")
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\LOCK")
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\MANIFEST-*")
-	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\*.log")
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\*.log")
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\*\*.log")
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\*\*log*")
@@ -407,7 +403,6 @@ $PathsToDelete = @(
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Profile *\LOCK")
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Profile *\MANIFEST-*")
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Profile *\*.log")
-	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Profile *\*.log")
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Profile *\*\*.log")
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Profile *\*\*log*")
 	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Profile *\*\MANIFEST-*")
@@ -423,25 +418,25 @@ $PathsToDelete = @(
 	(Join-Path -Path ${Env:ProgramFiles(x86)} -ChildPath "Microsoft\Edge\Application\SetupMetrics\*.pma")
 	(Join-Path -Path ${Env:ProgramFiles(x86)} -ChildPath "Microsoft\EdgeUpdate\Download\*")
 	#Quickbooks
-	(Join-Path -Path $Env:ProgramData "Intuit\QuickBooks*\Components\DownloadQB*")
-	(Join-Path -Path $Env:ProgramData "Intuit\QuickBooks*\Components\QBUpdateCache")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Intuit\QuickBooks*\Components\DownloadQB*")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Intuit\QuickBooks*\Components\QBUpdateCache")
 	#Worldox
 	#(Join-Path -Path $LocalAppData -ChildPath "Worldox\ZMS\*")
 )
 
 $FoldersToDeDuplicate = @(
-	(Join-Path -Path $($(($Env:Public).Replace('Public','*'))) -ChildPath "Downloads")
+	(Join-Path -Path ($Env:Public).Replace('Public', '*') -ChildPath "Downloads")
 )
 
 #Clean up folders
 $FoldersToClean | ForEach-Object {
-	If (@(Get-Item $_ -Force)){
+	If (@(Get-Item $_ -Force)) {
 		ForEach ($SubItem in @($_)) {
-			If (Get-Item $SubItem -Force ) {
+			If (Get-Item $SubItem -Force) {
 				Try {
 					Get-Item $SubItem -Force | ForEach-Object {
-						Remove-StaleObjects -targetDirectory $($_.FullName) -DaysOld $DaysToDelete
-				}
+						Remove-StaleObjects -targetDirectory $_.FullName -DaysOld $DaysToDelete
+					}
 				} Catch {
 					Write-Host "Not worth it for $SubItem"
 				}
@@ -452,13 +447,13 @@ $FoldersToClean | ForEach-Object {
 
 #Delete the folders / files
 $PathsToDelete | ForEach-Object {
-	If (@(Get-Item $_ -Force)){
+	If (@(Get-Item $_ -Force)) {
 		ForEach ($SubItem in @($_)) {
-			If (Get-Item $SubItem -Force ) {
+			If (Get-Item $SubItem -Force) {
 				Try {
 					Get-Item $SubItem -Force | ForEach-Object {
-						Remove-PathForcefully -Path $($_.FullName)
-				}
+						Remove-PathForcefully -Path $_.FullName
+					}
 				} Catch {
 					Write-Host "Not worth it for $SubItem"
 				}
@@ -469,16 +464,16 @@ $PathsToDelete | ForEach-Object {
 
 #DeDuplicate files in these folders
 $FoldersToDeDuplicate | ForEach-Object {
-	If (@(Get-Item $_ -Force)){
+	If (@(Get-Item $_ -Force)) {
 		ForEach ($SubItem in @($_)) {
-			If (Get-Item $SubItem -Force ) {
+			If (Get-Item $SubItem -Force) {
 				Write-Host $SubItem
 				Try {
 					Get-Item $SubItem -Force | ForEach-Object {
 						Write-Host "Searching $($_.FullName) for duplicate files"
-						Remove-DuplicateFiles -Path $($_.FullName)
+						Remove-DuplicateFiles -Path $_.FullName
 						Write-Host
-				}
+					}
 				} Catch {
 					Write-Host "Not worth it for $SubItem"
 				}
@@ -493,11 +488,11 @@ $FoldersToDeDuplicate | ForEach-Object {
 	Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 	Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-PathForcefully -ErrorAction SilentlyContinue
 	## Reduce the size of the WinSxS folder
-	Write-Host "Reducing the size of the WinSxS folder" 
-		Dism.exe /online /Cleanup-Image /StartComponentCleanup
-		Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase
-		Dism.exe /online /Cleanup-Image /SPSuperseded
-		DISM.exe /Online /Set-ReservedStorageState /State:Disabled
+	Write-Host "Reducing the size of the WinSxS folder"
+	Dism.exe /online /Cleanup-Image /StartComponentCleanup
+	Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase
+	Dism.exe /online /Cleanup-Image /SPSuperseded
+	DISM.exe /Online /Set-ReservedStorageState /State:Disabled
 	Write-Host "Cleaning up the WMI Repository" ; Winmgmt /salvagerepository ## Cleans up WMI Repository
 	Write-Host "Erasing IE Temp Data" ;Start-Process -FilePath rundll32.exe -ArgumentList 'inetcpl.cpl,ClearMyTracksByProcess 4351' -Wait -NoNewWindow ## erase Internet Explorer temp data
 	Write-Host "Removing Restore Points" ;Remove-WindowsRestorePoints
@@ -520,9 +515,9 @@ $PostClean = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object -Proper
 #$Wrapup = @(
 	Write-Host "`nBefore Clean-up:`n$(($PreClean | Format-Table | Out-String).Trim())"
 	Write-Host "`nAfter Clean-up:`n$(($PostClean | Format-Table | Out-String).Trim())"
-	Write-Host -ForegroundColor Green "`nFreed up :$($PostClean.'FreeSpace (GB)' - $PreClean.'FreeSpace (GB)') GB ($((($PostClean.PercentFree).Replace('%','')) - (($PreClean.PercentFree).Replace('%',''))) %)"
+	Write-Host -ForegroundColor Green "`nFreed up: $($PostClean.'FreeSpace (GB)' - $PreClean.'FreeSpace (GB)') GB ($((($PostClean.PercentFree).Replace('%','')) - (($PreClean.PercentFree).Replace('%',''))) %)"
 	## Completed Successfully!
-	Write-Host $((Get-Date).DateTime)
-	Write-Host $($env:computername)
+	Write-Host ((Get-Date).DateTime)
+	Write-Host $env:COMPUTERNAME
 
 #)

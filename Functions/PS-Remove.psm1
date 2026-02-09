@@ -307,7 +307,6 @@ Function Remove-StaleObjects {
 		if ($item.PSIsContainer) {
 			# If it's a folder, remove it recursively
 			Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
-			Write-Host $VerbosePreference
 			If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Verbose "Deleted folder: $($item.FullName)" }
 		}
 		else {

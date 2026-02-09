@@ -125,9 +125,9 @@ Function Remove-DuplicateDrivers {
 	$AllDrivers = Get-WindowsDriver -Online -All | Where-Object -Property Driver -Like oem*inf | Select-Object -Property @{ Name = 'OriginalFileName'; Expression = { $PSItem.OriginalFileName | Split-Path -Leaf } }, Driver, ClassDescription, ProviderName, Date, Version
 	$DuplicateDrivers = $AllDrivers | Group-Object -Property OriginalFileName | Where-Object -Property Count -GT 1 | ForEach-Object -Process { $PSItem.Group | Sort-Object -Property Date -Descending | Select-Object -Skip 1 }
 	If ($DuplicateDrivers) {
-		$DuplicateDrivers | Out-GridView -Title 'Remove Duplicate Drivers' -PassThru | ForEach-Object -Process {
+		$DuplicateDrivers | ForEach-Object -Process {
 			$Driver = $PSItem.Driver.Trim()
-			#Write-Verbose ('Performing the action "Delete Driver" on target {0}' -f $Driver) -Verbose
+			Write-Verbose ('Performing the action "Delete Driver" on target {0}' -f $Driver) -Verbose
 			Start-Process -FilePath PNPUTIL -ArgumentList ('/Delete-Driver {0} /Force' -f $Driver) -WindowStyle Hidden -Wait
 		}
 	}

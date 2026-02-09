@@ -298,7 +298,7 @@ Function Remove-StaleObjects {
 		Break
 	}
 	# Recursively get all files and folders in the target directory
-	$itemsToDelete = Get-ChildItem -Path $targetDirectory -Recurse | Where-Object {
+	$itemsToDelete = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
 		$_.LastWriteTime -lt $thresholdDate
 	}
 	#$itemsToDelete.FullName
@@ -307,7 +307,6 @@ Function Remove-StaleObjects {
 		if ($item.PSIsContainer) {
 			# If it's a folder, remove it recursively
 			Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
-			Write-Host $VerbosePreference
 			If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Verbose "Deleted folder: $($item.FullName)" }
 		}
 		else {
@@ -318,15 +317,15 @@ Function Remove-StaleObjects {
 	}
 
 	# Get all empty folders recursively
-	$emptyFolders = Get-ChildItem -Path $targetDirectory -Recurse | Where-Object {
-		$_.PSIsContainer -and @(Get-ChildItem -Path $_.FullName -Force).Count -eq 0
+	$emptyFolders = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
+		$_.PSIsContainer -and @(Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
 	}
 
 	foreach ($folder in $emptyFolders) {
 		Remove-Item -Path $folder.FullName -Force -ErrorAction SilentlyContinue
 		If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Host "Deleted empty folder: $($folder.FullName)" }
 	}
-	$itemsUnableToDelete = Get-ChildItem -Path $targetDirectory -Recurse | Where-Object {
+	$itemsUnableToDelete = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
 		$_.LastWriteTime -lt $thresholdDate
 	}
 
@@ -336,18 +335,18 @@ Function Remove-StaleObjects {
 	}
 
 	# Get all empty folders recursively
-	$emptyFolders = Get-ChildItem -Path $targetDirectory -Recurse | Where-Object {
-		$_.PSIsContainer -and @(Get-ChildItem -Path $_.FullName -Force).Count -eq 0
+	$emptyFolders = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
+		$_.PSIsContainer -and @(Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
 	}
 
 	foreach ($folder in $emptyFolders) {
 		Remove-PathForcefully -Path $folder.FullName -Verbose
 		If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Host "Deleted empty folder: $($folder.FullName)" }
 	}
-	$itemsUnableToDelete = Get-ChildItem -Path $targetDirectory -Recurse | Where-Object {
+	$itemsUnableToDelete = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
 		$_.LastWriteTime -lt $thresholdDate
 	}
-	
+
 	$SuccessfulDelete = $(($itemsToDelete).Count - ($itemsUnableToDelete).Count)
 	If ($SuccessfulDelete) {
 		Write-Host "Removed $($SuccessfulDelete.Count) objects."

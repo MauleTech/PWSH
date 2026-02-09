@@ -156,7 +156,7 @@ Function Remove-StaleProfiles {
 					Write-Host "Deleting inactive profile: $($profile.LocalPath)"
 					Write-Host "$profile"
 					Write-Host $lastWriteTime
-					Remove-CimInstance $profile -Verbose -ConfInvoke-RestMethod:$false 
+					Remove-CimInstance $profile -Verbose -Confirm:$false 
 					# Replace 'S-1-5-21-2552263123-1652881823-690255818-2139' with the actual SID you want to delete
 					$targetSID = $profile.SID
 
@@ -524,4 +524,5 @@ $PostClean = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object -Proper
 	## Completed Successfully!
 	Write-Host $((Get-Date).DateTime)
 	Write-Host $($env:computername)
+
 #)

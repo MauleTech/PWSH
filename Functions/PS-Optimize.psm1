@@ -1,6 +1,6 @@
 Function Optimize-Powershell {
 	If ((Get-ExecutionPolicy -Scope CurrentUser) -ne 'RemoteSigned') {
-    	Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+    	Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
 	}
 	$Commands = @()
 		$Commands = @'
@@ -50,7 +50,12 @@ Function Optimize-Powershell {
 		
 		# Module installation and configuration
 		$ErrorActionPreference = 'SilentlyContinue'
-		
+
+		# Ensure NuGet provider is installed (required for PSGallery operations)
+		if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+		    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+		}
+
 		# Configure PSGallery
 		if ((Get-PSRepository -Name "PSGallery").InstallationPolicy -eq "Untrusted") {
 		    Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
@@ -67,9 +72,6 @@ Function Optimize-Powershell {
 		
 		# Install and configure PSReadline
 		if (!(Get-Module -Name PSReadline -ListAvailable)) {
-		    if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-		        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force
-		    }
 		    Install-Module PSReadline -Force -AllowClobber
 		}
 		Import-Module PSReadline -Force

@@ -321,7 +321,7 @@ Function Global:Get-CurrentBranch {
 if (Test-Path $PWSHFolder) {
     Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
     try {
-        Invoke-Git -GitPath $GitCommand -Arguments @("config", "--global", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
+        Invoke-Git -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
 
         $CurrentBranch = Get-CurrentBranch -Git $GitCommand -WorkDir $PWSHFolder
 
@@ -343,7 +343,7 @@ if (Test-Path $PWSHFolder) {
 
         # Shallow clone - only latest commit, single branch (much faster)
         Invoke-Git -GitPath $GitCommand -Arguments @("clone", "--depth", "1", "--single-branch", "https://github.com/MauleTech/PWSH.git", $PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
-        Invoke-Git -GitPath $GitCommand -Arguments @("config", "--global", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
+        Invoke-Git -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
 
         Write-Host "Repository cloned successfully!" -ForegroundColor Green
     }

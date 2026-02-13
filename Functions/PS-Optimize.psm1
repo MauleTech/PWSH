@@ -52,8 +52,8 @@ Function Optimize-Powershell {
 		$ErrorActionPreference = 'SilentlyContinue'
 
 		# Ensure NuGet provider is installed (required for PSGallery operations)
-		if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-		    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+		if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
+		    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
 		}
 
 		# Configure PSGallery
@@ -219,3 +219,4 @@ Function Optimize-Powershell {
 # /vTk8MtzQgn64RtLHUQ43DwPCmE5FpvgYRQzA434rwFyPHEvoniAN3VW3OVG2haB
 # ivnx+g==
 # SIG # End signature block
+

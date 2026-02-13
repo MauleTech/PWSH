@@ -109,14 +109,14 @@ Function Install-GitPortable {
         # Extract the 7zip self-extractor
         Write-Host "Extracting Git Portable to $GitFolder..." -ForegroundColor Green
 
-        $Process = Start-Process -FilePath $FilePath -ArgumentList "-y", "-o$GitFolder" -NoNewWindow -PassThru
-        $Process.WaitForExit()
+        # -Wait ensures ExitCode is reliably populated when used with -PassThru
+        $Process = Start-Process -FilePath $FilePath -ArgumentList "-y", "-o$GitFolder" -NoNewWindow -Wait -PassThru
 
         if ($Process.ExitCode -ne 0) {
             throw "7zip extraction failed with exit code: $($Process.ExitCode)"
         }
 
-        # Verify extraction
+        # Verify git.exe exists after extraction
         $GitExePath = "$GitFolder\bin\git.exe"
         if (Test-Path $GitExePath) {
             Write-Host "Git Portable successfully extracted!" -ForegroundColor Green

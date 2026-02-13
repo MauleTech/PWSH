@@ -1,12 +1,7 @@
 #Write-Host "`n - Retrieving Maule Technologies PowerShell Functions via Git -"
 Set-ExecutionPolicy Bypass -Scope Process -Force
 
-# Adds fancy checkmark :D
-$greenCheck = @{
-    Object = [Char]8730
-    ForegroundColor = 'Green'
-    NoNewLine = $true
-}
+$bootTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Set default IT folder path if not already defined
 if (-not $ITFolder) {
@@ -413,11 +408,11 @@ if (Test-Path $FunctionsFolder) {
 
         $LoadedModules = Get-Module | Where-Object { $_.Path -like "$FunctionsFolder*" }
         If ($LoadedModules) {
-            Write-Host -NoNewLine " "
-            Write-Host @greenCheck
-            Write-Host -NoNewLine " $((Get-Command -Module "PS-*" | Sort-Object Name).Count) Functions successfully loaded "
-            Write-Host @greenCheck
-            Write-Host "`n - Get-ITFunctions to see commands. Update-ITFunctions to load updates.`n"
+            $bootTimer.Stop()
+            $elapsed = "{0:N1}s" -f $bootTimer.Elapsed.TotalSeconds
+            $funcCount = (Get-Command -Module "PS-*" | Sort-Object Name).Count
+            Write-Host " $funcCount Functions successfully loaded in $elapsed" -ForegroundColor Green
+            Write-Host " - Get-ITFunctions to see commands. Update-ITFunctions to load updates.`n"
         } Else {
             Write-Host "Functions were not successfully loaded. Please check the function files." -ForegroundColor Red
         }

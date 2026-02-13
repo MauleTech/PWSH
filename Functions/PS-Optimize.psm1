@@ -52,7 +52,7 @@ Function Optimize-Powershell {
 		$ErrorActionPreference = 'SilentlyContinue'
 
 		# Ensure NuGet provider is installed (required for PSGallery operations)
-		if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+		if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
 		    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
 		}
 

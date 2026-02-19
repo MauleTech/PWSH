@@ -775,80 +775,218 @@ Function Get-DomainInfo {
 Function Get-FileDownload {
 	<#
 	.SYNOPSIS
-		Takes a URL for a file and downloads it to the specified directory.
+		Downloads a file from a URL to the specified directory using the fastest available method.
 		Parses the file name from the URL so you don't have to manually specify the file name.
+		Supports checksum validation with auto-detection of hash algorithm.
+	.DESCRIPTION
+		Attempts download methods in order of speed:
+		1. System.Net.Http.HttpClient with stream-to-file (fastest; no memory buffering, no progress bar overhead)
+		2. Invoke-WebRequest with progress suppressed (fast, widely compatible)
+		3. System.Net.WebClient (legacy, very reliable)
+		4. BITS Transfer (last resort; handles intermittent connections)
+		If a Checksum is provided, the downloaded file is validated and removed on mismatch.
 	.PARAMETER URL
-		URL of the file to download, i.e. 'http://download.ambitionsgroup.com/Software/migwiz.zip'
+		URL of the file to download, e.g. 'http://download.ambitionsgroup.com/Software/migwiz.zip'
 	.PARAMETER SaveToFolder
-		Folder of where to save the file, i.e. 'C:\Temp
+		Folder to save the file to, e.g. 'C:\Temp'. Defaults to the current directory.
+	.PARAMETER FileName
+		Override the file name parsed from the URL.
+	.PARAMETER Checksum
+		Expected hash of the downloaded file. If supplied, the file is validated after download.
+	.PARAMETER ChecksumType
+		Hash algorithm to use for validation: MD5, SHA1, SHA256, SHA384, or SHA512.
+		If omitted, the algorithm is auto-detected from the checksum string length.
+		If auto-detection fails, you will be prompted.
 	.EXAMPLE
-		#The following downloads the variable "$Link" to "$ITFolder\"
-
 		Get-FileDownload -URL $Link -SaveToFolder '$ITFolder\'
 
 	.EXAMPLE
-		The following downloads the file 'migwiz.zip' to '$ITFolder'.
-		It then exports the FileName 'migwiz.zip' to the variable $DownloadFileName.
-		It also exports the full file path '$ITFolder\migwiz.zip' to the variable '$DownloadFilePath'.
 		$DownloadFileInfo = Get-FileDownload -URL 'http://download.ambitionsgroup.com/Software/migwiz.zip' -SaveToFolder '$ITFolder\'
 		$DownloadFileName = $DownloadFileInfo[0]
 		$DownloadFilePath = $DownloadFileInfo[-1]
+
+	.EXAMPLE
+		# Download with SHA256 checksum validation (auto-detected from 64-char hash)
+		Get-FileDownload -URL $Link -SaveToFolder 'C:\Temp' -Checksum 'A1B2C3...'
+
+	.EXAMPLE
+		# Download with explicit checksum type
+		Get-FileDownload -URL $Link -SaveToFolder 'C:\Temp' -Checksum 'A1B2C3...' -ChecksumType 'SHA256'
 	#>
+	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $True)]
 		[uri]$URL,
 		[Parameter(Mandatory = $False)]
 		[string]$SaveToFolder,
 		[Parameter(Mandatory = $False)]
-		[string]$FileName
+		[string]$FileName,
+		[Parameter(Mandatory = $False)]
+		[string]$Checksum,
+		[Parameter(Mandatory = $False)]
+		[ValidateSet('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')]
+		[string]$ChecksumType
 	)
 
-	#Isolate file name from URL
+	# Isolate file name from URL, decoding percent-encoded characters (e.g. %20 -> space)
 	If (-not $FileName) {
-		[string]$FileName = $URL.Segments[-1]
+		[string]$FileName = [System.Uri]::UnescapeDataString($URL.Segments[-1])
 	}
 
-	#Set's SaveToFolder to current directory if one wasn't supplied.
+	# Default to current directory if SaveToFolder wasn't supplied
 	If (-not $SaveToFolder) {
 		$SaveToFolder = (Get-Location).Path
 	}
 
-	#Add a '\' to the end of the folder only if needed.
-	If ($SaveToFolder -notmatch '\\$'){	$SaveToFolder += '\'}
-	
-	#Create the destination folder if it doesn't exist.
-	New-Item -Path $SaveToFolder -ItemType Directory -Force | Out-Null
+	# Normalize trailing separator and create destination folder
+	$SaveToFolder = $SaveToFolder.TrimEnd('\', '/') + '\'
+	$null = New-Item -Path $SaveToFolder -ItemType Directory -Force
 
-	#Create full download path
-	[string]$FilePath = $SaveToFolder + $FileName
+	# Build full file path using Join-Path for robustness
+	[string]$FilePath = Join-Path -Path $SaveToFolder -ChildPath $FileName
 
-	#Write-Host "Enabling SSL"
+	# Ensure modern TLS protocols are available
+	# Use integers because the TLS 1.2 (3072) and TLS 1.1 (768) enum values
+	# don't exist in .NET 4.0, even though they work if .NET 4.5+ is installed.
 	Try {
-		# Set TLS 1.2 (3072), then TLS 1.1 (768), then TLS 1.0 (192)
-		# Use integers because the enumeration values for TLS 1.2 and TLS 1.1 won't
-		# exist in .NET 4.0, even though they are addressable if .NET 4.5+ is
-		# installed (.NET 4.5 is an in-place upgrade).
 		[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
 	} Catch {
-		Write-Output 'Unable to set PowerShell to use TLS 1.2 and TLS 1.1 due to old .NET Framework installed. If you see underlying connection closed or trust errors, you may need to upgrade to .NET Framework 4.5+ and PowerShell v3+.'
+		Write-Warning 'Unable to set TLS 1.2/1.1 due to old .NET Framework. Upgrade to .NET 4.5+ and PowerShell v3+ if you see connection errors.'
 	}
 
-	#Delete destination file if found.
-	If (Test-Path -Path $FilePath -ErrorAction SilentlyContinue) {Remove-Item -Path $FilePath -Force}
+	# Remove existing file to avoid stale data
+	If (Test-Path -Path $FilePath) { Remove-Item -Path $FilePath -Force }
 
 	Write-Host "Beginning download to $FilePath"
-	Try {
-		Invoke-RestMethod -Uri $URL -OutFile $FilePath
-		Return $FileName, $FilePath
-	} Catch {
+
+	$Downloaded = $false
+	$DownloadErrors = [System.Collections.Generic.List[string]]::new()
+
+	# Method 1: HttpClient with stream-to-file
+	# Fastest option: streams directly to disk with an 80 KB buffer, no memory buffering
+	# of the full response, and no progress-bar rendering overhead.
+	If (-not $Downloaded) {
+		$HttpClient = $null
+		$Response = $null
+		$ResponseStream = $null
+		$FileStream = $null
 		Try {
-			Invoke-WebRequest -Uri $URL -OutFile $FilePath -UseBasicParsing
-			Return $FileName, $FilePath
+			$HttpClient = [System.Net.Http.HttpClient]::new()
+			$HttpClient.Timeout = [TimeSpan]::FromMinutes(30)
+			$Response = $HttpClient.GetAsync(
+				$URL.AbsoluteUri,
+				[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+			).GetAwaiter().GetResult()
+			$null = $Response.EnsureSuccessStatusCode()
+			$ResponseStream = $Response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+			$FileStream = [System.IO.FileStream]::new(
+				$FilePath,
+				[System.IO.FileMode]::Create,
+				[System.IO.FileAccess]::Write,
+				[System.IO.FileShare]::None,
+				81920
+			)
+			$ResponseStream.CopyTo($FileStream, 81920)
+			$Downloaded = $true
+			Write-Verbose 'Downloaded using HttpClient stream method.'
 		} Catch {
-			(New-Object System.Net.WebClient).DownloadFile($URL, $FilePath)
-			Return $FileName, $FilePath
+			$DownloadErrors.Add("HttpClient: $_")
+			Write-Verbose "HttpClient method failed: $_"
+		} Finally {
+			If ($FileStream)     { $FileStream.Dispose() }
+			If ($ResponseStream) { $ResponseStream.Dispose() }
+			If ($Response)       { $Response.Dispose() }
+			If ($HttpClient)     { $HttpClient.Dispose() }
+			# Clean up partial file after streams are closed to avoid file-lock failures
+			If (-not $Downloaded -and (Test-Path $FilePath)) {
+				Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+			}
 		}
 	}
+
+	# Method 2: Invoke-WebRequest with progress suppressed
+	# Disabling the progress bar avoids the massive rendering overhead that can
+	# slow Invoke-WebRequest by 10-50x on large files.
+	If (-not $Downloaded) {
+		$PreviousProgressPref = $ProgressPreference
+		Try {
+			$ProgressPreference = 'SilentlyContinue'
+			Invoke-WebRequest -Uri $URL -OutFile $FilePath -UseBasicParsing
+			$Downloaded = $true
+			Write-Verbose 'Downloaded using Invoke-WebRequest.'
+		} Catch {
+			$DownloadErrors.Add("Invoke-WebRequest: $_")
+			Write-Verbose "Invoke-WebRequest failed: $_"
+		} Finally {
+			$ProgressPreference = $PreviousProgressPref
+		}
+	}
+
+	# Method 3: System.Net.WebClient (legacy, very reliable on older .NET)
+	If (-not $Downloaded) {
+		$WebClient = $null
+		Try {
+			$WebClient = [System.Net.WebClient]::new()
+			$WebClient.DownloadFile($URL.AbsoluteUri, $FilePath)
+			$Downloaded = $true
+			Write-Verbose 'Downloaded using WebClient.'
+		} Catch {
+			$DownloadErrors.Add("WebClient: $_")
+			Write-Verbose "WebClient failed: $_"
+		} Finally {
+			If ($WebClient) { $WebClient.Dispose() }
+		}
+	}
+
+	# Method 4: BITS Transfer (last resort; handles resume on intermittent connections)
+	If (-not $Downloaded) {
+		Try {
+			Start-BitsTransfer -Source $URL.AbsoluteUri -Destination $FilePath -ErrorAction Stop
+			$Downloaded = $true
+			Write-Verbose 'Downloaded using BITS Transfer.'
+		} Catch {
+			$DownloadErrors.Add("BITS: $_")
+			Write-Verbose "BITS Transfer failed: $_"
+		}
+	}
+
+	If (-not $Downloaded) {
+		$ErrorDetail = $DownloadErrors -join "`n  "
+		Throw "All download methods failed for URL: $URL`n  $ErrorDetail"
+	}
+
+	# Checksum validation
+	If ($Checksum) {
+		# Auto-detect algorithm from hash string length if not specified
+		If (-not $ChecksumType) {
+			$ChecksumType = Switch ($Checksum.Length) {
+				32  { 'MD5'    }
+				40  { 'SHA1'   }
+				64  { 'SHA256' }
+				96  { 'SHA384' }
+				128 { 'SHA512' }
+				Default { $null }
+			}
+			If ($ChecksumType) {
+				Write-Verbose "Auto-detected checksum type: $ChecksumType (from $($Checksum.Length)-character hash)"
+			} Else {
+				$ChecksumType = Read-Host "Cannot determine checksum type from length ($($Checksum.Length)). Enter type (MD5, SHA1, SHA256, SHA384, SHA512)"
+				If ($ChecksumType -notin @('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')) {
+					Write-Warning "Invalid checksum type '$ChecksumType'. Skipping validation."
+					Return $FileName, $FilePath
+				}
+			}
+		}
+
+		$FileHash = (Get-FileHash -Path $FilePath -Algorithm $ChecksumType).Hash
+		If ($FileHash -ne $Checksum.ToUpper()) {
+			Remove-Item -Path $FilePath -Force -ErrorAction SilentlyContinue
+			Throw "Checksum mismatch for $FileName! Expected ($ChecksumType): $($Checksum.ToUpper()), Got: $FileHash. Downloaded file has been removed."
+		}
+		Write-Verbose "Checksum validated successfully: $ChecksumType = $FileHash"
+	}
+
+	Return $FileName, $FilePath
 }
 
 Function Get-InternetHealth {

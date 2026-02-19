@@ -783,7 +783,9 @@ Function Get-FileDownload {
 		1. System.Net.Http.HttpClient with stream-to-file (fastest; no memory buffering, no progress bar overhead)
 		2. Invoke-WebRequest with progress suppressed (fast, widely compatible)
 		3. System.Net.WebClient (legacy, very reliable)
-		4. BITS Transfer (last resort; handles intermittent connections)
+		4. curl.exe (native on Windows 10 1803+, fast and battle-tested)
+		5. certutil -urlcache (available on all Windows versions, reliable deep fallback)
+		6. BITS Transfer (last resort; handles intermittent connections)
 		If a Checksum is provided, the downloaded file is validated and removed on mismatch.
 	.PARAMETER URL
 		URL of the file to download, e.g. 'http://download.ambitionsgroup.com/Software/migwiz.zip'
@@ -797,6 +799,9 @@ Function Get-FileDownload {
 		Hash algorithm to use for validation: MD5, SHA1, SHA256, SHA384, or SHA512.
 		If omitted, the algorithm is auto-detected from the checksum string length.
 		If auto-detection fails, you will be prompted.
+	.PARAMETER ShowProgress
+		Show download progress when possible. Note: enabling progress will slow down the download.
+		Progress is throttled to update every 10 seconds to minimize performance impact.
 	.EXAMPLE
 		Get-FileDownload -URL $Link -SaveToFolder '$ITFolder\'
 
@@ -812,6 +817,10 @@ Function Get-FileDownload {
 	.EXAMPLE
 		# Download with explicit checksum type
 		Get-FileDownload -URL $Link -SaveToFolder 'C:\Temp' -Checksum 'A1B2C3...' -ChecksumType 'SHA256'
+
+	.EXAMPLE
+		# Download with progress display (updates every 10 seconds)
+		Get-FileDownload -URL $Link -SaveToFolder 'C:\Temp' -ShowProgress
 	#>
 	[CmdletBinding()]
 	param(
@@ -825,7 +834,8 @@ Function Get-FileDownload {
 		[string]$Checksum,
 		[Parameter(Mandatory = $False)]
 		[ValidateSet('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')]
-		[string]$ChecksumType
+		[string]$ChecksumType,
+		[switch]$ShowProgress
 	)
 
 	# Isolate file name from URL, decoding percent-encoded characters (e.g. %20 -> space)
@@ -857,6 +867,10 @@ Function Get-FileDownload {
 	# Remove existing file to avoid stale data
 	If (Test-Path -Path $FilePath) { Remove-Item -Path $FilePath -Force }
 
+	If ($ShowProgress) {
+		Write-Warning 'Progress display is enabled. This may slow down the download slightly. Progress updates are throttled to every 10 seconds to minimize impact.'
+	}
+
 	Write-Host "Beginning download to $FilePath"
 
 	$Downloaded = $false
@@ -865,6 +879,7 @@ Function Get-FileDownload {
 	# Method 1: HttpClient with stream-to-file
 	# Fastest option: streams directly to disk with an 80 KB buffer, no memory buffering
 	# of the full response, and no progress-bar rendering overhead.
+	# When -ShowProgress is used, progress updates are throttled to every 10 seconds.
 	If (-not $Downloaded) {
 		$HttpClient = $null
 		$Response = $null
@@ -886,7 +901,33 @@ Function Get-FileDownload {
 				[System.IO.FileShare]::None,
 				81920
 			)
-			$ResponseStream.CopyTo($FileStream, 81920)
+			If ($ShowProgress) {
+				$TotalBytes = $Response.Content.Headers.ContentLength
+				$Buffer = [byte[]]::new(81920)
+				$TotalRead = [long]0
+				$Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+				$LastUpdate = [long]-10000  # Force immediate first update
+				While (($BytesRead = $ResponseStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+					$FileStream.Write($Buffer, 0, $BytesRead)
+					$TotalRead += $BytesRead
+					If ($Stopwatch.ElapsedMilliseconds - $LastUpdate -ge 10000) {
+						$LastUpdate = $Stopwatch.ElapsedMilliseconds
+						$ProgressParams = @{
+							Activity = "Downloading $FileName (HttpClient)"
+							Status   = '{0:N2} MB downloaded' -f ($TotalRead / 1MB)
+						}
+						If ($TotalBytes -and $TotalBytes -gt 0) {
+							$Pct = [Math]::Min(100, [int](($TotalRead / $TotalBytes) * 100))
+							$ProgressParams['PercentComplete'] = $Pct
+							$ProgressParams['Status'] = '{0:N2} / {1:N2} MB ({2}%)' -f ($TotalRead / 1MB), ($TotalBytes / 1MB), $Pct
+						}
+						Write-Progress @ProgressParams
+					}
+				}
+				Write-Progress -Activity "Downloading $FileName (HttpClient)" -Completed
+			} Else {
+				$ResponseStream.CopyTo($FileStream, 81920)
+			}
 			$Downloaded = $true
 			Write-Verbose 'Downloaded using HttpClient stream method.'
 		} Catch {
@@ -904,13 +945,16 @@ Function Get-FileDownload {
 		}
 	}
 
-	# Method 2: Invoke-WebRequest with progress suppressed
+	# Method 2: Invoke-WebRequest
 	# Disabling the progress bar avoids the massive rendering overhead that can
 	# slow Invoke-WebRequest by 10-50x on large files.
+	# When -ShowProgress is used, the native progress bar is left enabled.
 	If (-not $Downloaded) {
 		$PreviousProgressPref = $ProgressPreference
 		Try {
-			$ProgressPreference = 'SilentlyContinue'
+			If (-not $ShowProgress) {
+				$ProgressPreference = 'SilentlyContinue'
+			}
 			Invoke-WebRequest -Uri $URL -OutFile $FilePath -UseBasicParsing
 			$Downloaded = $true
 			Write-Verbose 'Downloaded using Invoke-WebRequest.'
@@ -938,7 +982,60 @@ Function Get-FileDownload {
 		}
 	}
 
-	# Method 4: BITS Transfer (last resort; handles resume on intermittent connections)
+	# Method 4: curl.exe (native on Windows 10 1803+ and Server 2019+)
+	# Fast, battle-tested, and supports resume on intermittent connections.
+	If (-not $Downloaded) {
+		Try {
+			$CurlExe = Get-Command 'curl.exe' -ErrorAction Stop
+			$CurlArgs = @('-L', '-o', $FilePath, '--fail', '--connect-timeout', '30', '--max-time', '1800')
+			If ($ShowProgress) {
+				$CurlArgs += '--progress-bar'
+			} Else {
+				$CurlArgs += '--silent'
+			}
+			$CurlArgs += $URL.AbsoluteUri
+			& $CurlExe.Source @CurlArgs
+			If ($LASTEXITCODE -eq 0 -and (Test-Path $FilePath)) {
+				$Downloaded = $true
+				Write-Verbose 'Downloaded using curl.exe.'
+			} Else {
+				Throw "curl.exe exited with code $LASTEXITCODE"
+			}
+		} Catch {
+			$DownloadErrors.Add("curl.exe: $_")
+			Write-Verbose "curl.exe method failed: $_"
+			If (-not $Downloaded -and (Test-Path $FilePath)) {
+				Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+			}
+		}
+	}
+
+	# Method 5: certutil -urlcache (available on all Windows versions)
+	# A well-known sysadmin trick, extremely reliable as a deep fallback on legacy systems.
+	If (-not $Downloaded) {
+		Try {
+			$CertutilExe = Get-Command 'certutil.exe' -ErrorAction Stop
+			If ($ShowProgress) {
+				& $CertutilExe.Source -urlcache -split -f $URL.AbsoluteUri $FilePath
+			} Else {
+				$null = & $CertutilExe.Source -urlcache -split -f $URL.AbsoluteUri $FilePath 2>&1
+			}
+			If ($LASTEXITCODE -eq 0 -and (Test-Path $FilePath)) {
+				$Downloaded = $true
+				Write-Verbose 'Downloaded using certutil.'
+			} Else {
+				Throw "certutil exited with code $LASTEXITCODE"
+			}
+		} Catch {
+			$DownloadErrors.Add("certutil: $_")
+			Write-Verbose "certutil method failed: $_"
+			If (-not $Downloaded -and (Test-Path $FilePath)) {
+				Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+			}
+		}
+	}
+
+	# Method 6: BITS Transfer (last resort; handles resume on intermittent connections)
 	If (-not $Downloaded) {
 		Try {
 			Start-BitsTransfer -Source $URL.AbsoluteUri -Destination $FilePath -ErrorAction Stop

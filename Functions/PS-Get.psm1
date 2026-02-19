@@ -961,6 +961,9 @@ Function Get-FileDownload {
 		} Catch {
 			$DownloadErrors.Add("Invoke-WebRequest: $_")
 			Write-Verbose "Invoke-WebRequest failed: $_"
+			If (Test-Path $FilePath) {
+				Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+			}
 		} Finally {
 			$ProgressPreference = $PreviousProgressPref
 		}
@@ -979,6 +982,9 @@ Function Get-FileDownload {
 			Write-Verbose "WebClient failed: $_"
 		} Finally {
 			If ($WebClient) { $WebClient.Dispose() }
+			If (-not $Downloaded -and (Test-Path $FilePath)) {
+				Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+			}
 		}
 	}
 
@@ -991,7 +997,9 @@ Function Get-FileDownload {
 			If ($ShowProgress) {
 				$CurlArgs += '--progress-bar'
 			} Else {
+				# --show-error keeps error messages visible even in silent mode
 				$CurlArgs += '--silent'
+				$CurlArgs += '--show-error'
 			}
 			$CurlArgs += $URL.AbsoluteUri
 			& $CurlExe.Source @CurlArgs
@@ -1044,6 +1052,9 @@ Function Get-FileDownload {
 		} Catch {
 			$DownloadErrors.Add("BITS: $_")
 			Write-Verbose "BITS Transfer failed: $_"
+			If (Test-Path $FilePath) {
+				Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+			}
 		}
 	}
 

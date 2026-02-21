@@ -513,9 +513,10 @@ Function Install-ScreenConnect {
 		
 		# Direct URL to the ScreenConnect MSI
 		$InstallURL = 'https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi'
-		
+		$InstallHash = '4FB543702793D708227598B1FBA36443DB5B60607818C60B1791C2E286E4B64E'
+
 		# Download the installer using Get-FileDownload from MauleTech/PWSH
-		$ScreenConnectInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder "$ITFolder\ScreenConnect"
+		$ScreenConnectInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder "$ITFolder\ScreenConnect" -Checksum $InstallHash
 		$msiPath = $ScreenConnectInstaller[1]
 		
 		# Install the MSI silently

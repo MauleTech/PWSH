@@ -91,8 +91,8 @@ Function Invoke-BPARemediation {
 
 		Write-Verbose "Starting BPA Remediation on $ComputerName"
 
-		# Define safe remediations - structure allows easy expansion
-		# Format: RuleId/Pattern = @{ Type = 'Registry'|'SMB'|'DNS'|'Manual'; Action = scriptblock or description }
+		# Define safe remediations - add new entries here to expand coverage
+		# Format: Key = @{ Type; Property; Value; Description }
 		$SafeRemediations = @{
 			# SMB Server Settings
 			'SMB.AutoDisconnectTimeout' = @{
@@ -127,7 +127,8 @@ Function Invoke-BPARemediation {
 			}
 		}
 
-		# Patterns that indicate issues requiring manual attention
+		# Patterns that indicate issues requiring manual attention.
+		# Word-boundary anchors (\b) prevent false matches on common substrings.
 		$ManualReviewPatterns = @(
 			'credential',
 			'certificate',
@@ -136,13 +137,24 @@ Function Invoke-BPARemediation {
 			'network adapter',
 			'IP address',
 			'IP configuration',
-			'DHCP.*DNS.*credential',
-			'account',
+			'\baccount\b',
 			'password',
-			'authentication',
+			'\bauthentication\b',
 			'domain controller',
-			'replication'
+			'\breplication\b'
 		)
+
+		# Cache SMB configuration once per execution to avoid repeated queries for
+		# multiple SMB findings in the same scan session.
+		$SmbConfig = $null
+		if (Get-Module -ListAvailable -Name SmbServer -ErrorAction SilentlyContinue) {
+			try {
+				$SmbConfig = Get-SmbServerConfiguration -ErrorAction Stop
+				Write-Verbose "SMB Server configuration loaded and cached"
+			} catch {
+				Write-Warning "Could not retrieve SMB Server configuration: $_"
+			}
+		}
 
 		# Initialize results collection
 		$Results = [System.Collections.ArrayList]::new()
@@ -188,7 +200,7 @@ Function Invoke-BPARemediation {
 				if ($Category) {
 					$BpaResults = $BpaResults | Where-Object { $Category -contains $_.Category }
 				}
-				# Filter to non-compliant results
+				# Filter to non-compliant, actionable results
 				$BpaResults = $BpaResults | Where-Object { $_.Compliance -ne $true -and $_.Severity -ne 'Informational' }
 			} catch {
 				Write-Warning "Failed to get BPA results for $($Model.Id): $_"
@@ -198,62 +210,51 @@ Function Invoke-BPARemediation {
 			Write-Verbose "Found $($BpaResults.Count) non-compliant BPA finding(s) for $($Model.Id)"
 
 			foreach ($Finding in $BpaResults) {
-				$ResultObj = [PSCustomObject]@{
-					Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-					ComputerName = $ComputerName
-					ModelId = $Model.Id
-					RuleId = $Finding.RuleId
-					Title = $Finding.Title
-					Category = $Finding.Category
-					Severity = $Finding.Severity
-					Status = 'Pending'
-					PreviousValue = $null
-					NewValue = $null
-					Reason = $null
-				}
-
-				# Check if this requires manual review
-				$RequiresManualReview = $false
+				# Check manual review patterns before attempting remediation
+				$MatchedPattern = $null
 				foreach ($Pattern in $ManualReviewPatterns) {
 					if ($Finding.Title -match $Pattern -or $Finding.Problem -match $Pattern -or $Finding.Resolution -match $Pattern) {
-						$RequiresManualReview = $true
-						$ResultObj.Status = 'ManualRequired'
-						$ResultObj.Reason = "Contains sensitive pattern: $Pattern - requires manual review"
+						$MatchedPattern = $Pattern
 						break
 					}
 				}
 
-				if ($RequiresManualReview) {
-					Write-Verbose "Skipping $($Finding.RuleId): Requires manual review"
-					$null = $Results.Add($ResultObj)
+				if ($MatchedPattern) {
+					Write-Verbose "Manual review required for $($Finding.RuleId): matched pattern '$MatchedPattern'"
+					$null = $Results.Add((New-BPAResultObject -Finding $Finding -Model $Model -ComputerName $ComputerName `
+						-Status 'ManualRequired' -Reason "Matched sensitive pattern '$MatchedPattern' - requires manual review"))
 					continue
 				}
 
-				# Try to find a matching safe remediation
-				$Remediated = $false
+				# Each handler returns an array of partial result objects (empty if not applicable).
+				# Helpers are tried in priority order; the first that produces results wins.
+				$HandlerResults = @()
 
-				# Check SMB-related findings
-				if ($Finding.Title -match 'SMB|Server Message Block|file server' -or $Model.Id -match 'FileServices') {
-					$Remediated = Invoke-SMBRemediation -Finding $Finding -ResultObj $ResultObj -SafeRemediations $SafeRemediations -WhatIf:$WhatIfPreference -Verbose:$VerbosePreference
+				if ($HandlerResults.Count -eq 0 -and ($Finding.Title -match 'SMB|Server Message Block|file server' -or $Model.Id -match 'FileServices')) {
+					$HandlerResults = @(Invoke-SMBRemediation -Finding $Finding -SafeRemediations $SafeRemediations `
+						-SmbConfig $SmbConfig -WhatIf:$WhatIfPreference -Verbose:$VerbosePreference)
 				}
 
-				# Check DNS-related findings
-				if ((-not $Remediated) -and ($Finding.Title -match 'DNS' -or $Model.Id -match 'DNS')) {
-					$Remediated = Invoke-DNSRemediation -Finding $Finding -ResultObj $ResultObj -WhatIf:$WhatIfPreference -Verbose:$VerbosePreference
+				if ($HandlerResults.Count -eq 0 -and ($Finding.Title -match 'DNS' -or $Model.Id -match 'DNS')) {
+					$HandlerResults = @(Invoke-DNSRemediation -Finding $Finding -WhatIf:$WhatIfPreference -Verbose:$VerbosePreference)
 				}
 
-				# Check DHCP-related findings
-				if ((-not $Remediated) -and ($Finding.Title -match 'DHCP' -or $Model.Id -match 'DHCP')) {
-					$Remediated = Invoke-DHCPRemediation -Finding $Finding -ResultObj $ResultObj -WhatIf:$WhatIfPreference -Verbose:$VerbosePreference
+				if ($HandlerResults.Count -eq 0 -and ($Finding.Title -match 'DHCP' -or $Model.Id -match 'DHCP')) {
+					$HandlerResults = @(Invoke-DHCPRemediation -Finding $Finding -WhatIf:$WhatIfPreference -Verbose:$VerbosePreference)
 				}
 
-				# If no specific remediation found, mark as skipped
-				if (-not $Remediated -and $ResultObj.Status -eq 'Pending') {
-					$ResultObj.Status = 'Skipped'
-					$ResultObj.Reason = 'No safe automated remediation available'
+				if ($HandlerResults.Count -gt 0) {
+					# A handler matched - add one result row per partial result returned
+					foreach ($Partial in $HandlerResults) {
+						$null = $Results.Add((New-BPAResultObject -Finding $Finding -Model $Model -ComputerName $ComputerName `
+							-Status $Partial.Status -Target $Partial.Target `
+							-PreviousValue $Partial.PreviousValue -NewValue $Partial.NewValue -Reason $Partial.Reason))
+					}
+				} else {
+					# No handler matched this finding
+					$null = $Results.Add((New-BPAResultObject -Finding $Finding -Model $Model -ComputerName $ComputerName `
+						-Status 'Skipped' -Reason 'No safe automated remediation available'))
 				}
-
-				$null = $Results.Add($ResultObj)
 			}
 		}
 	}
@@ -269,7 +270,7 @@ Function Invoke-BPARemediation {
 		Write-Host "BPA Remediation Summary" -ForegroundColor Cyan
 		Write-Host "========================================" -ForegroundColor Cyan
 		Write-Host "Computer: $ComputerName"
-		Write-Host "Total Findings: $($Results.Count)"
+		Write-Host "Total Results: $($Results.Count)"
 		Write-Host "  Remediated:      $($RemediatedItems.Count)" -ForegroundColor Green
 		Write-Host "  Skipped:         $($SkippedItems.Count)" -ForegroundColor Yellow
 		Write-Host "  Manual Required: $($ManualItems.Count)" -ForegroundColor Red
@@ -294,8 +295,9 @@ Function Invoke-BPARemediation {
 					$Results | Export-Csv -Path $OutputPath -NoTypeInformation -Force
 					Write-Host "Report exported to: $OutputPath" -ForegroundColor Green
 				} elseif ($Extension -eq '.html') {
-					$HtmlContent = $Results | ConvertTo-Html -Title "BPA Remediation Report" -PreContent "<h1>BPA Remediation Report</h1><p>Generated: $(Get-Date)</p><p>Computer: $ComputerName</p>" | Out-String
-					$HtmlContent | Out-File -FilePath $OutputPath -Encoding ASCII -Force
+					$PreContent = "<h1>BPA Remediation Report</h1><p>Generated: $(Get-Date)</p><p>Computer: $ComputerName</p>"
+					$HtmlContent = $Results | ConvertTo-Html -Title "BPA Remediation Report" -PreContent $PreContent | Out-String
+					$HtmlContent | Out-File -FilePath $OutputPath -Encoding UTF8 -Force
 					Write-Host "Report exported to: $OutputPath" -ForegroundColor Green
 				}
 			} catch {
@@ -303,183 +305,247 @@ Function Invoke-BPARemediation {
 			}
 		}
 
-		# Return results
 		return $Results
 	}
 }
 
+# Internal helper: constructs a complete result object from a BPA finding and partial handler output.
+Function New-BPAResultObject {
+	param(
+		[psobject]$Finding,
+		[psobject]$Model,
+		[string]$ComputerName,
+		[string]$Status,
+		[string]$Target = $null,
+		$PreviousValue = $null,
+		$NewValue = $null,
+		[string]$Reason = $null
+	)
+	return [PSCustomObject]@{
+		Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+		ComputerName  = $ComputerName
+		ModelId       = $Model.Id
+		RuleId        = $Finding.RuleId
+		Title         = $Finding.Title
+		Category      = $Finding.Category
+		Severity      = $Finding.Severity
+		Target        = $Target
+		Status        = $Status
+		PreviousValue = $PreviousValue
+		NewValue      = $NewValue
+		Reason        = $Reason
+	}
+}
+
+# Internal helper: remediates SMB-related BPA findings.
+# Accepts a pre-fetched $SmbConfig to avoid redundant server queries across multiple findings.
+# Returns an array of partial result objects (empty if no rule matched the finding).
 Function Invoke-SMBRemediation {
-	<#
-	.SYNOPSIS
-		Internal helper function to remediate SMB-related BPA findings.
-	#>
 	[CmdletBinding(SupportsShouldProcess = $true)]
 	param(
 		[Parameter(Mandatory = $true)]
-		$Finding,
+		[psobject]$Finding,
 
 		[Parameter(Mandatory = $true)]
-		[PSCustomObject]$ResultObj,
+		[hashtable]$SafeRemediations,
 
-		[Parameter(Mandatory = $true)]
-		[hashtable]$SafeRemediations
+		[Parameter(Mandatory = $false)]
+		[psobject]$SmbConfig
 	)
 
-	# Check if SmbServer module is available
-	if (-not (Get-Module -ListAvailable -Name SmbServer -ErrorAction SilentlyContinue)) {
-		$ResultObj.Status = 'Skipped'
-		$ResultObj.Reason = 'SmbServer module not available'
-		return $false
+	if ($null -eq $SmbConfig) {
+		return @([PSCustomObject]@{
+			Target = 'SMB Server'
+			Status = 'Skipped'
+			PreviousValue = $null
+			NewValue = $null
+			Reason = 'SMB Server configuration not available (SmbServer module missing or query failed)'
+		})
 	}
 
-	try {
-		$SmbConfig = Get-SmbServerConfiguration -ErrorAction Stop
-	} catch {
-		$ResultObj.Status = 'Failed'
-		$ResultObj.Reason = "Failed to get SMB configuration: $_"
-		return $false
-	}
+	$PartialResults = [System.Collections.ArrayList]::new()
 
-	# Check each SMB remediation rule
 	foreach ($Key in $SafeRemediations.Keys) {
 		if ($Key -notmatch '^SMB\.') { continue }
 
 		$Rule = $SafeRemediations[$Key]
 		$Property = $Rule.Property
 
-		# Check if this finding relates to this property
-		if ($Finding.Title -match $Property -or $Finding.Problem -match $Property -or $Finding.Resolution -match $Property) {
-			$CurrentValue = $SmbConfig.$Property
-			$TargetValue = $Rule.Value
+		# Match this rule against the finding text
+		if (-not ($Finding.Title -match $Property -or $Finding.Problem -match $Property -or $Finding.Resolution -match $Property)) {
+			continue
+		}
 
-			if ($CurrentValue -ne $TargetValue) {
-				$ResultObj.PreviousValue = $CurrentValue
-				$ResultObj.NewValue = $TargetValue
+		$CurrentValue = $SmbConfig.$Property
+		$TargetValue = $Rule.Value
 
-				if ($PSCmdlet.ShouldProcess("SMB Server Configuration", "Set $Property from $CurrentValue to $TargetValue")) {
-					try {
-						$Params = @{ $Property = $TargetValue; Force = $true; Confirm = $false }
-						Set-SmbServerConfiguration @Params -ErrorAction Stop
-						$ResultObj.Status = 'Remediated'
-						$ResultObj.Reason = $Rule.Description
-						Write-Verbose "Remediated: $($Rule.Description)"
-						return $true
-					} catch {
-						$ResultObj.Status = 'Failed'
-						$ResultObj.Reason = "Failed to set $Property : $_"
-						return $false
-					}
-				} else {
-					$ResultObj.Status = 'Skipped'
-					$ResultObj.Reason = 'WhatIf mode - no changes made'
-					return $true
-				}
+		if ($CurrentValue -eq $TargetValue) {
+			Write-Verbose "SMB: $Property is already at target value $TargetValue"
+			continue
+		}
+
+		if ($PSCmdlet.ShouldProcess("SMB Server Configuration", "Set $Property from $CurrentValue to $TargetValue")) {
+			try {
+				$Params = @{ $Property = $TargetValue; Force = $true; Confirm = $false }
+				Set-SmbServerConfiguration @Params -ErrorAction Stop
+				$null = $PartialResults.Add([PSCustomObject]@{
+					Target = 'SMB Server'
+					Status = 'Remediated'
+					PreviousValue = $CurrentValue
+					NewValue = $TargetValue
+					Reason = $Rule.Description
+				})
+				Write-Verbose "Remediated SMB: $($Rule.Description)"
+			} catch {
+				$null = $PartialResults.Add([PSCustomObject]@{
+					Target = 'SMB Server'
+					Status = 'Failed'
+					PreviousValue = $CurrentValue
+					NewValue = $TargetValue
+					Reason = "Failed to set ${Property}: $_"
+				})
 			}
+		} else {
+			$null = $PartialResults.Add([PSCustomObject]@{
+				Target = 'SMB Server'
+				Status = 'Skipped'
+				PreviousValue = $CurrentValue
+				NewValue = $TargetValue
+				Reason = 'WhatIf mode - no changes made'
+			})
 		}
 	}
 
-	return $false
+	return @($PartialResults)
 }
 
+# Internal helper: remediates DNS-related BPA findings.
+# Returns one partial result object per DNS zone processed (all zones, not just the first).
 Function Invoke-DNSRemediation {
-	<#
-	.SYNOPSIS
-		Internal helper function to remediate DNS-related BPA findings.
-	#>
 	[CmdletBinding(SupportsShouldProcess = $true)]
 	param(
 		[Parameter(Mandatory = $true)]
-		$Finding,
-
-		[Parameter(Mandatory = $true)]
-		[PSCustomObject]$ResultObj
+		[psobject]$Finding
 	)
 
-	# Check if DnsServer module is available
 	if (-not (Get-Module -ListAvailable -Name DnsServer -ErrorAction SilentlyContinue)) {
-		$ResultObj.Status = 'Skipped'
-		$ResultObj.Reason = 'DnsServer module not available - DNS role may not be installed'
-		return $false
+		return @([PSCustomObject]@{
+			Target = $null
+			Status = 'Skipped'
+			PreviousValue = $null
+			NewValue = $null
+			Reason = 'DnsServer module not available - DNS role may not be installed'
+		})
 	}
 
-	# Handle zone notify settings
-	if ($Finding.Title -match 'notify|secondary|zone transfer') {
-		try {
-			$Zones = Get-DnsServerZone -ErrorAction Stop | Where-Object { $_.ZoneType -eq 'Primary' -and -not $_.IsAutoCreated }
+	# Only handle notify/secondary zone findings
+	if (-not ($Finding.Title -match 'notify|secondary|zone transfer')) {
+		return @()
+	}
 
-			foreach ($Zone in $Zones) {
-				# Check if there are secondary servers configured
-				$ZoneInfo = Get-DnsServerZone -Name $Zone.ZoneName -ErrorAction SilentlyContinue
+	$PartialResults = [System.Collections.ArrayList]::new()
 
-				if ($ZoneInfo -and ($null -eq $ZoneInfo.SecondaryServers -or $ZoneInfo.SecondaryServers.Count -eq 0)) {
-					$ResultObj.PreviousValue = $ZoneInfo.Notify
-					$ResultObj.NewValue = 'NoNotify'
+	try {
+		# Single call returns full zone objects - no second per-zone query needed
+		$Zones = Get-DnsServerZone -ErrorAction Stop | Where-Object { $_.ZoneType -eq 'Primary' -and -not $_.IsAutoCreated }
+	} catch {
+		return @([PSCustomObject]@{
+			Target = $null
+			Status = 'Failed'
+			PreviousValue = $null
+			NewValue = $null
+			Reason = "Failed to query DNS zones: $_"
+		})
+	}
 
-					if ($ZoneInfo.Notify -ne 'NoNotify') {
-						if ($PSCmdlet.ShouldProcess("DNS Zone: $($Zone.ZoneName)", "Set Notify to NoNotify (no secondaries configured)")) {
-							try {
-								Set-DnsServerZone -Name $Zone.ZoneName -Notify 'NoNotify' -ErrorAction Stop
-								$ResultObj.Status = 'Remediated'
-								$ResultObj.Reason = "Set zone notify to NoNotify - no secondary servers configured"
-								Write-Verbose "Remediated DNS zone $($Zone.ZoneName): Set Notify to NoNotify"
-								return $true
-							} catch {
-								$ResultObj.Status = 'Failed'
-								$ResultObj.Reason = "Failed to set zone notify: $_"
-								return $false
-							}
-						} else {
-							$ResultObj.Status = 'Skipped'
-							$ResultObj.Reason = 'WhatIf mode - no changes made'
-							return $true
-						}
-					}
-				}
+	foreach ($Zone in $Zones) {
+		# Only adjust zones that have no secondary servers configured
+		if (-not ($null -eq $Zone.SecondaryServers -or $Zone.SecondaryServers.Count -eq 0)) {
+			continue
+		}
+
+		if ($Zone.Notify -eq 'NoNotify') {
+			Write-Verbose "DNS: Zone $($Zone.ZoneName) already set to NoNotify"
+			continue
+		}
+
+		if ($PSCmdlet.ShouldProcess("DNS Zone: $($Zone.ZoneName)", "Set Notify to NoNotify (no secondaries configured)")) {
+			try {
+				Set-DnsServerZone -Name $Zone.ZoneName -Notify 'NoNotify' -ErrorAction Stop
+				$null = $PartialResults.Add([PSCustomObject]@{
+					Target = $Zone.ZoneName
+					Status = 'Remediated'
+					PreviousValue = $Zone.Notify
+					NewValue = 'NoNotify'
+					Reason = 'Set zone notify to NoNotify - no secondary servers configured'
+				})
+				Write-Verbose "Remediated DNS zone $($Zone.ZoneName): Set Notify to NoNotify"
+			} catch {
+				$null = $PartialResults.Add([PSCustomObject]@{
+					Target = $Zone.ZoneName
+					Status = 'Failed'
+					PreviousValue = $Zone.Notify
+					NewValue = 'NoNotify'
+					Reason = "Failed to set zone notify: $_"
+				})
 			}
-		} catch {
-			$ResultObj.Status = 'Failed'
-			$ResultObj.Reason = "Failed to query DNS zones: $_"
-			return $false
+		} else {
+			$null = $PartialResults.Add([PSCustomObject]@{
+				Target = $Zone.ZoneName
+				Status = 'Skipped'
+				PreviousValue = $Zone.Notify
+				NewValue = 'NoNotify'
+				Reason = 'WhatIf mode - no changes made'
+			})
 		}
 	}
 
-	return $false
+	return @($PartialResults)
 }
 
+# Internal helper: handles DHCP-related BPA findings.
+# Most DHCP remediations require manual attention due to credential requirements.
+# Returns a single partial result object.
 Function Invoke-DHCPRemediation {
-	<#
-	.SYNOPSIS
-		Internal helper function to handle DHCP-related BPA findings.
-		Note: Most DHCP remediations require manual attention due to credential requirements.
-	#>
 	[CmdletBinding(SupportsShouldProcess = $true)]
 	param(
 		[Parameter(Mandatory = $true)]
-		$Finding,
-
-		[Parameter(Mandatory = $true)]
-		[PSCustomObject]$ResultObj
+		[psobject]$Finding
 	)
 
-	# Check if DhcpServer module is available
 	if (-not (Get-Module -ListAvailable -Name DhcpServer -ErrorAction SilentlyContinue)) {
-		$ResultObj.Status = 'Skipped'
-		$ResultObj.Reason = 'DhcpServer module not available - DHCP role may not be installed'
-		return $false
+		return @([PSCustomObject]@{
+			Target = $null
+			Status = 'Skipped'
+			PreviousValue = $null
+			NewValue = $null
+			Reason = 'DhcpServer module not available - DHCP role may not be installed'
+		})
 	}
 
-	# DHCP DNS credential findings - always flag for manual attention
+	# DNS credential findings always require manual attention
 	if ($Finding.Title -match 'DNS.*credential|credential.*DNS|dynamic update|DHCP.*DNS') {
-		$ResultObj.Status = 'ManualRequired'
-		$ResultObj.Reason = 'DHCP DNS credential configuration requires manual setup - cannot auto-configure credentials'
-		return $true
+		return @([PSCustomObject]@{
+			Target = $null
+			Status = 'ManualRequired'
+			PreviousValue = $null
+			NewValue = $null
+			Reason = 'DHCP DNS credential configuration requires manual setup - cannot auto-configure credentials'
+		})
 	}
 
-	# Other DHCP findings - mark for review
-	$ResultObj.Status = 'Skipped'
-	$ResultObj.Reason = 'DHCP remediation requires manual review for environment safety'
-	return $false
+	return @([PSCustomObject]@{
+		Target = $null
+		Status = 'Skipped'
+		PreviousValue = $null
+		NewValue = $null
+		Reason = 'DHCP remediation requires manual review for environment safety'
+	})
 }
+
+# Restrict module exports to the public-facing function only.
+# Internal helpers (New-BPAResultObject, Invoke-SMBRemediation, etc.) are not exported.
+Export-ModuleMember -Function 'Invoke-BPARemediation'
 
 # SIG # Begin signature block
 # SIG # End signature block

@@ -85,8 +85,10 @@ Function Invoke-BPARemediation {
 		# Block remote execution - remediation commands only work locally.
 		# BPA scan can run remotely, but Set-SmbServerConfiguration/Set-DnsServerZone execute locally.
 		# To remediate a remote server, run this function directly on that server or use Invoke-Command.
+		$LocalFqdn = if ($env:USERDNSDOMAIN) { "$env:COMPUTERNAME.$env:USERDNSDOMAIN" } else { $null }
 		$IsLocalTarget = ($ComputerName -eq 'localhost' -or $ComputerName -eq '.' -or
-			$ComputerName -eq $env:COMPUTERNAME -or $ComputerName -eq "$env:COMPUTERNAME.$env:USERDNSDOMAIN")
+			$ComputerName -eq $env:COMPUTERNAME -or
+			($LocalFqdn -and $ComputerName -eq $LocalFqdn))
 		if (-not $IsLocalTarget) {
 			throw "Remote remediation is not supported. Remediation commands (Set-SmbServerConfiguration, Set-DnsServerZone) only execute locally. To remediate '$ComputerName', run this function directly on that server or use: Invoke-Command -ComputerName '$ComputerName' -ScriptBlock { Invoke-BPARemediation }"
 		}
@@ -155,6 +157,9 @@ Function Invoke-BPARemediation {
 
 		# Cache SMB configuration once per execution to avoid repeated queries for
 		# multiple SMB findings in the same scan session.
+		# Note: If multiple SMB properties are remediated, PreviousValue in result objects
+		# for subsequent findings will reflect the pre-remediation state (stale cache).
+		# The property-equality check remains accurate; only logged PreviousValue is affected.
 		$SmbConfig = $null
 		if (Get-Module -ListAvailable -Name SmbServer -ErrorAction SilentlyContinue) {
 			try {
@@ -518,7 +523,7 @@ Function Invoke-DNSRemediation {
 			Status = 'Skipped'
 			PreviousValue = 'NoNotify'
 			NewValue = 'NoNotify'
-			Reason = "All $ZonesAlreadyCompliant applicable DNS zone(s) already set to NoNotify"
+			Reason = "All $ZonesChecked applicable DNS zone(s) already set to NoNotify"
 		})
 	}
 

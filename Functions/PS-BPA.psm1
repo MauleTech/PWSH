@@ -45,8 +45,8 @@ Function Invoke-BPARemediation {
 		Run remediation and export results to a CSV file.
 
 	.EXAMPLE
-		Invoke-BPARemediation -ComputerName "SERVER01" -OutputPath "C:\Reports\BPA-Report.html"
-		Remediate a remote server and export an HTML report.
+		Invoke-Command -ComputerName "SERVER01" -ScriptBlock { Invoke-BPARemediation -OutputPath "C:\Reports\BPA-Report.html" }
+		Remediate a remote server via PowerShell remoting and export an HTML report.
 
 	.NOTES
 		Requires Administrator privileges to run.
@@ -80,6 +80,15 @@ Function Invoke-BPARemediation {
 		$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 		if (-not $IsAdmin) {
 			throw "This function requires Administrator privileges. Please run as Administrator."
+		}
+
+		# Block remote execution - remediation commands only work locally.
+		# BPA scan can run remotely, but Set-SmbServerConfiguration/Set-DnsServerZone execute locally.
+		# To remediate a remote server, run this function directly on that server or use Invoke-Command.
+		$IsLocalTarget = ($ComputerName -eq 'localhost' -or $ComputerName -eq '.' -or
+			$ComputerName -eq $env:COMPUTERNAME -or $ComputerName -eq "$env:COMPUTERNAME.$env:USERDNSDOMAIN")
+		if (-not $IsLocalTarget) {
+			throw "Remote remediation is not supported. Remediation commands (Set-SmbServerConfiguration, Set-DnsServerZone) only execute locally. To remediate '$ComputerName', run this function directly on that server or use: Invoke-Command -ComputerName '$ComputerName' -ScriptBlock { Invoke-BPARemediation }"
 		}
 
 		# Check for BestPractices module
@@ -181,14 +190,10 @@ Function Invoke-BPARemediation {
 		foreach ($Model in $Models) {
 			Write-Verbose "Processing BPA model: $($Model.Id)"
 
-			# Invoke BPA scan
+			# Invoke BPA scan (always local since remote remediation is blocked in begin block)
 			try {
 				Write-Verbose "Running BPA scan for $($Model.Id)..."
-				if ($ComputerName -eq 'localhost' -or $ComputerName -eq $env:COMPUTERNAME) {
-					$null = Invoke-BpaModel -Id $Model.Id -ErrorAction Stop
-				} else {
-					$null = Invoke-BpaModel -Id $Model.Id -ComputerName $ComputerName -ErrorAction Stop
-				}
+				$null = Invoke-BpaModel -Id $Model.Id -ErrorAction Stop
 			} catch {
 				Write-Warning "Failed to invoke BPA scan for $($Model.Id): $_"
 				continue
@@ -196,12 +201,12 @@ Function Invoke-BPARemediation {
 
 			# Get BPA results
 			try {
-				$BpaResults = Get-BpaResult -ModelId $Model.Id -ErrorAction Stop
+				$BpaResults = @(Get-BpaResult -ModelId $Model.Id -ErrorAction Stop)
 				if ($Category) {
-					$BpaResults = $BpaResults | Where-Object { $Category -contains $_.Category }
+					$BpaResults = @($BpaResults | Where-Object { $Category -contains $_.Category })
 				}
 				# Filter to non-compliant, actionable results
-				$BpaResults = $BpaResults | Where-Object { $_.Compliance -ne $true -and $_.Severity -ne 'Informational' }
+				$BpaResults = @($BpaResults | Where-Object { $_.Compliance -ne $true -and $_.Severity -ne 'Informational' })
 			} catch {
 				Write-Warning "Failed to get BPA results for $($Model.Id): $_"
 				continue
@@ -458,14 +463,20 @@ Function Invoke-DNSRemediation {
 		})
 	}
 
+	$ZonesChecked = 0
+	$ZonesAlreadyCompliant = 0
+
 	foreach ($Zone in $Zones) {
 		# Only adjust zones that have no secondary servers configured
 		if (-not ($null -eq $Zone.SecondaryServers -or $Zone.SecondaryServers.Count -eq 0)) {
 			continue
 		}
 
+		$ZonesChecked++
+
 		if ($Zone.Notify -eq 'NoNotify') {
 			Write-Verbose "DNS: Zone $($Zone.ZoneName) already set to NoNotify"
+			$ZonesAlreadyCompliant++
 			continue
 		}
 
@@ -500,6 +511,17 @@ Function Invoke-DNSRemediation {
 		}
 	}
 
+	# If we checked zones but all were already compliant, report that
+	if ($ZonesChecked -gt 0 -and $PartialResults.Count -eq 0) {
+		return @([PSCustomObject]@{
+			Target = $null
+			Status = 'Skipped'
+			PreviousValue = 'NoNotify'
+			NewValue = 'NoNotify'
+			Reason = "All $ZonesAlreadyCompliant applicable DNS zone(s) already set to NoNotify"
+		})
+	}
+
 	return @($PartialResults)
 }
 
@@ -523,14 +545,15 @@ Function Invoke-DHCPRemediation {
 		})
 	}
 
-	# DNS credential findings always require manual attention
-	if ($Finding.Title -match 'DNS.*credential|credential.*DNS|dynamic update|DHCP.*DNS') {
+	# DNS dynamic update findings require manual attention (credential patterns already
+	# caught by ManualReviewPatterns in the main function, so only check non-overlapping patterns)
+	if ($Finding.Title -match 'dynamic update|DHCP.*DNS' -or $Finding.Problem -match 'dynamic update|DHCP.*DNS') {
 		return @([PSCustomObject]@{
 			Target = $null
 			Status = 'ManualRequired'
 			PreviousValue = $null
 			NewValue = $null
-			Reason = 'DHCP DNS credential configuration requires manual setup - cannot auto-configure credentials'
+			Reason = 'DHCP DNS configuration requires manual setup'
 		})
 	}
 

@@ -24,18 +24,19 @@
     The Application (client) ID of the App Registration.
 
 .PARAMETER ClientSecret
-    The client secret for the App Registration.
+    The client secret for the App Registration, as a SecureString.
 
 .PARAMETER TimestampServer
     The RFC 3161 timestamp server URL. Defaults to DigiCert's timestamp server.
     Timestamping ensures signatures remain valid after the certificate expires.
 
 .PARAMETER RepoRoot
-    The root directory of the repository. Defaults to the script's parent directory.
+    The root directory of the repository. Defaults to the directory containing this script.
 
 .EXAMPLE
+    $secret = ConvertTo-SecureString -String "xxxxx" -AsPlainText -Force
     .\Sign-Scripts.ps1 -VaultName "my-vault" -CertName "code-signing" `
-        -TenantId "xxxxx" -ClientId "xxxxx" -ClientSecret "xxxxx"
+        -TenantId "xxxxx" -ClientId "xxxxx" -ClientSecret $secret
 #>
 
 [CmdletBinding()]
@@ -53,21 +54,16 @@ param(
     [string]$ClientId,
 
     [Parameter(Mandatory = $true)]
-    [string]$ClientSecret,
+    [SecureString]$ClientSecret,
 
     [Parameter(Mandatory = $false)]
     [string]$TimestampServer = "http://timestamp.digicert.com",
 
     [Parameter(Mandatory = $false)]
-    [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot)
+    [string]$RepoRoot = $PSScriptRoot
 )
 
 $ErrorActionPreference = "Stop"
-
-# If running from the repo root (e.g., CI), adjust RepoRoot
-if ($RepoRoot -eq "") {
-    $RepoRoot = $PSScriptRoot
-}
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Code Signing - Azure Key Vault" -ForegroundColor Cyan
@@ -94,8 +90,7 @@ Write-Host "  Modules ready." -ForegroundColor Green
 # -------------------------------------------------------------------
 Write-Host "[2/5] Authenticating to Azure..." -ForegroundColor Yellow
 
-$secureSecret = ConvertTo-SecureString -String $ClientSecret -AsPlainText -Force
-$credential = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+$credential = New-Object System.Management.Automation.PSCredential($ClientId, $ClientSecret)
 Connect-AzAccount -ServicePrincipal -Credential $credential -Tenant $TenantId | Out-Null
 
 Write-Host "  Authenticated as Service Principal ($ClientId)." -ForegroundColor Green
@@ -109,11 +104,16 @@ Write-Host "[3/5] Retrieving certificate '$CertName' from vault '$VaultName'..."
 # This requires the App Registration to have "Get" permission on Key Vault Secrets.
 $secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
 $pfxBytes = [Convert]::FromBase64String($secret)
-$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-    $pfxBytes,
-    [string]::Empty,
-    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-)
+try {
+    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $pfxBytes,
+        [string]::Empty,
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+    )
+}
+catch {
+    throw "Failed to load PFX from Key Vault. The certificate may be password-protected or in an unexpected format. Ensure it was imported to Key Vault as an exportable PFX without a password. Inner error: $($_.Exception.Message)"
+}
 
 if (-not $cert.HasPrivateKey) {
     throw "Certificate '$CertName' does not have a private key. Ensure the Key Vault certificate has an exportable private key."
@@ -128,6 +128,10 @@ $hasCodeSigningEku = $cert.Extensions |
 
 if (-not $hasCodeSigningEku) {
     Write-Warning "Certificate '$CertName' does not have the Code Signing enhanced key usage (EKU). Signing may fail."
+}
+
+if ($cert.NotAfter -lt (Get-Date)) {
+    throw "Certificate '$CertName' expired on $($cert.NotAfter.ToString('yyyy-MM-dd')). Renew it in Key Vault before signing."
 }
 
 Write-Host "  Certificate retrieved successfully." -ForegroundColor Green
@@ -185,7 +189,6 @@ Write-Host "[5/5] Signing scripts..." -ForegroundColor Yellow
 
 $signed = 0
 $failed = 0
-$skipped = 0
 
 foreach ($file in $filesToSign) {
     $relativePath = $file.FullName.Replace($RepoRoot, "").TrimStart("\", "/")
@@ -221,7 +224,7 @@ Write-Host "  Failed:  $failed" -ForegroundColor $(if ($failed -gt 0) { "Red" } 
 Write-Host "  Total:   $($filesToSign.Count)" -ForegroundColor Cyan
 
 if ($failed -gt 0) {
-    Write-Error "$failed file(s) failed to sign."
+    Write-Host "$failed file(s) failed to sign." -ForegroundColor Red
     exit 1
 }
 

@@ -44,13 +44,16 @@ jobs:
             -ClientSecret $secureSecret `
             -RepoRoot '${{ github.workspace }}'
 
+      # NOTE: If branch protection is enabled on main, the GITHUB_TOKEN may not
+      # have permission to push. In that case, either allow Actions to bypass
+      # branch protection, or use a PAT stored as a separate secret for the token.
       - name: Commit signed scripts
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          $changes = git diff --name-only
+          $changes = git diff --name-only HEAD
           if ($changes) {
             git add -- $changes
             git commit -m "chore: apply Authenticode signatures to scripts [skip ci]"

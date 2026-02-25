@@ -81,7 +81,7 @@ foreach ($mod in $requiredModules) {
         Write-Host "  Installing $mod..."
         Install-Module -Name $mod -Force -Scope CurrentUser -AllowClobber
     }
-    Import-Module $mod -Force
+    Import-Module $mod
 }
 Write-Host "  Modules ready." -ForegroundColor Green
 
@@ -114,6 +114,10 @@ try {
 catch {
     throw "Failed to load PFX from Key Vault. The certificate may be password-protected or in an unexpected format. Ensure it was imported to Key Vault as an exportable PFX without a password. Inner error: $($_.Exception.Message)"
 }
+finally {
+    # Zero out private key material from memory
+    [System.Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+}
 
 if (-not $cert.HasPrivateKey) {
     throw "Certificate '$CertName' does not have a private key. Ensure the Key Vault certificate has an exportable private key."
@@ -121,10 +125,11 @@ if (-not $cert.HasPrivateKey) {
 
 # Verify the certificate has the Code Signing EKU
 $codeSigningOid = "1.3.6.1.5.5.7.3.3"
-$hasCodeSigningEku = $cert.Extensions |
+$hasCodeSigningEku = ($cert.Extensions |
     Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
     ForEach-Object { $_.EnhancedKeyUsages } |
-    Where-Object { $_.Value -eq $codeSigningOid }
+    Where-Object { $_.Value -eq $codeSigningOid } |
+    Measure-Object).Count -gt 0
 
 if (-not $hasCodeSigningEku) {
     Write-Warning "Certificate '$CertName' does not have the Code Signing enhanced key usage (EKU). Signing may fail."
@@ -132,6 +137,11 @@ if (-not $hasCodeSigningEku) {
 
 if ($cert.NotAfter -lt (Get-Date)) {
     throw "Certificate '$CertName' expired on $($cert.NotAfter.ToString('yyyy-MM-dd')). Renew it in Key Vault before signing."
+}
+
+$daysUntilExpiry = ($cert.NotAfter - (Get-Date)).Days
+if ($daysUntilExpiry -le 30) {
+    Write-Warning "Certificate '$CertName' expires in $daysUntilExpiry day(s) on $($cert.NotAfter.ToString('yyyy-MM-dd')). Renew it soon."
 }
 
 Write-Host "  Certificate retrieved successfully." -ForegroundColor Green
@@ -155,7 +165,7 @@ $excludeFiles = @(
 $filesToSign = @()
 
 # All .ps1 and .psm1 files anywhere in the repo
-$filesToSign += Get-ChildItem -Path $RepoRoot -Include "*.ps1", "*.psm1" -Recurse -File |
+$filesToSign += Get-ChildItem -Path (Join-Path $RepoRoot '*') -Include "*.ps1", "*.psm1" -Recurse -File |
     Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' }
 
 # .txt files in Functions/, OneOffs/, and Scripts/ (these are PowerShell per .gitattributes)
@@ -178,7 +188,8 @@ if (Test-Path $loadFunctions) {
 $filesToSign = $filesToSign | Sort-Object FullName -Unique
 
 # Exclude the signing script itself
-$filesToSign = $filesToSign | Where-Object { $_.Name -ne "Sign-Scripts.ps1" }
+$selfPath = $MyInvocation.MyCommand.Path
+$filesToSign = $filesToSign | Where-Object { $_.FullName -ne $selfPath }
 
 Write-Host "  Found $($filesToSign.Count) files to sign." -ForegroundColor Green
 
@@ -211,6 +222,9 @@ foreach ($file in $filesToSign) {
         $failed++
     }
 }
+
+# Release the private key from memory
+$cert.Dispose()
 
 # -------------------------------------------------------------------
 # Summary

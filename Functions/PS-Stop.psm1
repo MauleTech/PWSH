@@ -126,18 +126,18 @@ Function Stop-StuckService {
             # Re-check ProcessId before kill — the display and kill blocks are intentionally
             # separate so that service/dependency info is always shown even in -WhatIf mode.
             If ($ProcessId -and $ProcessId -ne 0) {
-                # Gate shared-process kills with an explicit confirmation prompt
-                If ($IsSharedSvchost) {
-                    $SharedCount = @($SharedServices).Count
-                    If (-not $PSCmdlet.ShouldContinue(
-                        "PID $ProcessId is shared by $SharedCount other service(s). Continue?",
-                        "Shared svchost.exe Process")) {
-                        Write-Host "Aborted — shared process kill declined by user." -ForegroundColor Yellow
-                        Continue
-                    }
-                }
-
                 If ($PSCmdlet.ShouldProcess("$($Service.ServiceName) (PID: $ProcessId)", "Stop-Process -Force")) {
+                    # Gate shared-process kills with an explicit confirmation prompt
+                    If ($IsSharedSvchost) {
+                        $SharedCount = @($SharedServices).Count
+                        If (-not $PSCmdlet.ShouldContinue(
+                            "PID $ProcessId is shared by $SharedCount other service(s). Continue?",
+                            "Shared svchost.exe Process")) {
+                            Write-Host "Aborted — shared process kill declined by user." -ForegroundColor Yellow
+                            Continue
+                        }
+                    }
+
                     Write-Host "`nForce-killing process $ProcessId for service '$($Service.ServiceName)'..." -ForegroundColor Red
                     Try {
                         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
@@ -149,7 +149,11 @@ Function Stop-StuckService {
                             $CheckService = Get-Service -Name $Service.ServiceName -ErrorAction SilentlyContinue
                             If ($CheckService.Status -eq 'Stopped') { Break }
                         }
-                        Write-Host "Service status after kill: $($CheckService.Status)" -ForegroundColor Cyan
+                        If ($CheckService) {
+                            Write-Host "Service status after kill: $($CheckService.Status)" -ForegroundColor Cyan
+                        } Else {
+                            Write-Host "Service entry no longer exists after kill." -ForegroundColor Yellow
+                        }
                     } Catch {
                         Write-Host "Failed to kill process ${ProcessId}: $($_.Exception.Message)" -ForegroundColor Red
                     }

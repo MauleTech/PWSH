@@ -47,7 +47,12 @@ Function Stop-StuckService {
             }
 
             # Get the CIM service object for the PID and path info
-            $CimService = Get-CimInstance Win32_Service -Filter "Name='$($Service.ServiceName)'"
+            $EscapedName = $Service.ServiceName -replace "'", "\'"
+            $CimService = Get-CimInstance Win32_Service -Filter "Name='$EscapedName'" -ErrorAction SilentlyContinue
+            If (-not $CimService) {
+                Write-Warning "Could not retrieve CIM data for service '$($Service.ServiceName)'. Skipping."
+                Continue
+            }
             $ProcessId = $CimService.ProcessId
 
             # Display detailed service information
@@ -60,6 +65,7 @@ Function Stop-StuckService {
             Write-Host "Path          : $($CimService.PathName)"
             Write-Host "Process ID    : $ProcessId"
 
+            $IsSharedSvchost = $false
             If ($ProcessId -and $ProcessId -ne 0) {
                 Try {
                     $Process = Get-Process -Id $ProcessId -ErrorAction Stop
@@ -80,11 +86,12 @@ Function Stop-StuckService {
 
                     Write-Host "Handle Count  : $($Process.HandleCount)"
 
-                    # Warn about shared svchost.exe processes
+                    # Detect shared svchost.exe processes and flag for confirmation
                     If ($Process.ProcessName -eq 'svchost') {
                         $SharedServices = Get-CimInstance Win32_Service -Filter "ProcessId=$ProcessId" |
                             Where-Object { $_.Name -ne $Service.ServiceName }
                         If ($SharedServices) {
+                            $IsSharedSvchost = $true
                             Write-Host "`n----- WARNING: Shared Process -----" -ForegroundColor Red
                             Write-Host "This service runs in a shared svchost.exe process." -ForegroundColor Red
                             Write-Host "Killing PID $ProcessId will also stop these services:" -ForegroundColor Red
@@ -94,7 +101,7 @@ Function Stop-StuckService {
                         }
                     }
                 } Catch {
-                    Write-Host "`nCould not retrieve process details: $_" -ForegroundColor Red
+                    Write-Host "`nCould not retrieve process details: $($_.Exception.Message)" -ForegroundColor Red
                 }
             } Else {
                 Write-Host "`nNo running process found for this service." -ForegroundColor Yellow
@@ -116,19 +123,35 @@ Function Stop-StuckService {
                 }
             }
 
-            # Kill the process unless -WhatIf
+            # Re-check ProcessId before kill — the display and kill blocks are intentionally
+            # separate so that service/dependency info is always shown even in -WhatIf mode.
             If ($ProcessId -and $ProcessId -ne 0) {
+                # Gate shared-process kills with an explicit confirmation prompt
+                If ($IsSharedSvchost) {
+                    $SharedCount = @($SharedServices).Count
+                    If (-not $PSCmdlet.ShouldContinue(
+                        "PID $ProcessId is shared by $SharedCount other service(s). Continue?",
+                        "Shared svchost.exe Process")) {
+                        Write-Host "Aborted — shared process kill declined by user." -ForegroundColor Yellow
+                        Continue
+                    }
+                }
+
                 If ($PSCmdlet.ShouldProcess("$($Service.ServiceName) (PID: $ProcessId)", "Stop-Process -Force")) {
                     Write-Host "`nForce-killing process $ProcessId for service '$($Service.ServiceName)'..." -ForegroundColor Red
                     Try {
                         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
                         Write-Host "Process $ProcessId terminated successfully." -ForegroundColor Green
 
-                        Start-Sleep -Seconds 2
-                        $CheckService = Get-Service -Name $Service.ServiceName -ErrorAction SilentlyContinue
+                        # Poll for service state transition (up to 3 attempts, 1 second apart)
+                        ForEach ($i in 1..3) {
+                            Start-Sleep -Seconds 1
+                            $CheckService = Get-Service -Name $Service.ServiceName -ErrorAction SilentlyContinue
+                            If ($CheckService.Status -eq 'Stopped') { Break }
+                        }
                         Write-Host "Service status after kill: $($CheckService.Status)" -ForegroundColor Cyan
                     } Catch {
-                        Write-Host "Failed to kill process $ProcessId`: $_" -ForegroundColor Red
+                        Write-Host "Failed to kill process ${ProcessId}: $($_.Exception.Message)" -ForegroundColor Red
                     }
                 }
             } Else {

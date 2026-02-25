@@ -102,16 +102,37 @@ Write-Host "[3/5] Retrieving certificate '$CertName' from vault '$VaultName'..."
 
 # The certificate's private key is accessed via the Secrets API (PFX format).
 # This requires the App Registration to have "Get" permission on Key Vault Secrets.
-$secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
-$pfxBytes = [Convert]::FromBase64String($secret)
+$secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName
+
+# Validate content type — we need PFX (PKCS#12), not PEM
+$contentType = $secret.ContentType
+Write-Host "  Content type: $contentType" -ForegroundColor Gray
+if ($contentType -eq 'application/x-pem-file') {
+    throw "Certificate '$CertName' uses PEM content type in Key Vault. Re-import it as PFX (PKCS#12) format so the private key can be loaded by this script."
+}
+
+# Extract the base64-encoded PFX from the SecureString value.
+# Using Marshal rather than -AsPlainText to avoid potential encoding issues.
+$ssPtr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret.SecretValue)
 try {
-    # EphemeralKeySet keeps the private key in memory only, avoiding permission
-    # issues with the Windows certificate store on CI runners.
+    $base64Value = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ssPtr)
+}
+finally {
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ssPtr)
+}
+
+$pfxBytes = [Convert]::FromBase64String($base64Value)
+$base64Value = $null
+Write-Host "  PFX data size: $($pfxBytes.Length) bytes" -ForegroundColor Gray
+
+try {
+    # MachineKeySet is required for service accounts and CI runners where the
+    # user profile may not be fully loaded (e.g., GitHub Actions windows-latest).
     $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
         $pfxBytes,
         [string]::Empty,
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet -bor
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
     )
 }
 catch {

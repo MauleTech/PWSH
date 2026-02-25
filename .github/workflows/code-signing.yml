@@ -1,0 +1,65 @@
+name: Code Signing
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Functions/**"
+      - "Scripts/**"
+      - "OneOffs/**"
+      - "LoadFunctions.txt"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sign-scripts:
+    name: Sign PowerShell Scripts
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign scripts with Azure Key Vault certificate
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_VAULT_NAME: ${{ secrets.AZURE_VAULT_NAME }}
+          AZURE_CERT_NAME: ${{ secrets.AZURE_CERT_NAME }}
+        run: |
+          $secureSecret = ConvertTo-SecureString -String $env:AZURE_CLIENT_SECRET -AsPlainText -Force
+          .\Sign-Scripts.ps1 `
+            -VaultName $env:AZURE_VAULT_NAME `
+            -CertName $env:AZURE_CERT_NAME `
+            -TenantId $env:AZURE_TENANT_ID `
+            -ClientId $env:AZURE_CLIENT_ID `
+            -ClientSecret $secureSecret `
+            -RepoRoot '${{ github.workspace }}'
+
+      # NOTE: If branch protection is enabled on main, the GITHUB_TOKEN may not
+      # have permission to push. In that case, either allow Actions to bypass
+      # branch protection, or use a PAT stored as a separate secret for the token.
+      - name: Commit signed scripts
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          $changes = git diff --name-only HEAD
+          if ($changes) {
+            git add -- $changes
+            git commit -m "chore: apply Authenticode signatures to scripts [skip ci]"
+            git push
+            Write-Host "Signed scripts committed and pushed."
+          }
+          else {
+            Write-Host "No signing changes to commit."
+          }

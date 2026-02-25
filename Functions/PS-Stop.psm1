@@ -123,7 +123,7 @@ Function Stop-StuckService {
                 }
             }
 
-            # Re-check ProcessId before kill — the display and kill blocks are intentionally
+            # Re-check ProcessId before kill -- the display and kill blocks are intentionally
             # separate so that service/dependency info is always shown even in -WhatIf mode.
             If ($ProcessId -and $ProcessId -ne 0) {
                 If ($PSCmdlet.ShouldProcess("$($Service.ServiceName) (PID: $ProcessId)", "Stop-Process -Force")) {
@@ -133,7 +133,7 @@ Function Stop-StuckService {
                         If (-not $PSCmdlet.ShouldContinue(
                             "PID $ProcessId is shared by $SharedCount other service(s). Continue?",
                             "Shared svchost.exe Process")) {
-                            Write-Host "Aborted — shared process kill declined by user." -ForegroundColor Yellow
+                            Write-Host "Aborted - shared process kill declined by user." -ForegroundColor Yellow
                             Continue
                         }
                     }

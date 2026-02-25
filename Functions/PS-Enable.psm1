@@ -168,6 +168,239 @@ Function Enable-O365AuditLog {
 		}
 	}
 
+	Function Enable-RemoteManagement {
+		<#
+			.SYNOPSIS
+				Enables remote management capabilities on a Windows computer including Remote Registry, Admin Shares, PowerShell Remoting, WMI, PSExec support, and PRTG monitoring access. Also calls Enable-RDP.
+
+			.DESCRIPTION
+				This function configures a Windows computer to accept common remote management protocols:
+				- Remote Registry service (started and set to Automatic)
+				- Administrative Shares (ADMIN$, C$) via registry and Server service restart
+				- PowerShell Remoting (WinRM via Enable-PSRemoting)
+				- WMI firewall rules for remote management
+				- File and Printer Sharing firewall rules (required for PSExec)
+				- ICMP (ping) firewall rules for PRTG and general monitoring
+				- Remote Desktop Protocol via Enable-RDP
+
+			.EXAMPLE
+				Enable-RemoteManagement
+
+			.NOTES
+				Requires Administrator privileges.
+				Should be run locally on the target machine.
+		#>
+
+		# Check for Administrator privileges
+		$IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+		If (-not $IsAdmin) {
+			Write-Warning "This function requires Administrator privileges. Please run as Administrator."
+			return
+		}
+
+		Write-Host "=== Enabling Remote Management ===" -ForegroundColor Cyan
+
+		# 1. Enable Remote Registry
+		Write-Host "`nStep 1: Enabling Remote Registry service..." -ForegroundColor Yellow
+		Try {
+			$RemoteRegistry = Get-Service -Name "RemoteRegistry" -ErrorAction Stop
+			If ($RemoteRegistry.StartType -ne "Automatic") {
+				Set-Service -Name "RemoteRegistry" -StartupType Automatic -ErrorAction Stop
+				Write-Host "  [SUCCESS] RemoteRegistry set to Automatic startup" -ForegroundColor Green
+			} Else {
+				Write-Host "  [OK] RemoteRegistry already set to Automatic" -ForegroundColor Green
+			}
+			If ($RemoteRegistry.Status -ne "Running") {
+				Start-Service -Name "RemoteRegistry" -ErrorAction Stop
+				Write-Host "  [SUCCESS] RemoteRegistry service started" -ForegroundColor Green
+			} Else {
+				Write-Host "  [OK] RemoteRegistry service is already running" -ForegroundColor Green
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure Remote Registry: $_"
+		}
+
+		# 2. Enable Administrative Shares (ADMIN$, C$)
+		Write-Host "`nStep 2: Enabling Administrative Shares..." -ForegroundColor Yellow
+		Try {
+			$RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+			$ShareSettingChanged = $false
+
+			$CurrentValue = Get-ItemProperty -Path $RegPath -Name "AutoShareWks" -ErrorAction SilentlyContinue
+
+			# AutoShareWks = 1 enables admin shares on workstations, absence of the value also means enabled (default)
+			If ($CurrentValue.AutoShareWks -eq 0) {
+				Set-ItemProperty -Path $RegPath -Name "AutoShareWks" -Value 1 -Type DWord -ErrorAction Stop
+				Write-Host "  [SUCCESS] Administrative Shares enabled via AutoShareWks registry value" -ForegroundColor Green
+				$ShareSettingChanged = $true
+			} Else {
+				Write-Host "  [OK] Administrative Shares are already enabled (AutoShareWks)" -ForegroundColor Green
+			}
+
+			# Also check AutoShareServer for server OS
+			$ServerValue = Get-ItemProperty -Path $RegPath -Name "AutoShareServer" -ErrorAction SilentlyContinue
+			If ($ServerValue.AutoShareServer -eq 0) {
+				Set-ItemProperty -Path $RegPath -Name "AutoShareServer" -Value 1 -Type DWord -ErrorAction Stop
+				Write-Host "  [SUCCESS] Administrative Shares enabled via AutoShareServer registry value" -ForegroundColor Green
+				$ShareSettingChanged = $true
+			} Else {
+				Write-Host "  [OK] Administrative Shares are already enabled (AutoShareServer)" -ForegroundColor Green
+			}
+
+			# Only restart the Server service if we changed a registry value
+			If ($ShareSettingChanged) {
+				$LanmanServer = Get-Service -Name "LanmanServer" -ErrorAction SilentlyContinue
+				If ($LanmanServer -and $LanmanServer.Status -eq "Running") {
+					Restart-Service -Name "LanmanServer" -Force -ErrorAction Stop
+					Write-Host "  [SUCCESS] Server service restarted to apply share settings" -ForegroundColor Green
+				}
+			}
+
+			# Verify shares exist
+			$AdminShare = Get-SmbShare -Name "ADMIN$" -ErrorAction SilentlyContinue
+			$CShare = Get-SmbShare -Name "C$" -ErrorAction SilentlyContinue
+			If ($AdminShare -and $CShare) {
+				Write-Host "  [OK] ADMIN$ and C$ shares are present" -ForegroundColor Green
+			} Else {
+				Write-Warning "  [WARNING] Admin shares may require a reboot to appear"
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure Administrative Shares: $_"
+		}
+
+		# 3. Enable PowerShell Remoting (WinRM)
+		Write-Host "`nStep 3: Enabling PowerShell Remoting (WinRM)..." -ForegroundColor Yellow
+		Try {
+			$WinRM = Get-Service -Name "WinRM" -ErrorAction Stop
+			If ($WinRM.Status -eq "Running") {
+				# Test if PSRemoting is already functional
+				$SessionConfig = Get-PSSessionConfiguration -Name "Microsoft.PowerShell" -ErrorAction SilentlyContinue
+				If ($SessionConfig) {
+					Write-Host "  [OK] PowerShell Remoting is already enabled and configured" -ForegroundColor Green
+				} Else {
+					Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop
+					Write-Host "  [SUCCESS] PowerShell Remoting enabled" -ForegroundColor Green
+				}
+			} Else {
+				Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop
+				Write-Host "  [SUCCESS] PowerShell Remoting enabled and WinRM started" -ForegroundColor Green
+			}
+
+			# Refresh service object since Enable-PSRemoting may have changed startup type
+			$WinRM = Get-Service -Name "WinRM" -ErrorAction Stop
+			If ($WinRM.StartType -ne "Automatic") {
+				Set-Service -Name "WinRM" -StartupType Automatic -ErrorAction Stop
+				Write-Host "  [SUCCESS] WinRM set to Automatic startup" -ForegroundColor Green
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure PowerShell Remoting: $_"
+		}
+
+		# 4. Enable WMI Through Firewall
+		Write-Host "`nStep 4: Enabling WMI firewall rules..." -ForegroundColor Yellow
+		Try {
+			$WMIRules = Get-NetFirewallRule -DisplayGroup "Windows Management Instrumentation (WMI)" -ErrorAction SilentlyContinue
+
+			If ($WMIRules) {
+				ForEach ($Rule in $WMIRules) {
+					If ($Rule.Enabled -eq $false) {
+						Enable-NetFirewallRule -Name $Rule.Name -ErrorAction Stop
+						Write-Host "  [SUCCESS] Enabled firewall rule: $($Rule.DisplayName)" -ForegroundColor Green
+					} Else {
+						Write-Host "  [OK] Firewall rule already enabled: $($Rule.DisplayName)" -ForegroundColor Green
+					}
+				}
+			} Else {
+				Write-Warning "  [WARNING] WMI firewall rule group not found"
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure WMI firewall rules: $_"
+		}
+
+		# 5. Enable File and Printer Sharing (required for PSExec and admin share access)
+		Write-Host "`nStep 5: Enabling File and Printer Sharing firewall rules (PSExec support)..." -ForegroundColor Yellow
+		Try {
+			$FPSRules = Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" -ErrorAction SilentlyContinue
+
+			If ($FPSRules) {
+				ForEach ($Rule in $FPSRules) {
+					If ($Rule.Enabled -eq $false) {
+						Enable-NetFirewallRule -Name $Rule.Name -ErrorAction Stop
+						Write-Host "  [SUCCESS] Enabled firewall rule: $($Rule.DisplayName)" -ForegroundColor Green
+					} Else {
+						Write-Host "  [OK] Firewall rule already enabled: $($Rule.DisplayName)" -ForegroundColor Green
+					}
+				}
+			} Else {
+				Write-Warning "  [WARNING] File and Printer Sharing firewall rule group not found"
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure File and Printer Sharing firewall rules: $_"
+		}
+
+		# 6. Enable ICMP (Ping) for PRTG and monitoring tools
+		Write-Host "`nStep 6: Enabling ICMP (Ping) for PRTG and monitoring..." -ForegroundColor Yellow
+		Try {
+			# Enable ICMPv4 Echo Request
+			$ICMPv4Rule = Get-NetFirewallRule -Name "CoreNet-Diag-ICMP4-EchoRequest-In" -ErrorAction SilentlyContinue
+			If ($ICMPv4Rule) {
+				If ($ICMPv4Rule.Enabled -eq $false) {
+					Enable-NetFirewallRule -Name "CoreNet-Diag-ICMP4-EchoRequest-In" -ErrorAction Stop
+					Write-Host "  [SUCCESS] Enabled ICMPv4 Echo Request (Ping)" -ForegroundColor Green
+				} Else {
+					Write-Host "  [OK] ICMPv4 Echo Request (Ping) already enabled" -ForegroundColor Green
+				}
+			} Else {
+				# Create the rule if it doesn't exist
+				New-NetFirewallRule -DisplayName "Allow ICMPv4 Echo Request" `
+					-Name "Custom-ICMPv4-EchoRequest-In" `
+					-Protocol ICMPv4 `
+					-IcmpType 8 `
+					-Direction Inbound `
+					-Action Allow `
+					-Enabled True `
+					-ErrorAction Stop | Out-Null
+				Write-Host "  [SUCCESS] Created ICMPv4 Echo Request firewall rule" -ForegroundColor Green
+			}
+
+			# Enable Remote Event Log Management for PRTG WMI sensors
+			$EventLogRules = Get-NetFirewallRule -DisplayGroup "Remote Event Log Management" -ErrorAction SilentlyContinue
+			If ($EventLogRules) {
+				ForEach ($Rule in $EventLogRules) {
+					If ($Rule.Enabled -eq $false) {
+						Enable-NetFirewallRule -Name $Rule.Name -ErrorAction Stop
+						Write-Host "  [SUCCESS] Enabled firewall rule: $($Rule.DisplayName)" -ForegroundColor Green
+					} Else {
+						Write-Host "  [OK] Firewall rule already enabled: $($Rule.DisplayName)" -ForegroundColor Green
+					}
+				}
+			}
+		} Catch {
+			Write-Warning "  [ERROR] Failed to configure ICMP/monitoring firewall rules: $_"
+		}
+
+		# 7. Enable Remote Desktop via Enable-RDP
+		Write-Host "`nStep 7: Enabling Remote Desktop..." -ForegroundColor Yellow
+		Try {
+			Enable-RDP
+		} Catch {
+			Write-Warning "  [ERROR] Failed to run Enable-RDP: $_"
+		}
+
+		# Final Summary
+		Write-Host "`n========================================" -ForegroundColor Cyan
+		Write-Host "=== Remote Management Configuration Complete ===" -ForegroundColor Green
+		Write-Host "`nThe following remote management capabilities have been configured:" -ForegroundColor Cyan
+		Write-Host "  - Remote Registry (service running, set to Automatic)" -ForegroundColor White
+		Write-Host "  - Administrative Shares (ADMIN$, C$)" -ForegroundColor White
+		Write-Host "  - PowerShell Remoting (WinRM)" -ForegroundColor White
+		Write-Host "  - WMI (firewall rules enabled)" -ForegroundColor White
+		Write-Host "  - PSExec (File and Printer Sharing enabled)" -ForegroundColor White
+		Write-Host "  - PRTG Monitoring (ICMP, WMI, Remote Event Log)" -ForegroundColor White
+		Write-Host "  - Remote Desktop (RDP)" -ForegroundColor White
+		Write-Host "========================================`n" -ForegroundColor Cyan
+	}
+
 	Function Enable-RDP {
 		<#
 			.SYNOPSIS

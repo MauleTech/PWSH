@@ -8,11 +8,12 @@ Function Stop-StuckService {
     Stop-Process -Force to forcefully terminate the process. Accepts service name, display name,
     or pipeline input from Get-Service.
 
+    WARNING: If the service runs in a shared svchost.exe process, all services sharing that
+    process will be affected. The function detects this and lists co-hosted services before
+    proceeding.
+
 .PARAMETER Name
     The service name or display name of the stuck service.
-
-.PARAMETER WhatIf
-    Shows detailed service and process information without killing the process.
 
 .EXAMPLE
     Stop-StuckService -Name wuauserv
@@ -38,16 +39,16 @@ Function Stop-StuckService {
             # Try to find the service by Name first, then by DisplayName
             $Service = Get-Service -Name $SvcIdentifier -ErrorAction SilentlyContinue
             If (-not $Service) {
-                $Service = Get-Service | Where-Object { $_.DisplayName -eq $SvcIdentifier }
+                $Service = Get-Service -DisplayName $SvcIdentifier -ErrorAction SilentlyContinue
             }
             If (-not $Service) {
                 Write-Warning "Service not found: $SvcIdentifier"
                 Continue
             }
 
-            # Get the WMI service object for the PID and path info
-            $WmiService = Get-WmiObject Win32_Service -Filter "Name='$($Service.ServiceName)'"
-            $ProcessId = $WmiService.ProcessId
+            # Get the CIM service object for the PID and path info
+            $CimService = Get-CimInstance Win32_Service -Filter "Name='$($Service.ServiceName)'"
+            $ProcessId = $CimService.ProcessId
 
             # Display detailed service information
             Write-Host "`n===== Service Details =====" -ForegroundColor Cyan
@@ -55,8 +56,8 @@ Function Stop-StuckService {
             Write-Host "Display Name  : $($Service.DisplayName)"
             Write-Host "Status        : $($Service.Status)"
             Write-Host "Start Type    : $($Service.StartType)"
-            Write-Host "Service Type  : $($WmiService.ServiceType)"
-            Write-Host "Path          : $($WmiService.PathName)"
+            Write-Host "Service Type  : $($CimService.ServiceType)"
+            Write-Host "Path          : $($CimService.PathName)"
             Write-Host "Process ID    : $ProcessId"
 
             If ($ProcessId -and $ProcessId -ne 0) {
@@ -65,11 +66,33 @@ Function Stop-StuckService {
                     Write-Host "`n----- Process Details -----" -ForegroundColor Yellow
                     Write-Host "Process Name  : $($Process.ProcessName)"
                     Write-Host "PID           : $($Process.Id)"
-                    Write-Host "CPU (seconds) : $([math]::Round($Process.CPU, 2))"
+
+                    $CpuDisplay = If ($null -ne $Process.CPU) { "$([math]::Round($Process.CPU, 2))" } Else { "N/A" }
+                    Write-Host "CPU (seconds) : $CpuDisplay"
                     Write-Host "Memory (MB)   : $([math]::Round($Process.WorkingSet64 / 1MB, 2))"
                     Write-Host "Threads       : $($Process.Threads.Count)"
-                    Write-Host "Start Time    : $($Process.StartTime)"
+
+                    Try {
+                        Write-Host "Start Time    : $($Process.StartTime)"
+                    } Catch {
+                        Write-Host "Start Time    : N/A (access denied)"
+                    }
+
                     Write-Host "Handle Count  : $($Process.HandleCount)"
+
+                    # Warn about shared svchost.exe processes
+                    If ($Process.ProcessName -eq 'svchost') {
+                        $SharedServices = Get-CimInstance Win32_Service -Filter "ProcessId=$ProcessId" |
+                            Where-Object { $_.Name -ne $Service.ServiceName }
+                        If ($SharedServices) {
+                            Write-Host "`n----- WARNING: Shared Process -----" -ForegroundColor Red
+                            Write-Host "This service runs in a shared svchost.exe process." -ForegroundColor Red
+                            Write-Host "Killing PID $ProcessId will also stop these services:" -ForegroundColor Red
+                            $SharedServices | ForEach-Object {
+                                Write-Host "  $($_.Name) ($($_.DisplayName)) - $($_.State)" -ForegroundColor Red
+                            }
+                        }
+                    }
                 } Catch {
                     Write-Host "`nCould not retrieve process details: $_" -ForegroundColor Red
                 }
@@ -100,13 +123,13 @@ Function Stop-StuckService {
                     Try {
                         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
                         Write-Host "Process $ProcessId terminated successfully." -ForegroundColor Green
+
+                        Start-Sleep -Seconds 2
+                        $CheckService = Get-Service -Name $Service.ServiceName -ErrorAction SilentlyContinue
+                        Write-Host "Service status after kill: $($CheckService.Status)" -ForegroundColor Cyan
                     } Catch {
                         Write-Host "Failed to kill process $ProcessId`: $_" -ForegroundColor Red
                     }
-
-                    Start-Sleep -Seconds 2
-                    $CheckService = Get-Service -Name $Service.ServiceName -ErrorAction SilentlyContinue
-                    Write-Host "Service status after kill: $($CheckService.Status)" -ForegroundColor Cyan
                 }
             } Else {
                 Write-Host "`nNo process to kill - service has no running process." -ForegroundColor Yellow

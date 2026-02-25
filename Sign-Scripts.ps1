@@ -105,10 +105,13 @@ Write-Host "[3/5] Retrieving certificate '$CertName' from vault '$VaultName'..."
 $secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
 $pfxBytes = [Convert]::FromBase64String($secret)
 try {
+    # EphemeralKeySet keeps the private key in memory only, avoiding permission
+    # issues with the Windows certificate store on CI runners.
     $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
         $pfxBytes,
         [string]::Empty,
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
     )
 }
 catch {

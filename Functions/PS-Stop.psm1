@@ -5,7 +5,7 @@ Function Stop-StuckService {
 
 .DESCRIPTION
     Retrieves detailed information about a service and its underlying process, then uses
-    taskkill /F to forcefully terminate the process. Accepts service name, display name,
+    Stop-Process -Force to forcefully terminate the process. Accepts service name, display name,
     or pipeline input from Get-Service.
 
 .PARAMETER Name
@@ -95,10 +95,14 @@ Function Stop-StuckService {
 
             # Kill the process unless -WhatIf
             If ($ProcessId -and $ProcessId -ne 0) {
-                If ($PSCmdlet.ShouldProcess("$($Service.ServiceName) (PID: $ProcessId)", "taskkill /F")) {
+                If ($PSCmdlet.ShouldProcess("$($Service.ServiceName) (PID: $ProcessId)", "Stop-Process -Force")) {
                     Write-Host "`nForce-killing process $ProcessId for service '$($Service.ServiceName)'..." -ForegroundColor Red
-                    $Result = taskkill /F /PID $ProcessId 2>&1
-                    Write-Host $Result
+                    Try {
+                        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+                        Write-Host "Process $ProcessId terminated successfully." -ForegroundColor Green
+                    } Catch {
+                        Write-Host "Failed to kill process $ProcessId`: $_" -ForegroundColor Red
+                    }
 
                     Start-Sleep -Seconds 2
                     $CheckService = Get-Service -Name $Service.ServiceName -ErrorAction SilentlyContinue

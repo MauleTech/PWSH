@@ -137,7 +137,7 @@ Function Remove-StaleProfiles {
 	$thresholdDays = 731 #Days
 	Write-Host "Checking for stale profiles to clean up"
 	# Get a list of user profiles
-	$profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$thresholdDays) } | Where-Object { $_.Loaded -eq $False } | Where-Object { $_.LocalPath -notmatch 'atg|Remote Support|admin' }
+	$profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$thresholdDays) } | Where-Object { $_.Loaded -eq $False } | Where-Object { $_.LocalPath -notmatch 'Remote Support|admin' }
 	If ($profiles) {
 		foreach ($profile in $profiles) {
 			$localPath = $profile.LocalPath
@@ -233,7 +233,7 @@ $PathsToDelete = @(
 	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.ost") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST files that haven't been used in more than 30 days
 	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.bak") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST backup files that haven't been used in more than 30 days
 	(Join-Path -Path $Env:SystemDrive -ChildPath "Windows.old") ##Old windows install
-	(Join-Path -Path $Env:SystemDrive -ChildPath "Ambitions\NiniteDownloads")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "IT\NiniteDownloads")
 	(Join-Path -Path $Env:SystemDrive -ChildPath "adobeTemp")
 	(Join-Path -Path $Env:SystemRoot -ChildPath "debug\WIA\*.log")
 	(Join-Path -Path $Env:SystemRoot -ChildPath "INF\*.log*")

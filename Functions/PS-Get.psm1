@@ -98,7 +98,7 @@ Function Get-ADUserPassExpirations {
 		}
 		Else {
 			# otherwise, grid view UI
-			$adUserInfo | Out-GridView -Title "ATG Powershell --> User Password Expirations"
+			$adUserInfo | Out-GridView -Title "Powershell --> User Password Expirations"
 		}
 
 	}
@@ -379,21 +379,21 @@ function Get-BitLockerKey {
 		[Optional] Specify the name of the computer or a computer object from Get-ADComputer to retrieve the BitLockerKey for. 
 		Will copy the key to the clipboard if specified. If omitted, returns all computer BitLocker keys.
 	.EXAMPLE
-		Get-BitLockerKey -Computer "ACG-Desktop23"
-		
-		Retrieves the BitLocker key for ACG-Desktop23 and copies it to the clipboard.
+		Get-BitLockerKey -Computer "PC-Desktop23"
+
+		Retrieves the BitLocker key for PC-Desktop23 and copies it to the clipboard.
 	.EXAMPLE
 		Get-BitLockerKey
-		
+
 		Returns BitLocker keys for all computers in Active Directory.
 	.EXAMPLE
-		Get-ADComputer "ACG-Desktop23" | Get-BitLockerKey
-		
-		Retrieves the BitLocker key for ACG-Desktop23 using pipeline input from Get-ADComputer.
+		Get-ADComputer "PC-Desktop23" | Get-BitLockerKey
+
+		Retrieves the BitLocker key for PC-Desktop23 using pipeline input from Get-ADComputer.
 	.EXAMPLE
-		Get-ADComputer -Filter {Name -like "ACG-*"} | Get-BitLockerKey
-		
-		Retrieves BitLocker keys for all computers with names starting with "ACG-".
+		Get-ADComputer -Filter {Name -like "PC-*"} | Get-BitLockerKey
+
+		Retrieves BitLocker keys for all computers with names starting with "PC-".
 	.NOTES
 		Requires Active Directory PowerShell module and appropriate permissions.
 	#>
@@ -555,8 +555,7 @@ Function Global:Get-DellWarranty {
 	- $env:appdata\Microsoft\Windows\PowerShell\DellKey.txt
 	- $env:appdata\Microsoft\Windows\PowerShell\DellSec.txt
 
-	For more information on setting up Dell API credentials, refer to:
-	https://ambitions.itglue.com/806129/docs/10204492
+	For more information on setting up Dell API credentials, check documentation.
 #>
 	Param(
 		# Currently not used, reserved for future functionality
@@ -592,11 +591,11 @@ Function Global:Get-DellWarranty {
 
 	# Check for required API credentials
 	If ((Test-Path "$env:appdata\Microsoft\Windows\PowerShell\DellKey.txt") -ne $true) {
-		Write-Host "Authentication Needed. Please refer to https://ambitions.itglue.com/806129/docs/10204492" -ForegroundColor White -BackgroundColor Red
+		Write-Host "Authentication Needed. Please check documentation for Dell API credential setup." -ForegroundColor White -BackgroundColor Red
 		Break
 	}
 	If ((Test-Path "$env:appdata\Microsoft\Windows\PowerShell\DellSec.txt") -ne $true) {
-		Write-Host "Authentication Needed. Please refer to https://ambitions.itglue.com/806129/docs/10204492" -ForegroundColor White -BackgroundColor Red
+		Write-Host "Authentication Needed. Please check documentation for Dell API credential setup." -ForegroundColor White -BackgroundColor Red
 		Break
 	}
 
@@ -788,7 +787,7 @@ Function Get-FileDownload {
 		6. BITS Transfer (last resort; handles intermittent connections)
 		If a Checksum is provided, the downloaded file is validated and removed on mismatch.
 	.PARAMETER URL
-		URL of the file to download, e.g. 'http://download.ambitionsgroup.com/Software/migwiz.zip'
+		URL of the file to download, e.g. 'https://files.mauletech.com/Software/migwiz.zip?dl'
 	.PARAMETER SaveToFolder
 		Folder to save the file to, e.g. 'C:\Temp'. Defaults to the current directory.
 	.PARAMETER FileName
@@ -806,7 +805,7 @@ Function Get-FileDownload {
 		Get-FileDownload -URL $Link -SaveToFolder '$ITFolder\'
 
 	.EXAMPLE
-		$DownloadFileInfo = Get-FileDownload -URL 'http://download.ambitionsgroup.com/Software/migwiz.zip' -SaveToFolder '$ITFolder\'
+		$DownloadFileInfo = Get-FileDownload -URL 'https://files.mauletech.com/Software/migwiz.zip?dl' -SaveToFolder '$ITFolder\'
 		$DownloadFileName = $DownloadFileInfo[0]
 		$DownloadFilePath = $DownloadFileInfo[-1]
 

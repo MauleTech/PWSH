@@ -307,13 +307,13 @@ Function Set-DnsMadeEasyDDNS {
 	.DESCRIPTION
 		This command updates a DnsMadeEasy Dynamic DNS entry. For easy re-use, all settings including the password can also be stored in an encrypted file and be reused.
 	.EXAMPLE
-		Set-DnsMadeEasyDDNS -Username "ambitions" -Password "kee89" -RecordID "2348"
+		Set-DnsMadeEasyDDNS -Username "myuser" -Password "kee89" -RecordID "2348"
 			Uses credentials to update a dns record with the detected public IP.
 	.EXAMPLE
-		Set-DnsMadeEasyDDNS -Username "ambitions" -Password "kee89" -RecordID "2348" -IPAddress "127.0.0.1"
+		Set-DnsMadeEasyDDNS -Username "myuser" -Password "kee89" -RecordID "2348" -IPAddress "127.0.0.1"
 			Uses credentials to update a dns record with a predetermined key.
 	.EXAMPLE
-		Set-DnsMadeEasyDDNS -ToFile "$ITFolder\Scripts\DnsMadeEasyDDNS-4411mont.beyond-health.txt" -Username "ambitions" -Password "kee89" -RecordID "2348"
+		Set-DnsMadeEasyDDNS -ToFile "$ITFolder\Scripts\DnsMadeEasyDDNS-4411mont.beyond-health.txt" -Username "myuser" -Password "kee89" -RecordID "2348"
 			Stores all fo the needed settings in an encrypted file.
 	.EXAMPLE
 		Set-DnsMadeEasyDDNS -FromFile "$ITFolder\Scripts\DnsMadeEasyDDNS-4411mont.beyond-health.txt"

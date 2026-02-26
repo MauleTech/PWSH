@@ -455,20 +455,20 @@ Get-FWCheck
 	DattoBDRCheck
 	#End of Datto Backup Check
 
-	#Check if ATG tools exists
+	#Check if Portable Apps tools exist
 	Write-Host
 	Write-Host "Portable Apps check:"
 	If (Test-Path $ITFolder\Windows_Repair_Toolbox) {
-		Write-Host -ForegroundColor Green ATG Portable Apps tools are installed
+		Write-Host -ForegroundColor Green Portable Apps tools are installed
 	} Else {
-		Write-Host -ForegroundColor Red ATG Portable Apps tools are NOT installed
+		Write-Host -ForegroundColor Red Portable Apps tools are NOT installed
 	}
-	#End of Check if ATG tools exists
+	#End of Portable Apps tools check
 
 	#Changelog check
 	Write-Host
 	Write-Host "Change Log file check:"
-	If (Test-Path $Env:SystemDrive"\Ambitions\"$env:computername"_ChangeLog.txt") {
+	If (Test-Path $Env:SystemDrive"\IT\"$env:computername"_ChangeLog.txt") {
 		Write-Host -ForegroundColor Green $env:computername"_ChangeLog.txt does exist"
 	} Else {
 		Write-Host -ForegroundColor Red $env:computername"_ChangeLog.txt" does NOT exist

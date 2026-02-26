@@ -94,7 +94,6 @@ Enable-SSL #Enables SSL Permanently
   Export-365AllDistributionGroups
   Export-365DistributionGroup
   Export-LDAPSCertificate
-  Export-UnifiDevicesToItGlue
   Export-UsersOneDrive
 
 [Get]

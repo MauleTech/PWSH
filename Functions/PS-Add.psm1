@@ -29,13 +29,13 @@ Function Add-ChromeShortcut{
 	<#
 	.SYNOPSIS
 		Creates a Google Chrome Shortcut on the "All Users" Desktop.
-		If Google Chrome is not found, prompts to install the program using ATG-PS scripts + Chocolately.
+		If Google Chrome is not found, prompts to install the program using Chocolatey.
 	.PARAMETER Label
 		The file name of the shortcut; ".lnk" is automatically appended.
 	.PARAMETER Url
 		The full URL that the shortcut intends to open: "https://www.google.com/"
 	.EXAMPLE
-		Add-ChromeShortcut -Label "Github ATG-PS" -Url "https://github.com/MauleTech/PWSH/"
+		Add-ChromeShortcut -Label "Github PWSH" -Url "https://github.com/MauleTech/PWSH/"
 	#>
 }
 
@@ -66,8 +66,8 @@ Function Add-FileFolderShortcut {
 	.PARAMETER DestinationPath
 		What the shortcut is pointing to. "$ITFolder\RyanIsAwesome.txt"
 	.EXAMPLE
-		Add-FileFolderShortcut -SourceLnk "$env:Public\Desktop\Ambitions Folder.lnk" -DestinationPath "$ITFolder"
-		This example puts a shortcut on the desktop called "Ambitions Folder" and points to $ITFolder.
+		Add-FileFolderShortcut -SourceLnk "$env:Public\Desktop\IT Folder.lnk" -DestinationPath "$ITFolder"
+		This example puts a shortcut on the desktop called "IT Folder" and points to $ITFolder.
 	.EXAMPLE
 		Add-FileFolderShortcut -SourceLnk "$env:Public\Desktop\ProLaw.lnk" -DestinationPath "\\rradb.robles.law\ProLaw\ProLaw.exe" -StartIn "\\rradb.robles.law\ProLaw"
 		This example puts a shortcut on the desktop called ProLaw and with the working directory filled out.
@@ -100,7 +100,7 @@ Function Add-IEShortcut {
 	.PARAMETER Url
 		The full URL that the shortcut intends to open: "https://www.google.com/"
 	.EXAMPLE
-		Add-ChromeShortcut -Label "Github ATG-PS" -Url "https://github.com/MauleTech/PWSH/"
+		Add-ChromeShortcut -Label "Github PWSH" -Url "https://github.com/MauleTech/PWSH/"
 	#>
 
 }

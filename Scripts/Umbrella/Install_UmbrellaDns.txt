@@ -4,8 +4,8 @@
 .Description
 	Determines the site code from IP or manually, then downloads and installs the appropriate config file for the site.
 .Example
-	Install-UmbrellaDNS -Code ACG
-	Installs the agent for the site Ambitions Consulting Group. Will prompt for silent install confirmation.
+	Install-UmbrellaDNS -Code XMPL
+	Installs the agent for the site Example Org. Will prompt for silent install confirmation.
 .Notes
 	For a list of site codes, go to:
 	https://github.com/MauleTech/PWSH/blob/49d3876af3f2548ca106fb731cb0bf4def21a007/Scripts/Umbrella/UDNS-Client-Mapping.csv
@@ -31,7 +31,7 @@ Write-Host "Checking Root Certificate"
 $RootCertPath = "Cert:\LocalMachine\Root\C5091132E9ADF8AD3E33932AE60A5C8FA939E824" #Thumbprint of the Cert set to expire in 2036
 If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
 	Write-Host "Downloading the Umbrella Root Cert"
-	$url = 'https://download.ambitionsgroup.com/Software/Cisco_Umbrella_Root_CA.cer'
+	$url = 'https://files.mauletech.com/Software/Cisco_Umbrella_Root_CA.cer?dl'
 	$certFolder = $ITFolder + '\UmbrellaClient\'
 	$certFilePath = $certFolder + 'Cisco_Umbrella_Root_CA.cer'
 	Remove-Item $certFilePath -ea SilentlyContinue

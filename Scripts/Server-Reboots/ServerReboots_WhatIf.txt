@@ -61,9 +61,9 @@
 		Write-Host -foregroundcolor red "The switches -ServicesCheck and -ForceReboots are mutually exclusive, please only use one or the other"
 		Exit
 	}
-	#If((whoami) -ne "nt authority\system"){Write-Error -message "This script must be run as SYSTEM. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208" -Category SecurityError;Exit}
+	#If((whoami) -ne "nt authority\system"){Write-Error -message "This script must be run as SYSTEM. Follow configuration instructions at check documentation" -Category SecurityError;Exit}
 	If (-not (Test-Path "$ITFolder\scripts\server_reboot_user.txt")) {
-		$message = "Needed file server_reboot_user.txt is missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
+		$message = "Needed file server_reboot_user.txt is missing. Follow configuration instructions at check documentation"
 		Write-Error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
 		Send-To-Teams
@@ -71,7 +71,7 @@
 	}
 
 	If (-not (Test-Path "$ITFolder\scripts\Server_Reboot_Cred.txt")) {
-		$message = "Needed files are missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
+		$message = "Needed files are missing. Follow configuration instructions at check documentation"
 		Write-Error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
 		Send-To-Teams
@@ -79,7 +79,7 @@
 	}
 
 	If (-not (Test-Path "$ITFolder\scripts\Server_Reboots.csv")) {
-		$message = "Needed file Server_Reboot_Cred.txt is missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
+		$message = "Needed file Server_Reboot_Cred.txt is missing. Follow configuration instructions at check documentation"
 		Write-Error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
 		Send-To-Teams
@@ -87,7 +87,7 @@
 	}
 
 	If (-not (Test-Path "$ITFolder\scripts\Invoke-StartService.ps1")) {
-		$message = "Needed file is Invoke-StartService.ps1 missing. Follow configuration instructions at https://.itglue.com/DOC-806129-1544208"
+		$message = "Needed file is Invoke-StartService.ps1 missing. Follow configuration instructions at check documentation"
 		Write-Error -message $message -Category ObjectNotFound
 		$color = 'ff0000'
 		Send-To-Teams

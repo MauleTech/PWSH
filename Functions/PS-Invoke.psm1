@@ -756,9 +756,9 @@ Write-Host "Running NDDC"
 # Check for credentials
 	$SshKeyPath = $ITFolder + '\.ssh\nddc.id_rsa'
 	If (-not (Test-Path $SshKeyPath)) {
-		Write-Error "ERROR: .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
+		Write-Error "ERROR: .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check documentation for remedy."
 		Write-Host "Send to Teams"
-		$Message = "ERROR: .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
+		$Message = "ERROR: .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check documentation for remedy."
 		$server = "$env:computername"
 		$color = 'ff0000'
 		Send-To-Teams
@@ -766,7 +766,7 @@ Write-Host "Running NDDC"
 	Write-Host "Logging the attempt"
 		$date = Get-Date
 		$date = $date.ToShortDateString()
-		Add-Content "$ITFolder\NDDC Auto Scan Log.txt" "$date | .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check https://ambitions.itglue.com/806129/docs/9939741 for remedy."
+		Add-Content "$ITFolder\NDDC Auto Scan Log.txt" "$date | .SSH Key not found at $ITFolder\.ssh\nddc.id_rsa. - - Check documentation for remedy."
 	} Else {
 	
 	# Set local file path, SFTP path, and the backup location path which I assume is an SMB path
@@ -793,7 +793,7 @@ Write-Host "Running NDDC"
 		Get-SFTPSession | Remove-SFTPSession -ErrorAction SilentlyContinue
 
 	Write-Host "Send to Teams"
-		$Message = "NDDC has scanned and uploaded to $SftpLink Check https://ambitions.itglue.com/806129/passwords/17437892 for access."
+		$Message = "NDDC has scanned and uploaded to $SftpLink Check documentation for access credentials."
 		If (Select-String -Path $ExportedFile -SimpleMatch "Invalid Active Directory username") {
 			$Message = $Message + " The stored username and password appear to be incorrect. Please run NDDC manually at least once in $ITFolder\nddc and get to the point where the scan begins. You can cancel it after that."
 			$Color = 'ff0000'
@@ -804,7 +804,7 @@ Write-Host "Running NDDC"
 	Write-Host "Logging the attempt"
 		$date = Get-Date
 		$date = $date.ToShortDateString()
-		Add-Content "$ITFolder\NDDC Auto Scan Log.txt" "$date | NDDC has scanned and uploaded to $SftpLink Check https://ambitions.itglue.com/806129/passwords/17437892 for access."
+		Add-Content "$ITFolder\NDDC Auto Scan Log.txt" "$date | NDDC has scanned and uploaded to $SftpLink Check documentation for access credentials."
 		If (Select-String -Path $ExportedFile -SimpleMatch "Invalid Active Directory username") {
 			Add-Content "$ITFolder\NDDC Auto Scan Log.txt" "$date | ERROR: The stored username and password appear to be incorrect. Please run NDDC manually at least once in $ITFolder\nddc and get to the point where the scan begins. You can cancel it after that."
 		}

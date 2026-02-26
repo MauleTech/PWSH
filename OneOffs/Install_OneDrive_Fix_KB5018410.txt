@@ -10,7 +10,7 @@ Function Get-FileDownload {
 		Takes a URL for a file and downloads it to the specified directory.
 		Parses the file name from the URL so you don't have to manually specify the file name.
 	.PARAMETER URL
-		URL of the file to download, i.e. 'http://download.ambitionsgroup.com/Software/migwiz.zip'
+		URL of the file to download, i.e. 'https://files.mauletech.com/Software/migwiz.zip?dl'
 	.PARAMETER URL
 		Folder of where to save the file, i.e. 'C:\Temp
 	.EXAMPLE
@@ -22,7 +22,7 @@ Function Get-FileDownload {
 		The following downloads the file 'migwiz.zip' to '$ITFolder'.
 		It then exports the FileName 'migwiz.zip' to the variable $DownloadFileName.
 		It also exports the full file path '$ITFolder\migwiz.zip' to the variable '$DownloadFilePath'.
-		$DownloadFileName, $DownloadFilePath = Get-FileDownload -URL 'http://download.ambitionsgroup.com/Software/migwiz.zip' -SaveToFolder '$ITFolder\'
+		$DownloadFileName, $DownloadFilePath = Get-FileDownload -URL 'https://files.mauletech.com/Software/migwiz.zip?dl' -SaveToFolder '$ITFolder\'
 	#>
 	param(
 		[Parameter(Mandatory = $True)]

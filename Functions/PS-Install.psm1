@@ -62,7 +62,7 @@ Function Install-Action1 {
 Function Install-AppDefaults {
 	Write-Host "Downloading App Defaults"
 	New-Item -ItemType Directory -Force -Path $ITFolder
-	(New-Object System.Net.WebClient).DownloadFile('https://download.ambitionsgroup.com/AppDefaults.xml', '$ITFolder\AppDefaults.xml')
+	(New-Object System.Net.WebClient).DownloadFile('https://files.mauletech.com/AppDefaults.xml?dl', '$ITFolder\AppDefaults.xml')
 	Write-Host "Deploying App Defaults"
 	Dism.exe /online /import-defaultappassociations:'$ITFolder\AppDefaults.xml'
 }
@@ -243,7 +243,7 @@ Function Install-NiniteApps {
 Function Install-NinitePro {
 	Write-Host "Downloading Ninite Installer"
 	New-Item -ItemType Directory -Force -Path $ITFolder
-	(New-Object System.Net.WebClient).DownloadFile('https://download.ambitionsgroup.com/Software/NinitePro.exe', '$ITFolder\NinitePro.exe')
+	(New-Object System.Net.WebClient).DownloadFile('https://files.mauletech.com/Software/NinitePro.exe?dl', '$ITFolder\NinitePro.exe')
 	Write-Host "Schedule Ninite Updates"
 	$Trigger = New-ScheduledTaskTrigger -AtStartup
 	$User = "NT AUTHORITY\SYSTEM"
@@ -256,7 +256,7 @@ Function Install-O2016STD([String] $MSPURL){
 	Write-Host "Downloading MS Office"
 		Enable-SSL
 		New-Item -ItemType Directory -Force -Path '$ITFolder\O2016STD'
-		(New-Object System.Net.WebClient).DownloadFile('http://download.ambitionsgroup.com/Software/O2016_STD_X64.exe', '$ITFolder\O2016STD\O2016_STD_X64.exe')
+		(New-Object System.Net.WebClient).DownloadFile('https://files.mauletech.com/Software/O2016_STD_X64.exe?dl', '$ITFolder\O2016STD\O2016_STD_X64.exe')
 
 	Write-Host "Downloading MS Office config files"
 		$MSPfilename = $MSPURL.Substring($MSPURL.LastIndexOf("/") + 1)
@@ -756,7 +756,7 @@ Function Install-UmbrellaDNSasJob {
 	)
 	$SiteConfigs = @()
 	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
-	$MSIUrl = 'https://download.ambitionsgroup.com/Software/cisco-secure-client-win-5.1.9.113-predeploy-k9.zip'
+	$MSIUrl = 'https://files.mauletech.com/Software/cisco-secure-client-win-5.1.9.113-predeploy-k9.zip?dl'
 	
 	Write-Host "Checking Status Indicator"
 	$IndicKey = Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator | Select-Object -ExpandProperty UseGlobalDNS -ea SilentlyContinue
@@ -772,7 +772,7 @@ Function Install-UmbrellaDNSasJob {
 	$RootCertPath = "Cert:\LocalMachine\Root\C5091132E9ADF8AD3E33932AE60A5C8FA939E824" #Thumbprint of the Cert set to expire in 2036
 	If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
 		Write-Host "Downloading the Umbrella Root Cert"
-		$url = 'https://download.ambitionsgroup.com/Software/Cisco_Umbrella_Root_CA.cer'
+		$url = 'https://files.mauletech.com/Software/Cisco_Umbrella_Root_CA.cer?dl'
 		$certFolder = $ITFolder + '\UmbrellaClient\'
 		$certFilePath = $certFolder + 'Cisco_Umbrella_Root_CA.cer'
 		Remove-Item $certFilePath -ea SilentlyContinue
@@ -850,10 +850,10 @@ Function Install-UmbrellaDNSasJob {
 			If ($SelectedSite.Site -Match "Santa Fe Solid Waste Management") {
 				Write-Host "Installing Santa Fe City VPN first"
 				# Define URLs for downloading the Cisco AnyConnect VPN installer and configuration files
-				$CityVpnExeURL = "https://download.ambitionsgroup.com/Sites/SFSW/anyconnect-win-4.6.01103-core-vpn-webdeploy-k9.exe"
-				$CityVpnConfigURL = "https://download.ambitionsgroup.com/Sites/SFSW/VPN.exe"
+				$CityVpnExeURL = "https://files.mauletech.com/Sites/SFSW/anyconnect-win-4.6.01103-core-vpn-webdeploy-k9.exe?dl"
+				$CityVpnConfigURL = "https://files.mauletech.com/Sites/SFSW/VPN.exe?dl"
 				
-				# Download the VPN installer and configuration files to the Ambitions folder on the system drive
+				# Download the VPN installer and configuration files to the IT folder on the system drive
 				# Get-FileDownload is a custom function that downloads files and returns an array with status and file path
 				$CityVpnExeDownload = Get-FileDownload -URL $CityVpnExeURL -SaveToFolder $ITFolder\
 				$CityVpnConfigDownload = Get-FileDownload -URL $CityVpnConfigURL -SaveToFolder $ITFolder\
@@ -1036,7 +1036,7 @@ Function Install-UmbrellaDnsCert {
 	$RootCertPath = "Cert:\LocalMachine\Root\C5091132E9ADF8AD3E33932AE60A5C8FA939E824" #Thumbprint of the Cert set to expire in 2036
 	If (!(Test-Path $RootCertPath -ea SilentlyContinue)) {
 		Write-Host "Downloading the Umbrella Root Cert"
-		$url = 'https://download.ambitionsgroup.com/Software/Cisco_Umbrella_Root_CA.cer'
+		$url = 'https://files.mauletech.com/Software/Cisco_Umbrella_Root_CA.cer?dl'
 		$certFolder = $ITFolder + '\UmbrellaClient\'
 		$certFilePath = $certFolder + 'Cisco_Umbrella_Root_CA.cer'
 		Remove-Item $certFilePath -ea SilentlyContinue
@@ -1280,7 +1280,7 @@ Function Install-WinRepairToolbox {
 	Write-Host "Expanding Windows Repair Toolbox"
 		Expand-Archive -Path $DLFilePath -DestinationPath $DLFolder -Force
 	Write-Host "Downloading Windows Repair Toolbox Customizations"
-		$URL = 'https://download.ambitionsgroup.com/Software/Windows_Repair_Toolbox_Custom.zip'
+		$URL = 'https://files.mauletech.com/Software/Windows_Repair_Toolbox_Custom.zip?dl'
 		$CustomizationFilePath = $DLFolder + '\Windows_Repair_Toolbox_Custom.zip'
 		$null = (New-Item -ItemType Directory -Force -Path $DLFolder)
 		(New-Object System.Net.WebClient).DownloadFile($url, $CustomizationFilePath)

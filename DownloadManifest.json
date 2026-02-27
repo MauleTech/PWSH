@@ -1,36 +1,36 @@
 {
     "https://claude.ai/install.ps1": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "B9702ECF2928354DFC32E25468848408DE40B82D237F83953FDC6D6D655050EF",
         "LastVerified": "2026-02-26",
         "Note": "Claude Code official installer script"
     },
     "https://community.chocolatey.org/install.ps1": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "44E045ED5350758616D664C5AF631E7F2CD10165F5BF2BD82CBF3A0BB8F63462",
         "LastVerified": "2026-02-26",
         "Note": "Chocolatey bootstrap installer"
     },
     "https://s3.amazonaws.com/networkdetective/download/NetworkDetectiveDataCollector.exe": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "9FB82ACA4D2E94210A716FA596CA1E025B0DD0A0B60543DDB76926DDF8FF7523",
         "LastVerified": "2026-02-26",
         "Note": "RapidFire Tools Network Detective Data Collector"
     },
     "https://update.itsupport247.net/agtupdt/DPMAPatch.exe": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "3A41840380456CCCF8162736463FDEC72D6A062C803AB65464A6217EC8265793",
         "LastVerified": "2026-02-26",
         "Note": "Continuum ITS247 DPMA agent patch"
     },
     "https://dl.dell.com/FOLDER12418375M/1/Systems-Management_Application_03GC8_WN64_2.1.1.0_A00.EXE": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "DC3D740BCDBF89D0A8DCBF8B57E21D6369455E2EFE5313FC73233AEEFA381CD5",
         "LastVerified": "2026-02-26",
         "Note": "Dell OpenManage Server Administrator installer"
     },
     "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "9ABC092F9B3D57C5D5B314268F588CAA2D16820B7F9D91547F228C2E4740371A",
         "LastVerified": "2026-02-26",
         "Note": "Fido - Windows ISO download script (third-party)"
     },
     "https://aka.ms/SaRASetup": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "7DD1D3A395222E642862A7AA9B60C82CECAA26F5E3B4F5477221C52997DB55F4",
         "LastVerified": "2026-02-26",
         "Note": "Microsoft Support and Recovery Assistant"
     },
@@ -40,33 +40,27 @@
         "Note": "Sophos Connect VPN client MSI"
     },
     "https://windows-repair-toolbox.com/files/Windows_Repair_Toolbox.zip": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "71AAE690D095A9EE3A56915FB08F5E0C433817BB443C3A7740E1BEEAE6237B5C",
         "LastVerified": "2026-02-26",
         "Note": "Windows Repair Toolbox (third-party utility)"
     },
-    "https://install.speedtest.net/app/cli/ookla-speedtest-1.0.0-win64.zip": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+    "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-win64.zip": {
+        "SHA256": "13E3D888B845D301A556419E31F14AB9BFF57E3F06089EF2FD3BDC9BA6841EFA",
         "LastVerified": "2026-02-26",
         "Note": "Ookla Speedtest CLI for Windows x64"
     },
     "https://www.palemoon.org/download.php?mirror=us&bits=32&type=portable": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "F832D87D4694CC108B4E073CCEA5B4297C95182788DCD71AC893B4C336BED336",
         "LastVerified": "2026-02-26",
         "Note": "Pale Moon portable browser (32-bit)"
     },
     "https://disthost.umbrella.com/roaming/upgrade/win/production/manifest.json": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "SHA256": "9DD00FB40E69EA5C76740C10AF7A2DBCD7F6C702E768E02DA94F29710AA6CDB8",
         "LastVerified": "2026-02-26",
         "Note": "Cisco Umbrella roaming client manifest"
     },
-    "https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.1.5.nupkg": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+    "https://cdn.powershellgallery.com/packages/pswindowsupdate.2.2.1.5.nupkg": {
+        "SHA256": "174E05B1C194377F8D9AE0B004C93304C662EA9B5FC4DAFA19426049D2D5CF50",
         "LastVerified": "2026-02-26",
         "Note": "PSWindowsUpdate PowerShell module package"
-    },
-    "https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.0.3.nupkg": {
-        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
-        "LastVerified": "2026-02-26",
-        "Note": "PSWindowsUpdate PowerShell module package (older version)"
     }
-}

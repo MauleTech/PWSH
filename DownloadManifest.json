@@ -1,0 +1,72 @@
+{
+    "https://claude.ai/install.ps1": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Claude Code official installer script"
+    },
+    "https://community.chocolatey.org/install.ps1": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Chocolatey bootstrap installer"
+    },
+    "https://s3.amazonaws.com/networkdetective/download/NetworkDetectiveDataCollector.exe": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "RapidFire Tools Network Detective Data Collector"
+    },
+    "https://update.itsupport247.net/agtupdt/DPMAPatch.exe": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Continuum ITS247 DPMA agent patch"
+    },
+    "https://dl.dell.com/FOLDER12418375M/1/Systems-Management_Application_03GC8_WN64_2.1.1.0_A00.EXE": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Dell OpenManage Server Administrator installer"
+    },
+    "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Fido - Windows ISO download script (third-party)"
+    },
+    "https://aka.ms/SaRASetup": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Microsoft Support and Recovery Assistant"
+    },
+    "https://yourfirewall.com/downloads/SophosConnect_2.5_(IPsec_and_SSLVPN).msi": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Sophos Connect VPN client MSI"
+    },
+    "https://windows-repair-toolbox.com/files/Windows_Repair_Toolbox.zip": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Windows Repair Toolbox (third-party utility)"
+    },
+    "https://install.speedtest.net/app/cli/ookla-speedtest-1.0.0-win64.zip": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Ookla Speedtest CLI for Windows x64"
+    },
+    "https://www.palemoon.org/download.php?mirror=us&bits=32&type=portable": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Pale Moon portable browser (32-bit)"
+    },
+    "https://disthost.umbrella.com/roaming/upgrade/win/production/manifest.json": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "Cisco Umbrella roaming client manifest"
+    },
+    "https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.1.5.nupkg": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "PSWindowsUpdate PowerShell module package"
+    },
+    "https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.0.3.nupkg": {
+        "SHA256": "UPDATE_WITH_ACTUAL_HASH",
+        "LastVerified": "2026-02-26",
+        "Note": "PSWindowsUpdate PowerShell module package (older version)"
+    }
+}

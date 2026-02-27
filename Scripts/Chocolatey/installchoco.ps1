@@ -83,7 +83,7 @@ If (Get-Command choco.exe -ErrorAction SilentlyContinue) {
             Write-Host "Attempting to use chocolatey's script to install chocolatey."
             [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
             Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force
-            iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            Invoke-ValidatedDownload -Uri 'https://community.chocolatey.org/install.ps1' | Invoke-Expression
             $installed = $true
         }
         catch {

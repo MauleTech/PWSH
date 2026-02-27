@@ -512,7 +512,7 @@ Function Update-ITS247Agent {
 		 $SaveFolder = '$ITFolder'
 		 New-Item -ItemType Directory -Force -Path $SaveFolder
 		 $PatchPath = $SaveFolder + '\DPMAPatch' + $AvailableVersion + '.exe'
-		 (New-Object System.Net.WebClient).DownloadFile('http://update.itsupport247.net/agtupdt/DPMAPatch.exe', $PatchPath)
+		 (New-Object System.Net.WebClient).DownloadFile('https://update.itsupport247.net/agtupdt/DPMAPatch.exe', $PatchPath)
 		 & $PatchPath | Wait-Process
 		 $DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion
 	 WRITE-HOST "Agent is now version $DisplayVersion"

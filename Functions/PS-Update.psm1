@@ -360,7 +360,7 @@ Function Update-DellServer {
 	$delay = $null
 
 	$URL = "https://dl.dell.com/FOLDER12418375M/1/Systems-Management_Application_03GC8_WN64_2.1.1.0_A00.EXE"
-	$File = "$ITFolder\Dell System Update 2.0.1.exe"
+	$File = "$ITFolder\Dell System Update 2.1.1.0_A00.exe"
 	Function Get-DSUInstall {
 		Write-Host "Dell System Update is not installed, attempting to install."
 		Write-Host "Download the installer to $File"
@@ -388,8 +388,8 @@ Function Update-DellServer {
 			Exit
 		} Else {
 			Write-Host "Checkin if DSU is installed"
-			If ((Get-WmiObject win32_product | Where-Object -Property Name -Like "*Dell System Update*").Version -NotLike "2.0.1.0*") {
-				Write-Host "Dell System Update is either not installed or not version 2.0.1.0"
+			If ((Get-WmiObject win32_product | Where-Object -Property Name -Like "*Dell System Update*").Version -NotLike "2.1.1.0*") {
+				Write-Host "Dell System Update is either not installed or not version 2.1.1.0"
 				Get-DSUInstall
 				Install-DSU
 			} Else {

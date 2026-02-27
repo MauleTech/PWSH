@@ -3,22 +3,38 @@ Function Install-Action1 {
 	.Synopsis
 		Installs the Action1 Patch Management Software
 	.Description
-		Installs Action1 Patch Management Software
+		Installs Action1 Patch Management Software. Requires a password to decrypt the site configuration.
+	.Parameter Code
+		The site code identifying which organization's Action1 configuration to use
+	.Parameter Password
+		The password to decrypt the Action1 site configuration file
 	.Notes
-		For a list of site codes, go to:
-		https://github.com/MauleTech/PWSH/blob/master/Scripts/Action1.csv
+		Use Protect-ConfigFile to encrypt an updated Action1.csv before uploading to BinCache.
 	#>
 
 	###Require -RunAsAdministrator
 	[cmdletbinding()]
 	param(
-		[string]$Code
+		[string]$Code,
+		[Parameter(Mandatory = $true)]
+		[string]$Password
 	)
 
 	If (-not (Get-Service -Name "A1Agent" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Action1 patch management."
+
+		# Download and decrypt the encrypted site configuration
+		try {
+			$EncryptedContent = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Action1.enc" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content
+			$DecryptedCsv = Unprotect-ConfigFile -EncryptedContent $EncryptedContent -Password $Password
+		} catch {
+			Write-Host "Failed to download or decrypt site configuration: $_" -ForegroundColor Red
+			Write-Host "Verify your password is correct and try again." -ForegroundColor Yellow
+			return
+		}
+
 		$SiteConfigs = @()
-		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Action1.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
+		$SiteConfigs = $DecryptedCsv | ConvertFrom-Csv -Delimiter ','
 
 		# If a global variable 'SiteCode' exists, use it
 		If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {
@@ -608,7 +624,7 @@ Function Install-SophosEndpoint {
 	.Parameter Password
 	The password to decrypt the Sophos site configuration file
 	.Notes
-	Use Protect-SophosCSV to encrypt an updated Sophos.csv before uploading to BinCache.
+	Use Protect-ConfigFile to encrypt an updated Sophos.csv before uploading to BinCache.
 	#>
 
 	###Require -RunAsAdministrator
@@ -625,7 +641,7 @@ Function Install-SophosEndpoint {
 		# Download and decrypt the encrypted site configuration
 		try {
 			$EncryptedContent = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.enc" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content
-			$DecryptedCsv = Unprotect-SophosCSV -EncryptedContent $EncryptedContent -Password $Password
+			$DecryptedCsv = Unprotect-ConfigFile -EncryptedContent $EncryptedContent -Password $Password
 		} catch {
 			Write-Host "Failed to download or decrypt site configuration: $_" -ForegroundColor Red
 			Write-Host "Verify your password is correct and try again." -ForegroundColor Yellow

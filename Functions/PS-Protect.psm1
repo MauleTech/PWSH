@@ -1,21 +1,21 @@
-Function Protect-SophosCSV {
+Function Protect-ConfigFile {
 	<#
 	.Synopsis
-	Encrypts the Sophos CSV file for secure storage in the BinCache repository
+	Encrypts a configuration file for secure storage
 	.Description
-	Takes a plaintext Sophos CSV file and encrypts it using AES-256-CBC with a
+	Takes a plaintext configuration file and encrypts it using AES-256-CBC with a
 	password-derived key (PBKDF2-SHA256, 100000 iterations). The encrypted file
 	can be safely committed to a public or private repository.
 	.Parameter Path
-	Path to the plaintext Sophos.csv file
+	Path to the plaintext configuration file (e.g. Sophos.csv, Action1.csv)
 	.Parameter Password
-	Password used for encryption. Must match the password used with Install-SophosEndpoint -Password
+	Password used for encryption. Must match the password used for decryption.
 	.Parameter OutputPath
 	Path for the encrypted output file. Defaults to the same directory with .enc extension
 	.Example
-	Protect-SophosCSV -Path .\Sophos.csv -Password "MySecurePassword"
+	Protect-ConfigFile -Path .\Sophos.csv -Password "MySecurePassword"
 	.Example
-	Protect-SophosCSV -Path .\Sophos.csv -Password "MySecurePassword" -OutputPath .\Sophos.enc
+	Protect-ConfigFile -Path .\Action1.csv -Password "MySecurePassword" -OutputPath .\Action1.enc
 	#>
 	[CmdletBinding()]
 	param(
@@ -79,21 +79,20 @@ Function Protect-SophosCSV {
 	$keyDerivation.Dispose()
 	$rng.Dispose()
 
-	Write-Host "Encrypted CSV saved to: $outputFullPath" -ForegroundColor Green
-	Write-Host "Upload this file to BinCache/Utilities/Sophos.enc" -ForegroundColor Yellow
+	Write-Host "Encrypted file saved to: $outputFullPath" -ForegroundColor Green
 }
 
-Function Unprotect-SophosCSV {
+Function Unprotect-ConfigFile {
 	<#
 	.Synopsis
-	Decrypts an encrypted Sophos CSV string
+	Decrypts an encrypted configuration file string
 	.Description
 	Decrypts Base64-encoded AES-256-CBC encrypted content using a password-derived
-	key (PBKDF2-SHA256, 100000 iterations). Returns the plaintext CSV content as a string.
+	key (PBKDF2-SHA256, 100000 iterations). Returns the plaintext content as a string.
 	.Parameter EncryptedContent
 	The Base64-encoded encrypted content (as downloaded from BinCache)
 	.Parameter Password
-	The password that was used to encrypt the file via Protect-SophosCSV
+	The password that was used to encrypt the file via Protect-ConfigFile
 	#>
 	[CmdletBinding()]
 	param(

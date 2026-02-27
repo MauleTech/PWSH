@@ -602,22 +602,38 @@ Function Install-SophosEndpoint {
 	.Synopsis
 	Installs the Sophos Endpoint Software
 	.Description
-	Installs Sophos Endpoint Software
+	Installs Sophos Endpoint Software. Requires a password to decrypt the site configuration.
+	.Parameter Code
+	The site code identifying which organization's Sophos configuration to use
+	.Parameter Password
+	The password to decrypt the Sophos site configuration file
 	.Notes
-	For a list of site codes, go to:
-	https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.csv
+	Use Protect-SophosCSV to encrypt an updated Sophos.csv before uploading to BinCache.
 	#>
 
 	###Require -RunAsAdministrator
 	[cmdletbinding()]
 	param(
-		[string]$Code
+		[string]$Code,
+		[Parameter(Mandatory = $true)]
+		[string]$Password
 	)
 
 	If (-not (Get-Service -Name "Sophos Endpoint Defense Service" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Sophos Endpoint."
+
+		# Download and decrypt the encrypted site configuration
+		try {
+			$EncryptedContent = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.enc" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content
+			$DecryptedCsv = Unprotect-SophosCSV -EncryptedContent $EncryptedContent -Password $Password
+		} catch {
+			Write-Host "Failed to download or decrypt site configuration: $_" -ForegroundColor Red
+			Write-Host "Verify your password is correct and try again." -ForegroundColor Yellow
+			return
+		}
+
 		$SiteConfigs = @()
-		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
+		$SiteConfigs = $DecryptedCsv | ConvertFrom-Csv -Delimiter ','
 
 		# If a global variable 'SiteCode' exists, use it
 		If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {

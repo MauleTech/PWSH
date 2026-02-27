@@ -5,7 +5,7 @@ This repository is a collection of PowerShell functions and scripts for IT autom
 
 ## Loading Functions
 - **Primary workflow:** Functions are loaded into a PowerShell session using either:
-  - `irm rb.gy/0kyfn2 | iex`
+  - `irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex`
   - `IEX(new-object net.webclient).downloadstring('https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt')`
 - The loader script sets up environment variables, enables TLS, and ensures dependencies (e.g., Git Portable) are available.
 

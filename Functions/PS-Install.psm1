@@ -134,7 +134,7 @@ function Install-ClaudeCode {
 
 	try {
 		Write-Host "`nStep 1: Running official installer..." -ForegroundColor Yellow
-		$script = Invoke-RestMethod -Uri "https://claude.ai/install.ps1" -UseBasicParsing
+		$script = Invoke-ValidatedDownload -Uri "https://claude.ai/install.ps1"
 		Invoke-Expression $script
 		Start-Sleep -Seconds 3
 

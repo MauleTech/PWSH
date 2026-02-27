@@ -656,9 +656,21 @@ Function Invoke-IPv4NetworkScan {
 }
 
 Function Invoke-NDDCScan {
+	# Webhook URL loaded from local config file: $ITFolder\Config\webhooks.json
+	# Example config: { "TeamsWebhookUri": "https://your-webhook-url-here" }
 	Function Send-To-Teams{
 		$date = Get-Date -Format g
-		$uri = $([System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String("aHR0cHM6Ly9hbWJpdGlvbnNncm91cC53ZWJob29rLm9mZmljZS5jb20vd2ViaG9va2IyLzg5N2QyYjRjLTUwYzYtNDljYi1hNjk0LTUwZTNjNzI2NWJkY0BjZjRiZGQwNi1iMDNkLTRiYWYtODU2NS0xMjY1NDY5YTg3NGYvSW5jb21pbmdXZWJob29rLzc2YjE1NmJiNmNjMTQxZmY5MmFmNTg0NzdiOGQxMTVjLzA0ZDMzMjQ3LWVlNzItNDFhZi1hNWFlLTFjNDI4MTI2MjQ0MS9WMlhHbDdZR0pwR0ItUHdpeE1lTEthNnpWUTlKYzlnbl96VDRnOTM2TlcxclUx")))
+		$webhookConfig = "$ITFolder\Config\webhooks.json"
+		if (-not (Test-Path $webhookConfig)) {
+			Write-Warning "Teams webhook config not found at $webhookConfig - notifications disabled."
+			return
+		}
+		$config = Get-Content $webhookConfig -Raw | ConvertFrom-Json
+		$uri = $config.TeamsWebhookUri
+		if (-not $uri) {
+			Write-Warning "TeamsWebhookUri not set in $webhookConfig - notifications disabled."
+			return
+		}
 
 		$body = ConvertTo-Json -Depth 4 @{
 			themeColor = $color

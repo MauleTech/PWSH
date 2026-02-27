@@ -50,14 +50,15 @@ Function Invoke-ValidatedDownload {
 
 	# Download to temp file
 	$TempFile = [System.IO.Path]::GetTempFileName()
+	$prevPref = $ProgressPreference
 	try {
-		$prevPref = $ProgressPreference
 		$ProgressPreference = 'SilentlyContinue'
 		Invoke-WebRequest -Uri $Uri -OutFile $TempFile -UseBasicParsing
-		$ProgressPreference = $prevPref
 	} catch {
 		Remove-Item $TempFile -Force -ErrorAction SilentlyContinue
 		throw "Failed to download from ${Uri}: $_"
+	} finally {
+		$ProgressPreference = $prevPref
 	}
 
 	# Compute hash of downloaded content

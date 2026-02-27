@@ -1276,7 +1276,7 @@ Function Install-WinRepairToolbox {
 		$DLFolder = $ITFolder + '\Windows_Repair_Toolbox'
 		$DLFilePath = $DLFolder + '\Windows_Repair_Toolbox.zip'
 		$null = (New-Item -ItemType Directory -Force -Path $DLFolder)
-		(New-Object System.Net.WebClient).DownloadFile($url, $DLFilePath)
+		Invoke-ValidatedDownload -Uri $URL -OutFile $DLFilePath
 	Write-Host "Expanding Windows Repair Toolbox"
 		Expand-Archive -Path $DLFilePath -DestinationPath $DLFolder -Force
 	Write-Host "Downloading Windows Repair Toolbox Customizations"

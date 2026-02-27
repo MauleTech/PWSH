@@ -730,7 +730,7 @@ Write-Host "Downloading the NDDC Utility"
 	$NddcDownloadPath = $NddcFolder + '\NetworkDetectiveDataCollector.zip'
 	$Nddcexe = $NddcFolder + '\nddc.exe'
 	Remove-Item $NddcDownloadPath -ea SilentlyContinue
-	(New-Object System.Net.WebClient).DownloadFile($NddcURL, $NddcDownloadPath)
+	Invoke-ValidatedDownload -Uri $NddcURL -OutFile $NddcDownloadPath
 	Expand-Archive -Path $NddcDownloadPath -DestinationPath $NddcFolder -Force
 
 Write-Host "Optimizing Run Settings based on previous manual run."

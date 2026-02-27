@@ -361,22 +361,11 @@ Function Update-DellServer {
 
 	$URL = "https://dl.dell.com/FOLDER12418375M/1/Systems-Management_Application_03GC8_WN64_2.1.1.0_A00.EXE"
 	$File = "$ITFolder\Dell System Update 2.0.1.exe"
-	$Hash = 'dc3d740bcdbf89d0a8dcbf8b57e21d6369455e2efe5313fc73233aeefa381cd5'
 	Function Get-DSUInstall {
 		Write-Host "Dell System Update is not installed, attempting to install."
 		Write-Host "Download the installer to $File"
-		(New-Object System.Net.WebClient).DownloadFile($URL,$File) #Download the URL to the File.
-				Write-Host "Download is complete, checking the integrity."
-	}
-
-	Function Test-DSUInstall {IF ((Get-FileHash -Path $File -Algorithm SHA256).Hash -eq $Hash) {
-			Write-Host "It's a match!"
-		} Else {
-			Write-Host "Uh oh, there were issues downloading a non-corrupt file. Please attempt manually."
-			Write-Host "Download is available at https://downloads.dell.com/omimswac/dsu/"
-			Pause
-			Exit
-		}
+		Invoke-ValidatedDownload -Uri $URL -OutFile $File
+		Write-Host "Download is complete, integrity verified by Invoke-ValidatedDownload."
 	}
 
 	Function Install-DSU {
@@ -402,7 +391,6 @@ Function Update-DellServer {
 			If ((Get-WmiObject win32_product | Where-Object -Property Name -Like "*Dell System Update*").Version -NotLike "2.0.1.0*") {
 				Write-Host "Dell System Update is either not installed or not version 2.0.1.0"
 				Get-DSUInstall
-				Test-DSUInstall
 				Install-DSU
 			} Else {
 				Write-Host "DSU is already installed."
@@ -512,7 +500,7 @@ Function Update-ITS247Agent {
 		 $SaveFolder = '$ITFolder'
 		 New-Item -ItemType Directory -Force -Path $SaveFolder
 		 $PatchPath = $SaveFolder + '\DPMAPatch' + $AvailableVersion + '.exe'
-		 (New-Object System.Net.WebClient).DownloadFile('https://update.itsupport247.net/agtupdt/DPMAPatch.exe', $PatchPath)
+		 Invoke-ValidatedDownload -Uri 'https://update.itsupport247.net/agtupdt/DPMAPatch.exe' -OutFile $PatchPath
 		 & $PatchPath | Wait-Process
 		 $DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion
 	 WRITE-HOST "Agent is now version $DisplayVersion"
@@ -956,7 +944,7 @@ Function Update-Windows {
 			If (-Not (((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Major -ge "2") -and ((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Minor -ge "1"))) {
 				Write-Host "Attempting Manual installation of PSWUI 2.2.1.5"
 				New-Item -ItemType Directory -Force -Path '$ITFolder' -ErrorAction Stop
-				(New-Object System.Net.WebClient).DownloadFile('https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.1.5.nupkg', '$ITFolder\pswindowsupdate.2.2.1.5.zip')
+				Invoke-ValidatedDownload -Uri 'https://cdn.powershellgallery.com/packages/pswindowsupdate.2.2.1.5.nupkg' -OutFile '$ITFolder\pswindowsupdate.2.2.1.5.zip'
 				New-Item -ItemType Directory -Force -Path 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.1.5' -ErrorAction Stop
 				Expand-Archive -LiteralPath '$ITFolder\pswindowsupdate.2.2.1.5.zip' -DestinationPath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.1.5' -ErrorAction Stop
 				Import-Module PSWindowsUpdate -ErrorAction Stop
@@ -1554,7 +1542,7 @@ Function Update-WindowsTo11 {
 					$TempScript = [System.IO.Path]::GetTempFileName() + ".ps1"
 					$TempScriptToCleanup = $TempScript
 					
-					Invoke-RestMethod -Uri "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1" -OutFile $TempScript -ErrorAction Stop
+					Invoke-ValidatedDownload -Uri "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1" -OutFile $TempScript
 					Write-Log "Fido script downloaded successfully"
 					
 					Write-Log "Generating Windows 11 download URL..."

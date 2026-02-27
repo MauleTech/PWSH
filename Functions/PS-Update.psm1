@@ -430,7 +430,7 @@ Function Update-Everything {
 		If (Get-Command choco -ErrorAction SilentlyContinue) {choco upgrade all -y}
 	}
 	Update-Windows
-	Update-DellPackages
+	Update-OEMDrivers
 	Update-Edge
 	Update-NiniteApps
 	Update-PWSH

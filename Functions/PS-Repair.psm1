@@ -1,7 +1,7 @@
 Function Repair-O365AppIssues {
 	Write-Host "Please note this is an interactive tools, to be run from a user's session."
 	If (-not (Test-Path '$ITFolder')) {New-Item -ItemType Directory -Force -Path $ITFolder\ | Out-Null}
-	(New-Object System.Net.WebClient).DownloadFile('https://aka.ms/SaRASetup', '$ITFolder\SaraSetup.exe')
+	Invoke-ValidatedDownload -Uri 'https://aka.ms/SaRASetup' -OutFile "$ITFolder\SaraSetup.exe"
 	& $ITFolder\SaraSetup.exe
 	Write-Host "SaRA should now be installing, please wait a moment as it launces."
 <#

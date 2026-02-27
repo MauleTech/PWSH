@@ -56,7 +56,8 @@ If ($IsInstalled) {
 	#Dowload config file index
 	$SiteConfigs = @()
 	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
-	$MSIDetails = (Invoke-WebRequest https://disthost.umbrella.com/roaming/upgrade/win/production/manifest.json -UseBasicParsing) | ConvertFrom-Json
+	$UmbrellaManifestContent = Invoke-ValidatedDownload -Uri 'https://disthost.umbrella.com/roaming/upgrade/win/production/manifest.json'
+	$MSIDetails = $UmbrellaManifestContent | ConvertFrom-Json
 	$MSIUrl = "https://disthost.umbrella.com/roaming/upgrade/win/production/" + $MSIDetails.downloadFilename
 
 	Function InstallAgent {
@@ -69,7 +70,7 @@ If ($IsInstalled) {
 
 		$null = (New-Item -ItemType Directory -Force -Path $msiFolder)
 		If (Test-Path $msiFilePath) { Remove-Item $msiFilePath}
-		(New-Object System.Net.WebClient).DownloadFile($MSIUrl, $msiFilePath)
+		Invoke-ValidatedDownload -Uri $MSIUrl -OutFile $msiFilePath
 		Get-Item $msiFilePath | Unblock-File
 		#Write-Host Disabling Windows Defender Real Time Scanning
 		#Set-MpPreference -DisableRealtimeMonitoring $True -ErrorAction SilentlyContinue

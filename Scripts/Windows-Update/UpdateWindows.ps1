@@ -39,16 +39,16 @@ If ($PSVersionTable.PSVersion.Major -lt "5") {
 	}
 
 	If (-Not (((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Major -ge "2") -and ((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Minor -ge "1"))) {
-		Write-Host "Attempting automatic installation of PSWUI 2.2.0.3"
+		Write-Host "Attempting automatic installation of PSWUI 2.2.1.5"
 		Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force -ErrorAction SilentlyContinue
-		Install-Module -Name PSWindowsUpdate -MinimumVersion 2.2.1.4 -Force -ErrorAction SilentlyContinue
+		Install-Module -Name PSWindowsUpdate -MinimumVersion 2.2.1.5 -Force -ErrorAction SilentlyContinue
 		RegMU
 		If (-Not (((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Major -ge "2") -and ((Get-Command Get-WUInstall -ErrorAction SilentlyContinue).Version.Minor -ge "1"))) {
-			Write-Host "Auto install Failed, Attempting Manual installation of PSWUI 2.2.0.3"
+			Write-Host "Auto install Failed, Attempting Manual installation of PSWUI 2.2.1.5"
 			New-Item -ItemType Directory -Force -Path '$ITFolder' -ErrorAction Stop
-			(New-Object System.Net.WebClient).DownloadFile('https://psg-prod-eastus.azureedge.net/packages/pswindowsupdate.2.2.0.3.nupkg', '$ITFolder\pswindowsupdate.2.2.0.3.zip')
-			New-Item -ItemType Directory -Force -Path 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.0.3' -ErrorAction Stop
-			Expand-Archive -LiteralPath '$ITFolder\pswindowsupdate.2.2.0.3.zip' -DestinationPath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.0.3' -ErrorAction Stop
+			Invoke-ValidatedDownload -Uri 'https://cdn.powershellgallery.com/packages/pswindowsupdate.2.2.1.5.nupkg' -OutFile '$ITFolder\pswindowsupdate.2.2.1.5.zip'
+			New-Item -ItemType Directory -Force -Path 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.1.5' -ErrorAction Stop
+			Expand-Archive -LiteralPath '$ITFolder\pswindowsupdate.2.2.1.5.zip' -DestinationPath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\PSWindowsUpdate\2.2.1.5' -ErrorAction Stop
 			Import-Module PSWindowsUpdate -ErrorAction Stop
 			RegMU
 		}

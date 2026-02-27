@@ -1,10 +1,78 @@
+Function Get-StoredPassword {
+	<#
+	.Synopsis
+	Retrieves a plaintext password from Windows Credential Manager
+	.Description
+	Uses the advapi32 CredRead API to look up a Generic credential by target name
+	and return the stored password. Returns $null if the credential is not found.
+	.Parameter Target
+	The target name of the stored credential (e.g. "Powershell Client Install Password")
+	.Example
+	$pw = Get-StoredPassword -Target "Powershell Client Install Password"
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$Target
+	)
+
+	if (-not ([System.Management.Automation.PSTypeName]'CredManager').Type) {
+		Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public class CredManager {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credential);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern void CredFree(IntPtr credential);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CREDENTIAL {
+        public int Flags;
+        public int Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public int CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public int Persist;
+        public int AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+
+    public static string GetPassword(string target) {
+        IntPtr credPtr;
+        if (!CredRead(target, 1, 0, out credPtr)) {
+            return null;
+        }
+        try {
+            CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL));
+            if (cred.CredentialBlob != IntPtr.Zero && cred.CredentialBlobSize > 0) {
+                return Marshal.PtrToStringUni(cred.CredentialBlob, cred.CredentialBlobSize / 2);
+            }
+            return null;
+        } finally {
+            CredFree(credPtr);
+        }
+    }
+}
+"@
+	}
+
+	return [CredManager]::GetPassword($Target)
+}
+
 Function Protect-ConfigFile {
 	<#
 	.Synopsis
 	Encrypts a configuration file for secure storage
 	.Description
 	Takes a plaintext configuration file and encrypts it using AES-256-CBC with a
-	password-derived key (PBKDF2-SHA256, 100000 iterations). The encrypted file
+	password-derived key (PBKDF2-SHA256, 600000 iterations). The encrypted file
 	can be safely committed to a public or private repository.
 	.Parameter Path
 	Path to the plaintext configuration file (e.g. Sophos.csv, Action1.csv)
@@ -43,43 +111,48 @@ Function Protect-ConfigFile {
 	$rng.GetBytes($salt)
 	$rng.GetBytes($iv)
 
-	# Derive AES-256 key from password using PBKDF2-SHA256
-	$keyDerivation = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
-		$Password, $salt, 100000, [System.Security.Cryptography.HashAlgorithmName]::SHA256
-	)
-	$key = $keyDerivation.GetBytes(32)
+	$keyDerivation = $null
+	$aes = $null
+	$encryptor = $null
 
-	# Encrypt with AES-256-CBC
-	$aes = [System.Security.Cryptography.Aes]::Create()
-	$aes.Key = $key
-	$aes.IV = $iv
-	$aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
-	$aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+	try {
+		# Derive AES-256 key from password using PBKDF2-SHA256 (600k iterations per NIST SP 800-63B)
+		$keyDerivation = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
+			$Password, $salt, 600000, [System.Security.Cryptography.HashAlgorithmName]::SHA256
+		)
+		$key = $keyDerivation.GetBytes(32)
 
-	$encryptor = $aes.CreateEncryptor()
-	$ciphertext = $encryptor.TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
+		# Encrypt with AES-256-CBC
+		$aes = [System.Security.Cryptography.Aes]::Create()
+		$aes.Key = $key
+		$aes.IV = $iv
+		$aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+		$aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
 
-	# Combine: salt(16) + iv(16) + ciphertext
-	$combined = New-Object byte[] ($salt.Length + $iv.Length + $ciphertext.Length)
-	[System.Buffer]::BlockCopy($salt, 0, $combined, 0, 16)
-	[System.Buffer]::BlockCopy($iv, 0, $combined, 16, 16)
-	[System.Buffer]::BlockCopy($ciphertext, 0, $combined, 32, $ciphertext.Length)
+		$encryptor = $aes.CreateEncryptor()
+		$ciphertext = $encryptor.TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
 
-	# Write as Base64
-	$outputFullPath = if ([System.IO.Path]::IsPathRooted($OutputPath)) {
-		$OutputPath
-	} else {
-		Join-Path (Get-Location) $OutputPath
+		# Combine: salt(16) + iv(16) + ciphertext
+		$combined = New-Object byte[] ($salt.Length + $iv.Length + $ciphertext.Length)
+		[System.Buffer]::BlockCopy($salt, 0, $combined, 0, 16)
+		[System.Buffer]::BlockCopy($iv, 0, $combined, 16, 16)
+		[System.Buffer]::BlockCopy($ciphertext, 0, $combined, 32, $ciphertext.Length)
+
+		# Write as Base64
+		$outputFullPath = if ([System.IO.Path]::IsPathRooted($OutputPath)) {
+			$OutputPath
+		} else {
+			Join-Path (Get-Location) $OutputPath
+		}
+		[System.IO.File]::WriteAllText($outputFullPath, [System.Convert]::ToBase64String($combined))
+
+		Write-Host "Encrypted file saved to: $outputFullPath" -ForegroundColor Green
+	} finally {
+		if ($encryptor) { $encryptor.Dispose() }
+		if ($aes) { $aes.Dispose() }
+		if ($keyDerivation) { $keyDerivation.Dispose() }
+		$rng.Dispose()
 	}
-	[System.IO.File]::WriteAllText($outputFullPath, [System.Convert]::ToBase64String($combined))
-
-	# Cleanup
-	$encryptor.Dispose()
-	$aes.Dispose()
-	$keyDerivation.Dispose()
-	$rng.Dispose()
-
-	Write-Host "Encrypted file saved to: $outputFullPath" -ForegroundColor Green
 }
 
 Function Unprotect-ConfigFile {
@@ -88,7 +161,8 @@ Function Unprotect-ConfigFile {
 	Decrypts an encrypted configuration file string
 	.Description
 	Decrypts Base64-encoded AES-256-CBC encrypted content using a password-derived
-	key (PBKDF2-SHA256, 100000 iterations). Returns the plaintext content as a string.
+	key (PBKDF2-SHA256, 600000 iterations). Returns the plaintext content as a string.
+	Note: assumes the original file was UTF-8 encoded.
 	.Parameter EncryptedContent
 	The Base64-encoded encrypted content (as downloaded from BinCache)
 	.Parameter Password
@@ -122,31 +196,34 @@ Function Unprotect-ConfigFile {
 	[System.Buffer]::BlockCopy($combined, 16, $iv, 0, 16)
 	[System.Buffer]::BlockCopy($combined, 32, $ciphertext, 0, $ciphertextLength)
 
-	# Derive key from password using PBKDF2-SHA256
-	$keyDerivation = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
-		$Password, $salt, 100000, [System.Security.Cryptography.HashAlgorithmName]::SHA256
-	)
-	$key = $keyDerivation.GetBytes(32)
-
-	# Decrypt with AES-256-CBC
-	$aes = [System.Security.Cryptography.Aes]::Create()
-	$aes.Key = $key
-	$aes.IV = $iv
-	$aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
-	$aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+	$keyDerivation = $null
+	$aes = $null
+	$decryptor = $null
 
 	try {
+		# Derive key from password using PBKDF2-SHA256 (600k iterations per NIST SP 800-63B)
+		$keyDerivation = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
+			$Password, $salt, 600000, [System.Security.Cryptography.HashAlgorithmName]::SHA256
+		)
+		$key = $keyDerivation.GetBytes(32)
+
+		# Decrypt with AES-256-CBC
+		$aes = [System.Security.Cryptography.Aes]::Create()
+		$aes.Key = $key
+		$aes.IV = $iv
+		$aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+		$aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+
 		$decryptor = $aes.CreateDecryptor()
 		$plainBytes = $decryptor.TransformFinalBlock($ciphertext, 0, $ciphertext.Length)
-		$decryptor.Dispose()
 	} catch [System.Security.Cryptography.CryptographicException] {
-		$aes.Dispose()
-		$keyDerivation.Dispose()
 		throw "Decryption failed. The password is incorrect or the file is corrupted."
+	} finally {
+		if ($decryptor) { $decryptor.Dispose() }
+		if ($aes) { $aes.Dispose() }
+		if ($keyDerivation) { $keyDerivation.Dispose() }
 	}
 
-	$aes.Dispose()
-	$keyDerivation.Dispose()
-
+	# Assumes original file was UTF-8 encoded
 	return [System.Text.Encoding]::UTF8.GetString($plainBytes)
 }

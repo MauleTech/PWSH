@@ -29,11 +29,9 @@ Function Install-Action1 {
 
 		# Download and decrypt the encrypted site configuration
 		try {
-			$EncryptedContent = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Action1.enc" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content
-			$DecryptedCsv = Unprotect-ConfigFile -EncryptedContent $EncryptedContent -Password $Password
+			$DecryptedCsv = Get-DecryptedConfig -Url "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Action1.enc" -Password $Password
 		} catch {
-			Write-Host "Failed to download or decrypt site configuration: $_" -ForegroundColor Red
-			Write-Host "Verify your password is correct and try again." -ForegroundColor Yellow
+			Write-Error "Failed to download or decrypt site configuration: $_"
 			return
 		}
 
@@ -647,11 +645,9 @@ Function Install-SophosEndpoint {
 
 		# Download and decrypt the encrypted site configuration
 		try {
-			$EncryptedContent = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.enc" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content
-			$DecryptedCsv = Unprotect-ConfigFile -EncryptedContent $EncryptedContent -Password $Password
+			$DecryptedCsv = Get-DecryptedConfig -Url "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.enc" -Password $Password
 		} catch {
-			Write-Host "Failed to download or decrypt site configuration: $_" -ForegroundColor Red
-			Write-Host "Verify your password is correct and try again." -ForegroundColor Yellow
+			Write-Error "Failed to download or decrypt site configuration: $_"
 			return
 		}
 

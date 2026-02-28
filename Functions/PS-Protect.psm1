@@ -233,6 +233,6 @@ Function Get-DecryptedConfig {
 		[string]$Password
 	)
 
-	$content = (Invoke-WebRequest -Uri $Url -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content
+	$content = (Invoke-WebRequest -Uri $Url -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content.Trim()
 	return Unprotect-ConfigFile -EncryptedContent $content -Password $Password
 }

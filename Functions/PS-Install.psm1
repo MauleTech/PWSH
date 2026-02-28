@@ -4,17 +4,12 @@ Function Install-Action1 {
 		Installs the Action1 Patch Management Software
 	.Description
 		Installs Action1 Patch Management Software. Requires a password to decrypt the site configuration.
-		If -Password is omitted, the function checks Windows Credential Manager for a Generic credential
-		named "Powershell Client Install Password".
 	.Parameter Code
 		The site code identifying which organization's Action1 configuration to use
 	.Parameter Password
-		The password to decrypt the Action1 site configuration file.
-		If omitted, retrieved from Windows Credential Manager.
+		The password to decrypt the Action1 site configuration file
 	.Notes
 		Use Protect-ConfigFile to encrypt an updated Action1.csv before uploading to BinCache.
-		To store the password in Credential Manager:
-		  cmdkey /generic:"Powershell Client Install Password" /user:IT /pass:<password>
 	#>
 
 	###Require -RunAsAdministrator
@@ -27,15 +22,9 @@ Function Install-Action1 {
 	If (-not (Get-Service -Name "A1Agent" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Action1 patch management."
 
-		# Resolve password: parameter > Credential Manager
 		if ([string]::IsNullOrEmpty($Password)) {
-			$Password = Get-StoredPassword -Target "Powershell Client Install Password"
-			if ([string]::IsNullOrEmpty($Password)) {
-				Write-Warning "No password provided. Use -Password or store it in Windows Credential Manager as 'Powershell Client Install Password'."
-				Write-Warning "To store: cmdkey /generic:`"Powershell Client Install Password`" /user:IT /pass:<password>"
-				return
-			}
-			Write-Verbose "Using password from Windows Credential Manager."
+			Write-Warning "No -Password provided. Check the credential store for 'Powershell Client Install Password' and pass it with -Password."
+			return
 		}
 
 		# Download and decrypt the encrypted site configuration
@@ -633,17 +622,12 @@ Function Install-SophosEndpoint {
 	Installs the Sophos Endpoint Software
 	.Description
 	Installs Sophos Endpoint Software. Requires a password to decrypt the site configuration.
-	If -Password is omitted, the function checks Windows Credential Manager for a Generic credential
-	named "Powershell Client Install Password".
 	.Parameter Code
 	The site code identifying which organization's Sophos configuration to use
 	.Parameter Password
-	The password to decrypt the Sophos site configuration file.
-	If omitted, retrieved from Windows Credential Manager.
+	The password to decrypt the Sophos site configuration file
 	.Notes
 	Use Protect-ConfigFile to encrypt an updated Sophos.csv before uploading to BinCache.
-	To store the password in Credential Manager:
-	  cmdkey /generic:"Powershell Client Install Password" /user:IT /pass:<password>
 	#>
 
 	###Require -RunAsAdministrator
@@ -656,15 +640,9 @@ Function Install-SophosEndpoint {
 	If (-not (Get-Service -Name "Sophos Endpoint Defense Service" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Sophos Endpoint."
 
-		# Resolve password: parameter > Credential Manager
 		if ([string]::IsNullOrEmpty($Password)) {
-			$Password = Get-StoredPassword -Target "Powershell Client Install Password"
-			if ([string]::IsNullOrEmpty($Password)) {
-				Write-Warning "No password provided. Use -Password or store it in Windows Credential Manager as 'Powershell Client Install Password'."
-				Write-Warning "To store: cmdkey /generic:`"Powershell Client Install Password`" /user:IT /pass:<password>"
-				return
-			}
-			Write-Verbose "Using password from Windows Credential Manager."
+			Write-Warning "No -Password provided. Check the credential store for 'Powershell Client Install Password' and pass it with -Password."
+			return
 		}
 
 		# Download and decrypt the encrypted site configuration

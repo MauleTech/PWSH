@@ -98,6 +98,7 @@ Enable-SSL #Enables SSL Permanently
 
 [Get]
 -----
+  Get-DecryptedConfig
   Get-ADStaleComputers
   Get-ADStaleUsers
   Get-ADUserPassExpirations
@@ -160,6 +161,11 @@ Enable-SSL #Enables SSL Permanently
 [Join]
 ------
   Join-Domain
+
+[Protect]
+---------
+  Protect-ConfigFile
+  Unprotect-ConfigFile
 
 [Optimize]
 ----------

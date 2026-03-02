@@ -3,22 +3,39 @@ Function Install-Action1 {
 	.Synopsis
 		Installs the Action1 Patch Management Software
 	.Description
-		Installs Action1 Patch Management Software
+		Installs Action1 Patch Management Software. Requires a password to decrypt the site configuration.
+	.Parameter Code
+		The site code identifying which organization's Action1 configuration to use
+	.Parameter Password
+		The password to decrypt the Action1 site configuration file
 	.Notes
-		For a list of site codes, go to:
-		https://github.com/MauleTech/PWSH/blob/master/Scripts/Action1.csv
+		Use Protect-ConfigFile to encrypt an updated Action1.csv before uploading to BinCache.
 	#>
 
 	###Require -RunAsAdministrator
 	[cmdletbinding()]
 	param(
-		[string]$Code
+		[string]$Code,
+		[string]$Password
 	)
 
 	If (-not (Get-Service -Name "A1Agent" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Action1 patch management."
-		$SiteConfigs = @()
-		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Action1.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
+
+		if ([string]::IsNullOrEmpty($Password)) {
+			Write-Warning "No -Password provided. Check the credential store for 'Powershell Client Install Password' and pass it with -Password."
+			return
+		}
+
+		# Download and decrypt the encrypted site configuration
+		try {
+			$DecryptedCsv = Get-DecryptedConfig -Url "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Action1.enc" -Password $Password
+		} catch {
+			Write-Error "Failed to download or decrypt site configuration: $_"
+			return
+		}
+
+		$SiteConfigs = $DecryptedCsv | ConvertFrom-Csv -Delimiter ','
 
 		# If a global variable 'SiteCode' exists, use it
 		If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {
@@ -602,22 +619,39 @@ Function Install-SophosEndpoint {
 	.Synopsis
 	Installs the Sophos Endpoint Software
 	.Description
-	Installs Sophos Endpoint Software
+	Installs Sophos Endpoint Software. Requires a password to decrypt the site configuration.
+	.Parameter Code
+	The site code identifying which organization's Sophos configuration to use
+	.Parameter Password
+	The password to decrypt the Sophos site configuration file
 	.Notes
-	For a list of site codes, go to:
-	https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.csv
+	Use Protect-ConfigFile to encrypt an updated Sophos.csv before uploading to BinCache.
 	#>
 
 	###Require -RunAsAdministrator
 	[cmdletbinding()]
 	param(
-		[string]$Code
+		[string]$Code,
+		[string]$Password
 	)
 
 	If (-not (Get-Service -Name "Sophos Endpoint Defense Service" -ErrorAction SilentlyContinue)) {
 		Write-Host "Installing Sophos Endpoint."
-		$SiteConfigs = @()
-		$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | ConvertFrom-Csv -Delimiter ','
+
+		if ([string]::IsNullOrEmpty($Password)) {
+			Write-Warning "No -Password provided. Check the credential store for 'Powershell Client Install Password' and pass it with -Password."
+			return
+		}
+
+		# Download and decrypt the encrypted site configuration
+		try {
+			$DecryptedCsv = Get-DecryptedConfig -Url "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.enc" -Password $Password
+		} catch {
+			Write-Error "Failed to download or decrypt site configuration: $_"
+			return
+		}
+
+		$SiteConfigs = $DecryptedCsv | ConvertFrom-Csv -Delimiter ','
 
 		# If a global variable 'SiteCode' exists, use it
 		If (Get-Variable -Name SiteCode -ErrorAction SilentlyContinue) {

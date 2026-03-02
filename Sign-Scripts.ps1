@@ -125,21 +125,18 @@ $pfxBytes = [Convert]::FromBase64String($base64Value)
 $base64Value = $null
 Write-Host "  PFX data size: $($pfxBytes.Length) bytes" -ForegroundColor Gray
 
+# Import via the native PowerShell cmdlet rather than the .NET X509Certificate2
+# constructor, which has known issues associating private keys on Windows CI runners.
+$tempPfx = Join-Path ([System.IO.Path]::GetTempPath()) "sign-$([Guid]::NewGuid().ToString('N')).pfx"
 try {
-    # MachineKeySet is required for service accounts and CI runners where the
-    # user profile may not be fully loaded (e.g., GitHub Actions windows-latest).
-    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-        $pfxBytes,
-        [string]::Empty,
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet -bor
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-    )
+    [System.IO.File]::WriteAllBytes($tempPfx, $pfxBytes)
+    $cert = Import-PfxCertificate -FilePath $tempPfx -CertStoreLocation Cert:\CurrentUser\My -Exportable
 }
 catch {
-    throw "Failed to load PFX from Key Vault. The certificate may be password-protected or in an unexpected format. Ensure it was imported to Key Vault as an exportable PFX without a password. Inner error: $($_.Exception.Message)"
+    throw "Failed to import PFX from Key Vault. The certificate may be password-protected, have a non-exportable key policy, or be in an unexpected format. Inner error: $($_.Exception.Message)"
 }
 finally {
-    # Zero out private key material from memory
+    Remove-Item $tempPfx -Force -ErrorAction SilentlyContinue
     [System.Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
 }
 
@@ -247,8 +244,10 @@ foreach ($file in $filesToSign) {
     }
 }
 
-# Release the private key from memory
+# Remove the imported certificate from the store and release from memory
+$certThumbprint = $cert.Thumbprint
 $cert.Dispose()
+Get-ChildItem "Cert:\CurrentUser\My\$certThumbprint" -ErrorAction SilentlyContinue | Remove-Item -Force
 
 # -------------------------------------------------------------------
 # Summary

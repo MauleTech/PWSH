@@ -1313,16 +1313,16 @@ Function Install-WinRepairToolbox {
 		Invoke-ValidatedDownload -Uri $URL -OutFile $DLFilePath
 	Write-Host "Expanding Windows Repair Toolbox"
 		Expand-Archive -Path $DLFilePath -DestinationPath $DLFolder -Force
-	Write-Host "Downloading Windows Repair Toolbox Customizations"
+	<#Write-Host "Downloading Windows Repair Toolbox Customizations"
 		$URL = 'https://files.mauletech.com/Software/Windows_Repair_Toolbox_Custom.zip?dl'
 		$CustomizationFilePath = $DLFolder + '\Windows_Repair_Toolbox_Custom.zip'
 		$null = (New-Item -ItemType Directory -Force -Path $DLFolder)
 		(New-Object System.Net.WebClient).DownloadFile($url, $CustomizationFilePath)
 	Write-Host "Customizing Windows Repair Toolbox"
-		Expand-Archive -Path $CustomizationFilePath -DestinationPath $DLFolder -Force
+		Expand-Archive -Path $CustomizationFilePath -DestinationPath $DLFolder -Force#>
 	Write-Host "Cleaning up downloaded files"
 	Remove-Item -Path $DLFilePath -Force
-	Remove-Item -Path $CustomizationFilePath -Force
+	#Remove-Item -Path $CustomizationFilePath -Force
 	"& $($DLFolder + '\Windows_Repair_Toolbox.exe')" | Clip
 	Write-Host "The command to launch Windows Repair Toolbox has been put in your clipboard."
 }

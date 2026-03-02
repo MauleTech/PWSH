@@ -125,23 +125,93 @@ $pfxBytes = [Convert]::FromBase64String($base64Value)
 $base64Value = $null
 Write-Host "  PFX data size: $($pfxBytes.Length) bytes" -ForegroundColor Gray
 
-# Import via the native PowerShell cmdlet rather than the .NET X509Certificate2
-# constructor, which has known issues associating private keys on Windows CI runners.
+# Write PFX to temp file for import and diagnostics
 $tempPfx = Join-Path ([System.IO.Path]::GetTempPath()) "sign-$([Guid]::NewGuid().ToString('N')).pfx"
+[System.IO.File]::WriteAllBytes($tempPfx, $pfxBytes)
+[System.Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+
+# Dump PFX structure via certutil so we can see whether a private key is present
+Write-Host "  Inspecting PFX structure with certutil..." -ForegroundColor Gray
+$certutilOutput = & certutil -dump -p '""' $tempPfx 2>&1 | Out-String
+# Show key-related lines (avoid leaking full cert details)
+$certutilOutput -split "`n" | Where-Object {
+    $_ -match 'Key Container|Private Key|CERT_KEY_PROV_INFO|Provider|KeySpec|Bag Attribute|friendlyName|Microsoft'
+} | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+
+# Try multiple import strategies
+$cert = $null
+
+# Strategy 1: Import-PfxCertificate (native PowerShell cmdlet)
+Write-Host "  Import strategy: Import-PfxCertificate..." -ForegroundColor Gray
 try {
-    [System.IO.File]::WriteAllBytes($tempPfx, $pfxBytes)
-    $cert = Import-PfxCertificate -FilePath $tempPfx -CertStoreLocation Cert:\CurrentUser\My -Exportable
+    $emptyPw = ConvertTo-SecureString -String '' -AsPlainText -Force
+    $cert = Import-PfxCertificate -FilePath $tempPfx -CertStoreLocation Cert:\CurrentUser\My `
+        -Password $emptyPw -Exportable
+    Write-Host "    HasPrivateKey: $($cert.HasPrivateKey)" -ForegroundColor Gray
 }
 catch {
-    throw "Failed to import PFX from Key Vault. The certificate may be password-protected, have a non-exportable key policy, or be in an unexpected format. Inner error: $($_.Exception.Message)"
-}
-finally {
-    Remove-Item $tempPfx -Force -ErrorAction SilentlyContinue
-    [System.Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+    Write-Host "    Failed: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
-if (-not $cert.HasPrivateKey) {
-    throw "Certificate '$CertName' does not have a private key. Ensure the Key Vault certificate has an exportable private key."
+# Strategy 2: certutil -importpfx (Windows CryptoAPI, bypasses .NET entirely)
+if (-not $cert -or -not $cert.HasPrivateKey) {
+    Write-Host "  Import strategy: certutil -importpfx..." -ForegroundColor Gray
+    $importOutput = & certutil -f -user -p '""' -importpfx My $tempPfx 2>&1 | Out-String
+    Write-Host "    certutil output:" -ForegroundColor Gray
+    $importOutput -split "`n" | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
+
+    # Retrieve the cert from the store by finding the most recently added cert
+    # that matches what was just imported
+    $pfxForSubject = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($tempPfx)
+    $expectedThumbprint = $pfxForSubject.Thumbprint
+    $pfxForSubject.Dispose()
+    $cert = Get-ChildItem "Cert:\CurrentUser\My\$expectedThumbprint" -ErrorAction SilentlyContinue
+    if ($cert) {
+        Write-Host "    Found cert in store - HasPrivateKey: $($cert.HasPrivateKey)" -ForegroundColor Gray
+    }
+    else {
+        Write-Host "    Certificate not found in store after certutil import" -ForegroundColor Yellow
+    }
+}
+
+# Strategy 3: X509Certificate2Collection with PersistKeySet + MachineKeySet
+if (-not $cert -or -not $cert.HasPrivateKey) {
+    Write-Host "  Import strategy: X509Certificate2Collection..." -ForegroundColor Gray
+    try {
+        $collection = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+        $collection.Import(
+            $tempPfx,
+            [string]::Empty,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+        )
+        Write-Host "    Certificates in collection: $($collection.Count)" -ForegroundColor Gray
+        foreach ($c in $collection) {
+            Write-Host "    Subject: $($c.Subject) | HasPrivateKey: $($c.HasPrivateKey) | KeyAlg: $($c.PublicKey.Oid.FriendlyName)" -ForegroundColor Gray
+        }
+        $cert = $collection | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+        if (-not $cert) { $cert = $collection[0] }
+    }
+    catch {
+        Write-Host "    Failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+Remove-Item $tempPfx -Force -ErrorAction SilentlyContinue
+
+if (-not $cert -or -not $cert.HasPrivateKey) {
+    Write-Host ""
+    Write-Host "  === DIAGNOSTIC SUMMARY ===" -ForegroundColor Red
+    Write-Host "  All import strategies failed to find a private key." -ForegroundColor Red
+    Write-Host "  This typically means the Key Vault certificate's key policy" -ForegroundColor Red
+    Write-Host "  has 'Exportable Private Key' set to NO." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  To fix: In Azure Portal > Key Vault > Certificates > $CertName" -ForegroundColor Yellow
+    Write-Host "    > Certificate Policy > Advanced Policy Configuration" -ForegroundColor Yellow
+    Write-Host "    > Set 'Exportable Private Key' to YES" -ForegroundColor Yellow
+    Write-Host "    > Then create a new version of the certificate." -ForegroundColor Yellow
+    throw "Certificate '$CertName' does not have a private key. The Key Vault certificate likely has a non-exportable key policy. See diagnostic output above."
 }
 
 # Verify the certificate has the Code Signing EKU

@@ -10,6 +10,13 @@ if (-not $ITFolder) {
 # TLS 1.2 only — 1.0 and 1.1 are deprecated and insecure
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
+# Canonical list of well-known system git install paths — single source of truth used by
+# both Test-GitInstalled and the bootstrap fallback search to prevent the lists drifting apart
+$Script:GitCandidatePaths = @(
+    "C:\Program Files\Git\bin\git.exe",
+    "C:\Program Files (x86)\Git\bin\git.exe"
+)
+
 # Check if a usable git executable is available
 function Test-GitInstalled {
     param([string]$GitPath = "$ITFolder\GitHub\MinGit\bin\git.exe")
@@ -17,10 +24,7 @@ function Test-GitInstalled {
     if (Test-Path $GitPath) { return $true }
 
     # Check common system install paths
-    foreach ($candidate in @(
-        "C:\Program Files\Git\bin\git.exe",
-        "C:\Program Files (x86)\Git\bin\git.exe"
-    )) {
+    foreach ($candidate in $Script:GitCandidatePaths) {
         if (Test-Path $candidate) { return $true }
     }
 
@@ -349,10 +353,15 @@ function Global:Import-ITModules {
     }
 }
 
-# Silent update — no output, for internal/background use
+# Silent update — no output, for internal/background job use.
+# Errors are caught and silently discarded: background jobs have no interactive
+# console, so an unhandled terminating error would just surface as a noisy job failure.
 function Global:Update-ITPS {
-    Sync-PWSHRepository
-    Import-ITModules
+    try {
+        Sync-PWSHRepository
+        Import-ITModules
+    }
+    catch { }
 }
 
 # User-facing update with progress output
@@ -382,7 +391,7 @@ $Global:GitExePath      = "$ITFolder\GitHub\MinGit\bin\git.exe"
 # Remove legacy PortableGit installation if present (one-time migration to MinGit)
 $PortableGitFolder = "$ITFolder\GitHub\PortableGit"
 if (Test-Path $PortableGitFolder) {
-    Write-Host "Removing legacy PortableGit installation..." -ForegroundColor Yellow
+    Write-Warning "Deleting $PortableGitFolder (legacy PortableGit — no longer used). Move it first if another tool placed it there."
     Remove-Item -Path $PortableGitFolder -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "Legacy PortableGit removed." -ForegroundColor Green
 }
@@ -397,10 +406,7 @@ $MinGitNeedsInstall = $false
 if (-not $MinGitReady) {
     # Look for any usable git to carry this session while MinGit is installed behind the scenes
     $fallbackGit = $null
-    foreach ($candidate in @(
-        "C:\Program Files\Git\bin\git.exe",
-        "C:\Program Files (x86)\Git\bin\git.exe"
-    )) {
+    foreach ($candidate in $Script:GitCandidatePaths) {
         if (Test-Path $candidate) { $fallbackGit = $candidate; break }
     }
     if (-not $fallbackGit) {
@@ -438,8 +444,9 @@ if (Test-Path $Global:PWSHFolder) {
         Set-GitSafeDirectory -Git $Global:GitCommand -Path $Global:PWSHFolder
 
         $CurrentBranch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $Global:PWSHFolder
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $Global:PWSHFolder
+        # Suppress git stdout — "Repository updated successfully!" is the explicit confirmation
+        Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $Global:PWSHFolder | Out-Null
+        Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $Global:PWSHFolder | Out-Null
 
         Write-Host "Repository updated successfully!" -ForegroundColor Green
     }
@@ -480,23 +487,35 @@ if (Test-Path $Global:FunctionsFolder) {
             Write-Host " $funcCount Functions successfully loaded in $elapsed" -ForegroundColor Green
             Write-Host " - Get-ITFunctions to see commands. Update-ITFunctions to load updates."
 
-            # Background MinGit maintenance — runs silently after the prompt is returned
-            # Cleans up any previous completed run before starting a fresh one
-            Get-Job -Name "MinGit-Maintenance" -ErrorAction SilentlyContinue |
-                Where-Object { $_.State -in @('Completed','Failed','Stopped') } | Remove-Job
-            if ($MinGitNeedsInstall) {
-                Write-Host " - Installing MinGit in the background for future sessions..." -ForegroundColor DarkGray
+            # Background MinGit maintenance — gate on a staleness check so the GitHub
+            # redirect is not hit on every session open when MinGit is already current.
+            # Always runs when MinGit needs installing; otherwise only when git.exe is
+            # older than 7 days (i.e. hasn't been updated this week).
+            $runMaintenanceJob = $MinGitNeedsInstall
+            if (-not $runMaintenanceJob -and $MinGitReady) {
+                $daysSinceUpdate   = ((Get-Date) - (Get-Item $Global:GitExePath).LastWriteTime).TotalDays
+                $runMaintenanceJob = $daysSinceUpdate -gt 7
             }
-            Start-Job -Name "MinGit-Maintenance" `
-                -ArgumentList ${function:Get-MinGitLatestInfo}, ${function:Install-MinGit}, $ITFolder `
-                -ScriptBlock {
-                    param($getInfoFn, $installFn, $itFolder)
-                    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-                    $Global:ITFolder = $itFolder
-                    New-Item -Path function: -Name Get-MinGitLatestInfo -Value $getInfoFn | Out-Null
-                    New-Item -Path function: -Name Install-MinGit       -Value $installFn | Out-Null
-                    Install-MinGit
-                } | Out-Null
+
+            if ($runMaintenanceJob) {
+                Get-Job -Name "MinGit-Maintenance" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.State -in @('Completed','Failed','Stopped') } | Remove-Job
+                if ($MinGitNeedsInstall) {
+                    Write-Host " - Installing MinGit in the background for future sessions..." -ForegroundColor DarkGray
+                }
+                # ${function:Name} captures the function's ScriptBlock so it can be passed
+                # into the job's separate runspace, which does not inherit the parent scope.
+                Start-Job -Name "MinGit-Maintenance" `
+                    -ArgumentList ${function:Get-MinGitLatestInfo}, ${function:Install-MinGit}, $ITFolder `
+                    -ScriptBlock {
+                        param($getInfoFn, $installFn, $itFolder)
+                        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+                        $Global:ITFolder = $itFolder
+                        New-Item -Path function: -Name Get-MinGitLatestInfo -Value $getInfoFn | Out-Null
+                        New-Item -Path function: -Name Install-MinGit       -Value $installFn | Out-Null
+                        Install-MinGit
+                    } | Out-Null
+            }
             Write-Host ""
         }
         else {

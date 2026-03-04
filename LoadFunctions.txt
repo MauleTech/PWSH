@@ -1,4 +1,3 @@
-#Write-Host "`n - Retrieving Maule Technologies PowerShell Functions via Git -"
 Set-ExecutionPolicy Bypass -Scope Process -Force
 
 $bootTimer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -8,145 +7,164 @@ if (-not $ITFolder) {
     $Global:ITFolder = "$Env:SystemDrive\IT"
 }
 
-# Enable TLS 1.2/1.1/1.0
-[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
+# TLS 1.2 only — 1.0 and 1.1 are deprecated and insecure
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
-# Function to check if git is installed
-Function Test-GitInstalled {
-    param([string]$GitPath = "$ITFolder\GitHub\PortableGit\bin\git.exe")
+# Check if a usable git executable is available
+function Test-GitInstalled {
+    param([string]$GitPath = "$ITFolder\GitHub\MinGit\bin\git.exe")
 
-    if (Test-Path $GitPath) {
-        return $true
+    if (Test-Path $GitPath) { return $true }
+
+    # Check common system install paths
+    foreach ($candidate in @(
+        "C:\Program Files\Git\bin\git.exe",
+        "C:\Program Files (x86)\Git\bin\git.exe"
+    )) {
+        if (Test-Path $candidate) { return $true }
     }
 
-    # Also check system PATH
+    # Check system PATH via Get-Command (avoids executing unknown binaries)
+    return ($null -ne (Get-Command git -ErrorAction SilentlyContinue))
+}
+
+# Resolve the latest MinGit tag and download URL via GitHub redirect (no full API JSON call)
+function Get-MinGitLatestInfo {
     try {
-        $null = git --version 2>$null
+        $request = [System.Net.WebRequest]::Create("https://github.com/git-for-windows/git/releases/latest")
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 15000
+        $response = $request.GetResponse()
+        $location = $response.Headers["Location"]
+        $response.Close()
+
+        if ([string]::IsNullOrWhiteSpace($location)) {
+            throw "GitHub did not return a Location header — redirect format may have changed"
+        }
+
+        # Extract tag from URL: .../releases/tag/v2.47.1.windows.2
+        if ($location -notmatch '/tag/(v\d+\.\d+\.\d+\.windows\.\d+)$') {
+            throw "Unexpected tag format in redirect URL: $location"
+        }
+        $tag = $Matches[1]   # e.g. v2.47.1.windows.2
+
+        # Strip 'v' prefix and '.windows.N' suffix for the zip filename
+        $zipVersion = $tag -replace '^v' -replace '\.windows\.\d+$'   # e.g. 2.47.1
+
+        if ($zipVersion -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Could not parse a valid version from tag: $tag"
+        }
+
+        return @{
+            Tag         = $tag
+            Version     = $zipVersion
+            DownloadUrl = "https://github.com/git-for-windows/git/releases/download/$tag/MinGit-$zipVersion-64-bit.zip"
+            FileName    = "MinGit-$zipVersion-64-bit.zip"
+        }
+    }
+    catch {
+        throw "Failed to resolve latest MinGit release: $($_.Exception.Message)"
+    }
+}
+
+# Add safe.directory to global git config only if not already present
+# (uses USERPROFILE as working dir to avoid the chicken-and-egg problem of needing
+#  safe.directory to be set before running git commands inside the repo directory)
+function Set-GitSafeDirectory {
+    param([string]$Git, [string]$Path)
+    $safeWorkDir = if (Test-Path $env:USERPROFILE) { $env:USERPROFILE } else { "$env:SystemDrive\" }
+    try {
+        $existing = Invoke-Git -GitPath $Git -Arguments @("config", "--global", "--get-all", "safe.directory") -WorkingDirectory $safeWorkDir
+        if ($existing -contains $Path) { return }
+    }
+    catch {
+        # Exit code 1 = key not found in config; proceed to add it
+    }
+    Invoke-Git -GitPath $Git -Arguments @("config", "--global", "--add", "safe.directory", $Path) -WorkingDirectory $safeWorkDir
+}
+
+# Install MinGit (~16MB zip, no binary execution required)
+function Install-MinGit {
+    $GitFolder = "$ITFolder\GitHub\MinGit"
+    $TempPath  = "$env:TEMP\MinGit"
+
+    try {
+        [void](New-Item -ItemType Directory -Path $GitFolder -Force)
+        [void](New-Item -ItemType Directory -Path $TempPath  -Force)
+
+        Write-Host "Resolving latest MinGit release..." -ForegroundColor Green
+        $releaseInfo   = Get-MinGitLatestInfo
+        $LatestVersion = $releaseInfo.Version
+        $GitExePath    = "$GitFolder\bin\git.exe"
+
+        # Check whether the installed version is already current
+        if (Test-Path $GitExePath) {
+            Write-Host "Found existing MinGit, checking version..." -ForegroundColor Yellow
+            try {
+                $vi             = (Get-Item $GitExePath).VersionInfo
+                $CurrentVersion = "$($vi.ProductMajorPart).$($vi.ProductMinorPart).$($vi.ProductBuildPart)"
+                Write-Host "Current: $CurrentVersion  Latest: $LatestVersion" -ForegroundColor Cyan
+
+                if ([System.Version]$CurrentVersion -ge [System.Version]$LatestVersion) {
+                    Write-Host "MinGit is already up to date!" -ForegroundColor Green
+                    return $true
+                }
+                Write-Host "Update available, downloading..." -ForegroundColor Yellow
+            }
+            catch {
+                Write-Host "Could not read current version, re-downloading..." -ForegroundColor Yellow
+            }
+        }
+        else {
+            Write-Host "MinGit not found, downloading fresh copy..." -ForegroundColor Yellow
+        }
+
+        $FilePath = "$TempPath\$($releaseInfo.FileName)"
+        Write-Host "Downloading MinGit $LatestVersion from:" -ForegroundColor Green
+        Write-Host "  $($releaseInfo.DownloadUrl)" -ForegroundColor Yellow
+
+        $savedProgressPreference = $ProgressPreference
+        try {
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $releaseInfo.DownloadUrl -OutFile $FilePath -UseBasicParsing
+        }
+        finally {
+            $ProgressPreference = $savedProgressPreference
+        }
+
+        Write-Host "Downloaded: $([math]::Round((Get-Item $FilePath).Length / 1MB, 2)) MB" -ForegroundColor Green
+
+        Write-Host "Extracting to $GitFolder..." -ForegroundColor Green
+        Expand-Archive -Path $FilePath -DestinationPath $GitFolder -Force
+
+        if (-not (Test-Path $GitExePath)) {
+            throw "git.exe not found after extraction — archive structure may have changed"
+        }
+
+        Write-Host "Installed: $(& $GitExePath --version)" -ForegroundColor Green
+
+        Remove-Item -Path $TempPath -Recurse -Force
+
+        Write-Host "`n=== MinGit Installation Complete ===" -ForegroundColor Cyan
+        Write-Host "Location:   $GitFolder"  -ForegroundColor White
+        Write-Host "Executable: $GitExePath" -ForegroundColor White
+
         return $true
     }
     catch {
+        Write-Error "Failed to install MinGit: $($_.Exception.Message)"
         return $false
     }
 }
 
-# Function to install Git Portable
-Function Install-GitPortable {
-    $GitFolder = "$ITFolder\GitHub\PortableGit"
-    $TempPath = "$env:TEMP\GitPortable"
-
-    try {
-        # Create directories if they don't exist
-        Write-Host "Creating directories..." -ForegroundColor Green
-        New-Item -ItemType Directory -Path $GitFolder -Force | Out-Null
-        New-Item -ItemType Directory -Path $TempPath -Force | Out-Null
-
-        # Get latest Git release info from GitHub API
-        Write-Host "Fetching latest Git release information..." -ForegroundColor Green
-        $LatestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest"
-
-        # Extract version from tag (e.g., "v2.50.1.windows.1" -> "2.50.1")
-        $LatestVersionRaw = $LatestRelease.tag_name -replace '^v', ''
-        $LatestVersionParts = $LatestVersionRaw -split '\.'
-        $LatestVersion = "$($LatestVersionParts[0]).$($LatestVersionParts[1]).$($LatestVersionParts[2])"
-
-        # Check if Git is already installed and up to date
-        $GitExePath = "$GitFolder\bin\git.exe"
-        if (Test-Path $GitExePath) {
-            Write-Host "Found existing Git installation, checking version..." -ForegroundColor Yellow
-
-            try {
-                $CurrentVersionInfo = (Get-Item $GitExePath).VersionInfo
-                $CurrentVersion = "$($CurrentVersionInfo.ProductMajorPart).$($CurrentVersionInfo.ProductMinorPart).$($CurrentVersionInfo.ProductBuildPart)"
-
-                Write-Host "Current version: $CurrentVersion" -ForegroundColor Cyan
-                Write-Host "Latest version:  $LatestVersion" -ForegroundColor Cyan
-
-                if ([System.Version]$CurrentVersion -ge [System.Version]$LatestVersion) {
-                    Write-Host "Git Portable is already up to date!" -ForegroundColor Green
-                    return $true
-                } else {
-                    Write-Host "Update available, proceeding with download..." -ForegroundColor Yellow
-                }
-            } catch {
-                Write-Host "Could not determine current version, proceeding with download..." -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host "Git Portable not found, proceeding with fresh installation..." -ForegroundColor Yellow
-        }
-
-        # Find the portable x64 asset
-        $PortableAsset = $LatestRelease.assets | Where-Object {
-            $_.name -like "PortableGit*64-bit*" -and $_.name -like "*.exe"
-        }
-
-        if (-not $PortableAsset) {
-            throw "Could not find Git Portable 64-bit asset in latest release"
-        }
-
-        $DownloadUrl = $PortableAsset.browser_download_url
-        $FileName = $PortableAsset.name
-        $FilePath = "$TempPath\$FileName"
-
-        Write-Host "Found: $FileName" -ForegroundColor Yellow
-        Write-Host "Downloading from: $DownloadUrl" -ForegroundColor Yellow
-
-        # Download the file
-        Write-Host "Downloading Git Portable..." -ForegroundColor Green
-        try {
-            $ProgressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -Uri $DownloadUrl -OutFile $FilePath
-        } finally {
-            $ProgressPreference = 'Continue'
-        }
-
-        Write-Host "Download completed: $([math]::Round((Get-Item $FilePath).Length / 1MB, 2)) MB" -ForegroundColor Green
-
-        # Extract the 7zip self-extractor
-        Write-Host "Extracting Git Portable to $GitFolder..." -ForegroundColor Green
-
-        # -Wait ensures ExitCode is reliably populated when used with -PassThru
-        $Process = Start-Process -FilePath $FilePath -ArgumentList "-y", "-o$GitFolder" -NoNewWindow -Wait -PassThru
-
-        if ($Process.ExitCode -ne 0) {
-            throw "7zip extraction failed with exit code: $($Process.ExitCode)"
-        }
-
-        # Verify git.exe exists after extraction
-        $GitExePath = "$GitFolder\bin\git.exe"
-        if (Test-Path $GitExePath) {
-            Write-Host "Git Portable successfully extracted!" -ForegroundColor Green
-
-            $GitVersion = & "$GitExePath" --version
-            Write-Host "Installed version: $GitVersion" -ForegroundColor Green
-
-        } else {
-            throw "Git executable not found after extraction"
-        }
-
-        # Cleanup
-        Write-Host "Cleaning up temporary files..." -ForegroundColor Green
-        Remove-Item -Path $TempPath -Recurse -Force
-
-        Write-Host "`n=== Git Installation Complete ===" -ForegroundColor Cyan
-        Write-Host "Git Portable Location: $GitFolder" -ForegroundColor White
-        Write-Host "Git Executable: $GitExePath" -ForegroundColor White
-
-        return $true
-
-    } catch {
-        Write-Error "Failed to download/extract Git Portable: $($_.Exception.Message)"
-        return $false
-    }
-}
-
-# Function to run git commands using direct process execution (no subprocess overhead)
-Function Global:Invoke-Git {
+# Run git commands using the .NET Process API (avoids Start-Job overhead, prevents deadlocks)
+function Global:Invoke-Git {
     <#
     .SYNOPSIS
         Runs git commands using System.Diagnostics.Process for fast, isolated execution.
 
     .DESCRIPTION
-        Executes git commands in a separate process using .NET Process API directly,
+        Executes git commands in a separate process using the .NET Process API directly,
         avoiding the heavy overhead of Start-Job (which spawns a full powershell.exe).
         Uses ReadToEndAsync for deadlock-free stdout/stderr capture.
         Throws on non-zero exit codes so callers can use try/catch.
@@ -190,19 +208,18 @@ Function Global:Invoke-Git {
     }
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $GitPath
-    # Quote arguments that contain spaces or double quotes
+    $psi.FileName  = $GitPath
     $psi.Arguments = ($Arguments | ForEach-Object {
         $escaped = $_ -replace '"', '\"'
         if ($_ -match '[\s"]') { "`"$escaped`"" } else { $_ }
     }) -join ' '
-    $psi.WorkingDirectory = $WorkingDirectory
-    $psi.UseShellExecute = $false
+    $psi.WorkingDirectory       = $WorkingDirectory
+    $psi.UseShellExecute        = $false
     $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
 
-    # Prevent git from waiting for terminal input
+    # Prevent git from blocking on credential prompts
     $psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0"
 
     $process = New-Object System.Diagnostics.Process
@@ -211,14 +228,14 @@ Function Global:Invoke-Git {
     try {
         [void]$process.Start()
 
-        # Use ReadToEndAsync to read both streams concurrently (prevents deadlocks)
+        # Read both streams concurrently — prevents pipe buffer deadlocks
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
 
-        # 60 second timeout to prevent hanging on credential prompts or network issues
+        # 60s timeout prevents hanging on credential prompts or network issues
         if (-not $process.WaitForExit(60000)) {
             $process.Kill()
-            throw "Git command timed out after 60 seconds: git $($Arguments -join ' ')"
+            throw "Git command timed out after 60 seconds (slow network or credential prompt?): git $($Arguments -join ' ')"
         }
 
         $stdout = $stdoutTask.GetAwaiter().GetResult().TrimEnd([char]"`r", [char]"`n")
@@ -227,13 +244,11 @@ Function Global:Invoke-Git {
 
         if ($process.ExitCode -ne 0) {
             $cmdString = "git $($Arguments -join ' ')"
-            $errorMsg = if ($stderr) { $stderr } elseif ($stdout) { $stdout } else { "Exit code $($process.ExitCode)" }
+            $errorMsg  = if ($stderr) { $stderr } elseif ($stdout) { $stdout } else { "Exit code $($process.ExitCode)" }
             throw "Git command '$cmdString' failed: $errorMsg"
         }
 
-        if ($ShowOutput -and $output) {
-            $output | Write-Output
-        }
+        if ($ShowOutput -and $output) { $output | Write-Output }
 
         return $output
     }
@@ -242,147 +257,168 @@ Function Global:Invoke-Git {
     }
 }
 
-# Set up paths (global so Update-ITFunctions works after script scope ends)
-$Global:PWSHFolder = "$ITFolder\GitHub\PWSH"
-$Global:FunctionsFolder = "$PWSHFolder\Functions"
-$Global:GitExePath = "$ITFolder\GitHub\PortableGit\bin\git.exe"
-
-# Ensure git is installed
-if (-not (Test-GitInstalled)) {
-    if (-not (Install-GitPortable)) {
-        Write-Host "Cannot proceed without Git. Exiting." -ForegroundColor Red
-        return
-    }
-}
-
-# Set git executable path for this session (avoid duplicates)
-$gitBinPath = "$ITFolder\GitHub\PortableGit\bin"
-if ((Test-Path $GitExePath) -and $env:PATH -notlike "*$gitBinPath*") {
-    $env:PATH += ";$gitBinPath"
-}
-
-# Determine which git to use (resolved once, reused everywhere)
-$Global:GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
-
-# Helper to detect current branch with fallback to main
-Function Global:Get-CurrentBranch {
+# Detect current branch; falls back to remote HEAD ref, then 'main' as last resort
+function Global:Get-CurrentBranch {
     param([string]$Git, [string]$WorkDir)
     try {
-        $branchOutput = Invoke-Git -GitPath $Git -Arguments @("branch", "--show-current") -WorkingDirectory $WorkDir
-        $branch = ($branchOutput -join "").Trim()
-    } catch {
-        Write-Warning "Failed to detect current branch: $_"
+        $branch = (Invoke-Git -GitPath $Git -Arguments @("branch", "--show-current") -WorkingDirectory $WorkDir -join "").Trim()
+    }
+    catch {
+        Write-Warning "Failed to detect current branch: $($_.Exception.Message)"
         $branch = ""
     }
+
     if ([string]::IsNullOrWhiteSpace($branch)) {
-        Write-Warning "Detached HEAD or unknown state, defaulting to main branch"
-        $branch = "main"
+        # Detached HEAD — try to resolve the remote's default branch
+        try {
+            $headRef = (Invoke-Git -GitPath $Git -Arguments @("symbolic-ref", "refs/remotes/origin/HEAD") -WorkingDirectory $WorkDir -join "").Trim()
+            $branch  = $headRef -replace '^refs/remotes/origin/', ''
+        }
+        catch { $branch = "" }
+
+        if ([string]::IsNullOrWhiteSpace($branch)) {
+            Write-Warning "Could not determine branch from remote HEAD, defaulting to 'main'"
+            $branch = "main"
+        }
+        else {
+            Write-Warning "Detached HEAD state — using remote default branch: $branch"
+        }
     }
     return $branch
 }
 
-# Clone or update repository
-if (Test-Path $PWSHFolder) {
-    Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
-    try {
-        Invoke-Git -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
+# Shared git sync logic used by both Update-ITPS and Update-ITFunctions
+function Sync-PWSHRepository {
+    param([switch]$Verbose)
+    $branch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
+    if ($Verbose) { Write-Host "Current branch: $branch" -ForegroundColor Yellow }
 
-        $CurrentBranch = Get-CurrentBranch -Git $GitCommand -WorkDir $PWSHFolder
+    if ($Verbose) { Write-Host "Fetching latest changes..." -ForegroundColor Yellow }
+    Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $branch) -WorkingDirectory $Global:PWSHFolder | Out-Null
 
-        # Fetch only the branch we need (faster than fetching all refs)
-        Invoke-Git -GitPath $GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $PWSHFolder
+    if ($Verbose) { Write-Host "Resetting to origin/$branch..." -ForegroundColor Yellow }
+    Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$branch") -WorkingDirectory $Global:PWSHFolder | Out-Null
 
-        Invoke-Git -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder
-
-        Write-Host "Repository updated successfully!" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Failed to update repository: $_" -ForegroundColor Red
-        return
-    }
-} else {
-    Write-Host "Cloning PowerShell Functions repository..." -ForegroundColor Yellow
-    try {
-        New-Item -ItemType Directory -Force -Path "$ITFolder\GitHub" | Out-Null
-
-        # Shallow clone - only latest commit, single branch (much faster)
-        Invoke-Git -GitPath $GitCommand -Arguments @("clone", "--depth", "1", "--single-branch", "https://github.com/MauleTech/PWSH.git", $PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
-        Invoke-Git -GitPath $GitCommand -Arguments @("config", "--global", "--add", "safe.directory", $PWSHFolder) -WorkingDirectory $PWSHFolder
-
-        Write-Host "Repository cloned successfully!" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Failed to clone repository: $_" -ForegroundColor Red
-        return
+    if ($Verbose) {
+        $commit = Invoke-Git -GitPath $Global:GitCommand -Arguments @("log", "--oneline", "-1") -WorkingDirectory $Global:PWSHFolder
+        Write-Host "Current commit: $($commit -join '')" -ForegroundColor Green
     }
 }
 
-# Helper function to import all .psm1 modules from the Functions folder
-Function Global:Import-ITModules {
+# Import all .psm1 modules from the Functions folder
+function Global:Import-ITModules {
     $files = Get-ChildItem -Path $Global:FunctionsFolder -Filter "*.psm1" -File -ErrorAction SilentlyContinue
     if ($files) {
         $files | ForEach-Object {
-            Import-Module $_.FullName -Global -Force -Verbose:$false 3>$null
+            Import-Module $_.FullName -Global -Force -Verbose:$false -WarningAction SilentlyContinue
         }
     }
 }
 
-# Silent update function (no output, for internal use)
-Function Global:Update-ITPS {
-    $CurrentBranch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
-    Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $Global:PWSHFolder | Out-Null
-    Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $Global:PWSHFolder | Out-Null
+# Silent update — no output, for internal/background use
+function Global:Update-ITPS {
+    Sync-PWSHRepository
     Import-ITModules
 }
 
-# User-facing update function with progress output
-Function Global:Update-ITFunctions {
+# User-facing update with progress output
+function Global:Update-ITFunctions {
     Write-Host "Updating IT Functions from GitHub..." -ForegroundColor Yellow
     if (-not (Test-Path $Global:PWSHFolder)) {
         Write-Host "PowerShell Functions repository not found. Please run the main script again." -ForegroundColor Red
         return
     }
     try {
-        $CurrentBranch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
-        Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
-
-        Write-Host "Fetching latest changes..." -ForegroundColor Yellow
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $Global:PWSHFolder | Out-Null
-
-        Write-Host "Resetting to origin/$CurrentBranch..." -ForegroundColor Yellow
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $Global:PWSHFolder | Out-Null
-
-        $commitLine = Invoke-Git -GitPath $Global:GitCommand -Arguments @("log", "--oneline", "-1") -WorkingDirectory $Global:PWSHFolder
-        Write-Host "Current commit: $($commitLine -join '')" -ForegroundColor Green
-
+        Sync-PWSHRepository -Verbose
         Import-ITModules
         Write-Host "IT Functions updated and reloaded successfully!" -ForegroundColor Green
     }
     catch {
-        Write-Host "Failed to update functions: $_" -ForegroundColor Red
+        Write-Host "Failed to update functions: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
-# Load functions - just import modules (repo was already updated above)
+# --- Main bootstrap flow ---
+
+# Set up global paths (must survive script scope for exported functions)
+$Global:PWSHFolder      = "$ITFolder\GitHub\PWSH"
+$Global:FunctionsFolder = "$PWSHFolder\Functions"
+$Global:GitExePath      = "$ITFolder\GitHub\MinGit\bin\git.exe"
+
+# Ensure git is available
+if (-not (Test-GitInstalled)) {
+    if (-not (Install-MinGit)) {
+        Write-Host "Cannot proceed without Git. Exiting." -ForegroundColor Red
+        return
+    }
+}
+
+# Resolve which git binary to use (resolved once, reused everywhere)
+$Global:GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
+
+# Add MinGit bin to PATH for this session using exact segment matching (avoid partial matches)
+$gitBinPath = "$ITFolder\GitHub\MinGit\bin"
+if ((Test-Path $GitExePath) -and (($env:PATH -split ';') -notcontains $gitBinPath)) {
+    $env:PATH += ";$gitBinPath"
+}
+
+# Clone or update the PWSH repository
+if (Test-Path $PWSHFolder) {
+    Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
+    try {
+        Set-GitSafeDirectory -Git $GitCommand -Path $PWSHFolder
+
+        $CurrentBranch = Get-CurrentBranch -Git $GitCommand -WorkDir $PWSHFolder
+        Invoke-Git -GitPath $GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $PWSHFolder
+        Invoke-Git -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder
+
+        Write-Host "Repository updated successfully!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Failed to update repository: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+else {
+    Write-Host "Cloning PowerShell Functions repository..." -ForegroundColor Yellow
+    try {
+        [void](New-Item -ItemType Directory -Force -Path "$ITFolder\GitHub")
+
+        # Shallow clone — only latest commit, single branch (faster and smaller)
+        Invoke-Git -GitPath $GitCommand -Arguments @("clone", "--depth", "1", "--single-branch", "https://github.com/MauleTech/PWSH.git", $PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
+        Set-GitSafeDirectory -Git $GitCommand -Path $PWSHFolder
+
+        Write-Host "Repository cloned successfully!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Failed to clone repository: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+# Load functions
 if (Test-Path $FunctionsFolder) {
-    $moduleFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File
+    $moduleFiles = @(Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File)
     if ($moduleFiles.Count -gt 0) {
         Write-Host "Loading PowerShell Functions..." -ForegroundColor Yellow
         Import-ITModules
 
-        $LoadedModules = Get-Module | Where-Object { $_.Path -like "$FunctionsFolder*" }
-        If ($LoadedModules) {
+        $LoadedModules = @(Get-Module | Where-Object { $_.Path -like "$FunctionsFolder*" })
+        if ($LoadedModules) {
             $bootTimer.Stop()
-            $elapsed = "{0:N1}s" -f $bootTimer.Elapsed.TotalSeconds
-            $funcCount = (Get-Command -Module "PS-*" | Sort-Object Name).Count
+            $elapsed   = "{0:N1}s" -f $bootTimer.Elapsed.TotalSeconds
+            $funcCount = @($LoadedModules | ForEach-Object { Get-Command -Module $_.Name -ErrorAction SilentlyContinue }).Count
             Write-Host " $funcCount Functions successfully loaded in $elapsed" -ForegroundColor Green
             Write-Host " - Get-ITFunctions to see commands. Update-ITFunctions to load updates.`n"
-        } Else {
+        }
+        else {
             Write-Host "Functions were not successfully loaded. Please check the function files." -ForegroundColor Red
         }
-    } else {
+    }
+    else {
         Write-Host "No .psm1 function files found in $FunctionsFolder" -ForegroundColor Yellow
     }
-} else {
+}
+else {
     Write-Host "No .psm1 function files found in $FunctionsFolder" -ForegroundColor Yellow
 }

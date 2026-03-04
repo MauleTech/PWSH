@@ -19,9 +19,9 @@ $Script:GitCandidatePaths = @(
 
 # Check if a usable git executable is available
 function Test-GitInstalled {
-    param([string]$GitPath = "$ITFolder\GitHub\MinGit\bin\git.exe")
+    param([string]$MinGitFolder = "$ITFolder\GitHub\MinGit")
 
-    if (Test-Path $GitPath) { return $true }
+    if (Resolve-MinGitExe $MinGitFolder) { return $true }
 
     # Check common system install paths
     foreach ($candidate in $Script:GitCandidatePaths) {
@@ -30,6 +30,17 @@ function Test-GitInstalled {
 
     # Check system PATH via Get-Command (avoids executing unknown binaries)
     return ($null -ne (Get-Command git -ErrorAction SilentlyContinue))
+}
+
+# Locate git.exe within a MinGit installation — the binary path has shifted across versions:
+# cmd\ (2.47.0+, current), mingw64\bin\ (intermediate), bin\ (legacy)
+function Resolve-MinGitExe {
+    param([string]$MinGitFolder = "$ITFolder\GitHub\MinGit")
+    @(
+        "$MinGitFolder\cmd\git.exe",
+        "$MinGitFolder\mingw64\bin\git.exe",
+        "$MinGitFolder\bin\git.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 
 # Resolve the latest MinGit tag and download URL via GitHub redirect (no full API JSON call).
@@ -107,9 +118,8 @@ function Set-GitSafeDirectory {
 
 # Install MinGit (~16MB zip, no binary execution required)
 function Install-MinGit {
-    $GitFolder  = "$ITFolder\GitHub\MinGit"
-    $TempPath   = "$env:TEMP\MinGit"
-    $GitExePath = "$GitFolder\bin\git.exe"
+    $GitFolder = "$ITFolder\GitHub\MinGit"
+    $TempPath  = "$env:TEMP\MinGit"
 
     try {
         [void](New-Item -ItemType Directory -Path $GitFolder -Force)
@@ -119,7 +129,8 @@ function Install-MinGit {
         $LatestVersion = $releaseInfo.Version
 
         # Check whether the installed version is already current
-        if (Test-Path $GitExePath) {
+        $GitExePath = Resolve-MinGitExe $GitFolder
+        if ($GitExePath) {
             Write-Host "Found existing MinGit, checking version..." -ForegroundColor Yellow
             try {
                 $vi             = (Get-Item $GitExePath).VersionInfo
@@ -162,7 +173,8 @@ function Install-MinGit {
             Write-Host "Extracting to $GitFolder..." -ForegroundColor Green
             Expand-Archive -Path $FilePath -DestinationPath $GitFolder -Force
 
-            if (-not (Test-Path $GitExePath)) {
+            $GitExePath = Resolve-MinGitExe $GitFolder
+            if (-not $GitExePath) {
                 throw "git.exe not found after extraction — archive structure may have changed"
             }
 
@@ -389,13 +401,13 @@ function Global:Update-ITFunctions {
 # Set up global paths (must survive script scope for exported functions)
 $Global:PWSHFolder      = "$ITFolder\GitHub\PWSH"
 $Global:FunctionsFolder = "$PWSHFolder\Functions"
-$Global:GitExePath      = "$ITFolder\GitHub\MinGit\bin\git.exe"
+$Global:GitExePath      = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
 
 # Three-path git strategy:
 #   1. MinGit already present   → use it now, check for updates in the background
 #   2. MinGit absent, other git → use that git now, install MinGit in the background
 #   3. No git at all            → install MinGit synchronously, then continue
-$MinGitReady        = Test-Path $Global:GitExePath
+$MinGitReady        = $null -ne $Global:GitExePath
 $MinGitNeedsInstall = $false
 
 if (-not $MinGitReady) {
@@ -420,13 +432,14 @@ if (-not $MinGitReady) {
             Write-Host "Cannot proceed without Git. Exiting." -ForegroundColor Red
             return
         }
+        $Global:GitExePath = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
         $MinGitReady = $true
     }
 }
 
 if ($MinGitReady) {
     $Global:GitCommand = $Global:GitExePath
-    $gitBinPath        = "$ITFolder\GitHub\MinGit\bin"
+    $gitBinPath        = Split-Path -Parent $Global:GitExePath
     if (($env:PATH -split ';') -notcontains $gitBinPath) {
         $env:PATH += ";$gitBinPath"
     }
@@ -512,13 +525,14 @@ if (Test-Path $Global:FunctionsFolder) {
                 # ${function:Name} captures the function's ScriptBlock so it can be passed
                 # into the job's separate runspace, which does not inherit the parent scope.
                 Start-Job -Name "MinGit-Maintenance" `
-                    -ArgumentList ${function:Get-MinGitLatestInfo}, ${function:Install-MinGit}, $ITFolder `
+                    -ArgumentList ${function:Get-MinGitLatestInfo}, ${function:Install-MinGit}, ${function:Resolve-MinGitExe}, $ITFolder `
                     -ScriptBlock {
-                        param($getInfoFn, $installFn, $itFolder)
+                        param($getInfoFn, $installFn, $resolveExeFn, $itFolder)
                         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
                         $Global:ITFolder = $itFolder
-                        New-Item -Path function: -Name Get-MinGitLatestInfo -Value $getInfoFn | Out-Null
-                        New-Item -Path function: -Name Install-MinGit       -Value $installFn | Out-Null
+                        New-Item -Path function: -Name Get-MinGitLatestInfo -Value $getInfoFn    | Out-Null
+                        New-Item -Path function: -Name Install-MinGit       -Value $installFn    | Out-Null
+                        New-Item -Path function: -Name Resolve-MinGitExe    -Value $resolveExeFn | Out-Null
                         Install-MinGit
                     } | Out-Null
             }

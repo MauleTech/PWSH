@@ -35,8 +35,8 @@ function Get-MinGitLatestInfo {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 15000
         $response = $request.GetResponse()
-        $location = $response.Headers["Location"]
-        $response.Close()
+        try { $location = $response.Headers["Location"] }
+        finally { $response.Close() }
 
         if ([string]::IsNullOrWhiteSpace($location)) {
             throw "GitHub did not return a Location header — redirect format may have changed"
@@ -58,6 +58,7 @@ function Get-MinGitLatestInfo {
         return @{
             Tag         = $tag
             Version     = $zipVersion
+            # x64 only — expected deployment target; 32-bit hosts are not supported
             DownloadUrl = "https://github.com/git-for-windows/git/releases/download/$tag/MinGit-$zipVersion-64-bit.zip"
             FileName    = "MinGit-$zipVersion-64-bit.zip"
         }
@@ -72,15 +73,27 @@ function Get-MinGitLatestInfo {
 #  safe.directory to be set before running git commands inside the repo directory)
 function Set-GitSafeDirectory {
     param([string]$Git, [string]$Path)
-    $safeWorkDir = if (Test-Path $env:USERPROFILE) { $env:USERPROFILE } else { "$env:SystemDrive\" }
+    $safeWorkDir    = if (Test-Path $env:USERPROFILE) { $env:USERPROFILE } else { "$env:SystemDrive\" }
+    $alreadyPresent = $false
     try {
-        $existing = Invoke-Git -GitPath $Git -Arguments @("config", "--global", "--get-all", "safe.directory") -WorkingDirectory $safeWorkDir
-        if ($existing -contains $Path) { return }
+        $existing       = Invoke-Git -GitPath $Git -Arguments @("config", "--global", "--get-all", "safe.directory") -WorkingDirectory $safeWorkDir
+        $alreadyPresent = $existing -contains $Path
     }
     catch {
-        # Exit code 1 = key not found in config; proceed to add it
+        # git exits 1 when the key doesn't exist yet — expected on first run.
+        # Any other failure (permissions, corrupt config) gets a visible warning.
+        if ($_.Exception.Message -notmatch 'Exit code 1') {
+            Write-Warning "Set-GitSafeDirectory: could not read existing entries — $($_.Exception.Message)"
+        }
     }
-    Invoke-Git -GitPath $Git -Arguments @("config", "--global", "--add", "safe.directory", $Path) -WorkingDirectory $safeWorkDir
+    if (-not $alreadyPresent) {
+        try {
+            Invoke-Git -GitPath $Git -Arguments @("config", "--global", "--add", "safe.directory", $Path) -WorkingDirectory $safeWorkDir
+        }
+        catch {
+            Write-Warning "Set-GitSafeDirectory: failed to add '$Path' — $($_.Exception.Message)"
+        }
+    }
 }
 
 # Install MinGit (~16MB zip, no binary execution required)
@@ -261,7 +274,7 @@ function Global:Invoke-Git {
 function Global:Get-CurrentBranch {
     param([string]$Git, [string]$WorkDir)
     try {
-        $branch = (Invoke-Git -GitPath $Git -Arguments @("branch", "--show-current") -WorkingDirectory $WorkDir -join "").Trim()
+        $branch = ((Invoke-Git -GitPath $Git -Arguments @("branch", "--show-current") -WorkingDirectory $WorkDir) -join "").Trim()
     }
     catch {
         Write-Warning "Failed to detect current branch: $($_.Exception.Message)"
@@ -271,7 +284,7 @@ function Global:Get-CurrentBranch {
     if ([string]::IsNullOrWhiteSpace($branch)) {
         # Detached HEAD — try to resolve the remote's default branch
         try {
-            $headRef = (Invoke-Git -GitPath $Git -Arguments @("symbolic-ref", "refs/remotes/origin/HEAD") -WorkingDirectory $WorkDir -join "").Trim()
+            $headRef = ((Invoke-Git -GitPath $Git -Arguments @("symbolic-ref", "refs/remotes/origin/HEAD") -WorkingDirectory $WorkDir) -join "").Trim()
             $branch  = $headRef -replace '^refs/remotes/origin/', ''
         }
         catch { $branch = "" }
@@ -289,17 +302,25 @@ function Global:Get-CurrentBranch {
 
 # Shared git sync logic used by both Update-ITPS and Update-ITFunctions
 function Sync-PWSHRepository {
-    param([switch]$Verbose)
-    $branch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
-    if ($Verbose) { Write-Host "Current branch: $branch" -ForegroundColor Yellow }
+    param([switch]$ShowProgress)
 
-    if ($Verbose) { Write-Host "Fetching latest changes..." -ForegroundColor Yellow }
+    if (-not $Global:GitCommand -or -not $Global:PWSHFolder) {
+        throw "Sync-PWSHRepository: global paths are not initialized — run the bootstrap script first"
+    }
+
+    # Ensure safe.directory is current (may have been cleared between runs)
+    Set-GitSafeDirectory -Git $Global:GitCommand -Path $Global:PWSHFolder
+
+    $branch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
+    if ($ShowProgress) { Write-Host "Current branch: $branch" -ForegroundColor Yellow }
+
+    if ($ShowProgress) { Write-Host "Fetching latest changes..." -ForegroundColor Yellow }
     Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $branch) -WorkingDirectory $Global:PWSHFolder | Out-Null
 
-    if ($Verbose) { Write-Host "Resetting to origin/$branch..." -ForegroundColor Yellow }
+    if ($ShowProgress) { Write-Host "Resetting to origin/$branch..." -ForegroundColor Yellow }
     Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$branch") -WorkingDirectory $Global:PWSHFolder | Out-Null
 
-    if ($Verbose) {
+    if ($ShowProgress) {
         $commit = Invoke-Git -GitPath $Global:GitCommand -Arguments @("log", "--oneline", "-1") -WorkingDirectory $Global:PWSHFolder
         Write-Host "Current commit: $($commit -join '')" -ForegroundColor Green
     }
@@ -329,7 +350,7 @@ function Global:Update-ITFunctions {
         return
     }
     try {
-        Sync-PWSHRepository -Verbose
+        Sync-PWSHRepository -ShowProgress
         Import-ITModules
         Write-Host "IT Functions updated and reloaded successfully!" -ForegroundColor Green
     }
@@ -363,14 +384,14 @@ if ((Test-Path $GitExePath) -and (($env:PATH -split ';') -notcontains $gitBinPat
 }
 
 # Clone or update the PWSH repository
-if (Test-Path $PWSHFolder) {
+if (Test-Path $Global:PWSHFolder) {
     Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
     try {
-        Set-GitSafeDirectory -Git $GitCommand -Path $PWSHFolder
+        Set-GitSafeDirectory -Git $Global:GitCommand -Path $Global:PWSHFolder
 
-        $CurrentBranch = Get-CurrentBranch -Git $GitCommand -WorkDir $PWSHFolder
-        Invoke-Git -GitPath $GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $PWSHFolder
-        Invoke-Git -GitPath $GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $PWSHFolder
+        $CurrentBranch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
+        Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $Global:PWSHFolder
+        Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $Global:PWSHFolder
 
         Write-Host "Repository updated successfully!" -ForegroundColor Green
     }
@@ -385,8 +406,8 @@ else {
         [void](New-Item -ItemType Directory -Force -Path "$ITFolder\GitHub")
 
         # Shallow clone — only latest commit, single branch (faster and smaller)
-        Invoke-Git -GitPath $GitCommand -Arguments @("clone", "--depth", "1", "--single-branch", "https://github.com/MauleTech/PWSH.git", $PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
-        Set-GitSafeDirectory -Git $GitCommand -Path $PWSHFolder
+        Invoke-Git -GitPath $Global:GitCommand -Arguments @("clone", "--depth", "1", "--single-branch", "https://github.com/MauleTech/PWSH.git", $Global:PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
+        Set-GitSafeDirectory -Git $Global:GitCommand -Path $Global:PWSHFolder
 
         Write-Host "Repository cloned successfully!" -ForegroundColor Green
     }
@@ -397,13 +418,13 @@ else {
 }
 
 # Load functions
-if (Test-Path $FunctionsFolder) {
-    $moduleFiles = @(Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File)
+if (Test-Path $Global:FunctionsFolder) {
+    $moduleFiles = @(Get-ChildItem -Path $Global:FunctionsFolder -Filter "*.psm1" -File)
     if ($moduleFiles.Count -gt 0) {
         Write-Host "Loading PowerShell Functions..." -ForegroundColor Yellow
         Import-ITModules
 
-        $LoadedModules = @(Get-Module | Where-Object { $_.Path -like "$FunctionsFolder*" })
+        $LoadedModules = @(Get-Module | Where-Object { $_.Path -like "$Global:FunctionsFolder*" })
         if ($LoadedModules) {
             $bootTimer.Stop()
             $elapsed   = "{0:N1}s" -f $bootTimer.Elapsed.TotalSeconds
@@ -416,9 +437,9 @@ if (Test-Path $FunctionsFolder) {
         }
     }
     else {
-        Write-Host "No .psm1 function files found in $FunctionsFolder" -ForegroundColor Yellow
+        Write-Host "No .psm1 function files found in $Global:FunctionsFolder" -ForegroundColor Yellow
     }
 }
 else {
-    Write-Host "No .psm1 function files found in $FunctionsFolder" -ForegroundColor Yellow
+    Write-Host "Functions folder not found: $Global:FunctionsFolder" -ForegroundColor Red
 }

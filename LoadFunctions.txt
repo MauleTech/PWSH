@@ -32,7 +32,10 @@ function Test-GitInstalled {
     return ($null -ne (Get-Command git -ErrorAction SilentlyContinue))
 }
 
-# Resolve the latest MinGit tag and download URL via GitHub redirect (no full API JSON call)
+# Resolve the latest MinGit tag and download URL via GitHub redirect (no full API JSON call).
+# Uses [System.Net.WebRequest] rather than Invoke-WebRequest because Invoke-WebRequest does
+# not expose AllowAutoRedirect = $false cleanly; we need the Location header from the redirect
+# to extract the version tag without following through to the full release page.
 function Get-MinGitLatestInfo {
     try {
         $request = [System.Net.WebRequest]::Create("https://github.com/git-for-windows/git/releases/latest")
@@ -85,27 +88,21 @@ function Set-GitSafeDirectory {
     try {
         $existing = & $Git config --global --get-all safe.directory 2>$null
         $readCode = $LASTEXITCODE
-    }
-    finally { Pop-Location }
 
-    if ($readCode -eq 0) {
-        if ($existing -contains $Path) { return }   # already present, nothing to do
-    }
-    elseif ($readCode -ne 1) {
-        # 1 = key simply not set yet (expected on first run); anything else is an error
-        Write-Warning "Set-GitSafeDirectory: could not read existing entries (git exit $readCode)"
-    }
+        if ($readCode -eq 0 -and $existing -contains $Path) { return }   # already present
 
-    Push-Location $safeWorkDir
-    try {
+        if ($readCode -ne 0 -and $readCode -ne 1) {
+            # 1 = key not set yet (expected on first run); anything else is a real error
+            Write-Warning "Set-GitSafeDirectory: could not read existing entries (git exit $readCode)"
+        }
+
         & $Git config --global --add safe.directory $Path 2>$null
         $addCode = $LASTEXITCODE
+        if ($addCode -ne 0) {
+            Write-Warning "Set-GitSafeDirectory: failed to add '$Path' (git exit $addCode)"
+        }
     }
     finally { Pop-Location }
-
-    if ($addCode -ne 0) {
-        Write-Warning "Set-GitSafeDirectory: failed to add '$Path' (git exit $addCode)"
-    }
 }
 
 # Install MinGit (~16MB zip, no binary execution required)
@@ -265,6 +262,9 @@ function Global:Invoke-Git {
         # 60s timeout prevents hanging on credential prompts or network issues
         if (-not $process.WaitForExit(60000)) {
             $process.Kill()
+            # Give the async readers a brief window to drain after the kill so the
+            # underlying threadpool tasks are not permanently abandoned (resource leak)
+            [void][System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 3000)
             throw "Git command timed out after 60 seconds (slow network or credential prompt?): git $($Arguments -join ' ')"
         }
 
@@ -354,14 +354,17 @@ function Global:Import-ITModules {
 }
 
 # Silent update — no output, for internal/background job use.
-# Errors are caught and silently discarded: background jobs have no interactive
-# console, so an unhandled terminating error would just surface as a noisy job failure.
+# Errors surface as warnings rather than terminating exceptions: an unhandled throw
+# inside a job becomes a noisy job-level failure; a warning is recorded in the job's
+# warning stream and can be inspected via (Receive-Job -Name MinGit-Maintenance -Keep).
 function Global:Update-ITPS {
     try {
         Sync-PWSHRepository
         Import-ITModules
     }
-    catch { }
+    catch {
+        Write-Warning "Update-ITPS: $_"
+    }
 }
 
 # User-facing update with progress output
@@ -387,14 +390,6 @@ function Global:Update-ITFunctions {
 $Global:PWSHFolder      = "$ITFolder\GitHub\PWSH"
 $Global:FunctionsFolder = "$PWSHFolder\Functions"
 $Global:GitExePath      = "$ITFolder\GitHub\MinGit\bin\git.exe"
-
-# Remove legacy PortableGit installation if present (one-time migration to MinGit)
-$PortableGitFolder = "$ITFolder\GitHub\PortableGit"
-if (Test-Path $PortableGitFolder) {
-    Write-Warning "Deleting $PortableGitFolder (legacy PortableGit — no longer used). Move it first if another tool placed it there."
-    Remove-Item -Path $PortableGitFolder -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "Legacy PortableGit removed." -ForegroundColor Green
-}
 
 # Three-path git strategy:
 #   1. MinGit already present   → use it now, check for updates in the background
@@ -434,6 +429,15 @@ if ($MinGitReady) {
     $gitBinPath        = "$ITFolder\GitHub\MinGit\bin"
     if (($env:PATH -split ';') -notcontains $gitBinPath) {
         $env:PATH += ";$gitBinPath"
+    }
+
+    # Remove legacy PortableGit only once MinGit is confirmed ready — ensures we
+    # always have a working replacement before the deletion happens.
+    $PortableGitFolder = "$ITFolder\GitHub\PortableGit"
+    if (Test-Path $PortableGitFolder) {
+        Write-Warning "Deleting $PortableGitFolder (legacy PortableGit — no longer used). Move it first if another tool placed it there."
+        Remove-Item -Path $PortableGitFolder -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Legacy PortableGit removed." -ForegroundColor Green
     }
 }
 
@@ -483,7 +487,9 @@ if (Test-Path $Global:FunctionsFolder) {
         if ($LoadedModules) {
             $bootTimer.Stop()
             $elapsed   = "{0:N1}s" -f $bootTimer.Elapsed.TotalSeconds
-            $funcCount = @($LoadedModules | ForEach-Object { Get-Command -Module $_.Name -ErrorAction SilentlyContinue }).Count
+            # PS-* filter matches Get-ITFunctions so the reported count is consistent
+            $funcCount = (Get-Command -Module ($LoadedModules.Name) -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Source -like "PS-*" }).Count
             Write-Host " $funcCount Functions successfully loaded in $elapsed" -ForegroundColor Green
             Write-Host " - Get-ITFunctions to see commands. Update-ITFunctions to load updates."
 
@@ -530,4 +536,5 @@ else {
     Write-Host "Functions folder not found: $Global:FunctionsFolder" -ForegroundColor Red
 }
 
+# Land in the IT root so the prompt starts in a useful location after load
 Set-Location $ITFolder

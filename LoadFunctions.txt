@@ -379,21 +379,56 @@ $Global:PWSHFolder      = "$ITFolder\GitHub\PWSH"
 $Global:FunctionsFolder = "$PWSHFolder\Functions"
 $Global:GitExePath      = "$ITFolder\GitHub\MinGit\bin\git.exe"
 
-# Ensure git is available
-if (-not (Test-GitInstalled)) {
-    if (-not (Install-MinGit)) {
-        Write-Host "Cannot proceed without Git. Exiting." -ForegroundColor Red
-        return
+# Remove legacy PortableGit installation if present (one-time migration to MinGit)
+$PortableGitFolder = "$ITFolder\GitHub\PortableGit"
+if (Test-Path $PortableGitFolder) {
+    Write-Host "Removing legacy PortableGit installation..." -ForegroundColor Yellow
+    Remove-Item -Path $PortableGitFolder -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "Legacy PortableGit removed." -ForegroundColor Green
+}
+
+# Three-path git strategy:
+#   1. MinGit already present   → use it now, check for updates in the background
+#   2. MinGit absent, other git → use that git now, install MinGit in the background
+#   3. No git at all            → install MinGit synchronously, then continue
+$MinGitReady        = Test-Path $Global:GitExePath
+$MinGitNeedsInstall = $false
+
+if (-not $MinGitReady) {
+    # Look for any usable git to carry this session while MinGit is installed behind the scenes
+    $fallbackGit = $null
+    foreach ($candidate in @(
+        "C:\Program Files\Git\bin\git.exe",
+        "C:\Program Files (x86)\Git\bin\git.exe"
+    )) {
+        if (Test-Path $candidate) { $fallbackGit = $candidate; break }
+    }
+    if (-not $fallbackGit) {
+        $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+        if ($gitCmd) { $fallbackGit = $gitCmd.Source }
+    }
+
+    if ($fallbackGit) {
+        Write-Host "MinGit not found — using existing git for this session." -ForegroundColor Yellow
+        $Global:GitCommand  = $fallbackGit
+        $MinGitNeedsInstall = $true
+    }
+    else {
+        # No git at all — must block until MinGit is installed
+        if (-not (Install-MinGit)) {
+            Write-Host "Cannot proceed without Git. Exiting." -ForegroundColor Red
+            return
+        }
+        $MinGitReady = $true
     }
 }
 
-# Resolve which git binary to use (resolved once, reused everywhere)
-$Global:GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
-
-# Add MinGit bin to PATH for this session using exact segment matching (avoid partial matches)
-$gitBinPath = "$ITFolder\GitHub\MinGit\bin"
-if ((Test-Path $GitExePath) -and (($env:PATH -split ';') -notcontains $gitBinPath)) {
-    $env:PATH += ";$gitBinPath"
+if ($MinGitReady) {
+    $Global:GitCommand = $Global:GitExePath
+    $gitBinPath        = "$ITFolder\GitHub\MinGit\bin"
+    if (($env:PATH -split ';') -notcontains $gitBinPath) {
+        $env:PATH += ";$gitBinPath"
+    }
 }
 
 # Clone or update the PWSH repository
@@ -443,7 +478,26 @@ if (Test-Path $Global:FunctionsFolder) {
             $elapsed   = "{0:N1}s" -f $bootTimer.Elapsed.TotalSeconds
             $funcCount = @($LoadedModules | ForEach-Object { Get-Command -Module $_.Name -ErrorAction SilentlyContinue }).Count
             Write-Host " $funcCount Functions successfully loaded in $elapsed" -ForegroundColor Green
-            Write-Host " - Get-ITFunctions to see commands. Update-ITFunctions to load updates.`n"
+            Write-Host " - Get-ITFunctions to see commands. Update-ITFunctions to load updates."
+
+            # Background MinGit maintenance — runs silently after the prompt is returned
+            # Cleans up any previous completed run before starting a fresh one
+            Get-Job -Name "MinGit-Maintenance" -ErrorAction SilentlyContinue |
+                Where-Object { $_.State -in @('Completed','Failed','Stopped') } | Remove-Job
+            if ($MinGitNeedsInstall) {
+                Write-Host " - Installing MinGit in the background for future sessions..." -ForegroundColor DarkGray
+            }
+            Start-Job -Name "MinGit-Maintenance" `
+                -ArgumentList ${function:Get-MinGitLatestInfo}, ${function:Install-MinGit}, $ITFolder `
+                -ScriptBlock {
+                    param($getInfoFn, $installFn, $itFolder)
+                    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+                    $Global:ITFolder = $itFolder
+                    New-Item -Path function: -Name Get-MinGitLatestInfo -Value $getInfoFn | Out-Null
+                    New-Item -Path function: -Name Install-MinGit       -Value $installFn | Out-Null
+                    Install-MinGit
+                } | Out-Null
+            Write-Host ""
         }
         else {
             Write-Host "Functions were not successfully loaded. Please check the function files." -ForegroundColor Red

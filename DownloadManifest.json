@@ -25,7 +25,7 @@
         "Note": "Dell OpenManage Server Administrator installer"
     },
     "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1": {
-        "SHA256": "9ABC092F9B3D57C5D5B314268F588CAA2D16820B7F9D91547F228C2E4740371A",
+        "SHA256": "2FC59E51ECDA248D2A593FE3938916B75984F96749A93C5D0C523C93565D77DB",
         "LastVerified": "2026-02-26",
         "Note": "Fido - Windows ISO download script (third-party)"
     },
@@ -65,4 +65,5 @@
         "Note": "PSWindowsUpdate PowerShell module package"
     }
 }
+
 

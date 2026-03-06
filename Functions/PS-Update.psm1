@@ -1323,9 +1323,6 @@ Function Update-WindowsTo11 {
 		return
 	}
 
-	# Load MauleTech functions (provides Get-FileDownload, Start-CleanupOfSystemDrive, $ITFolder, etc.)
-	irm ps.mauletech.com | iex
-
 	# Start transcript
 	try { Start-Transcript -Path $LogPath -Force | Out-Null } catch {}
 

@@ -1162,506 +1162,440 @@ Function Update-OEMDrivers {
 Function Update-WindowsTo11 {
 	<#
 	.SYNOPSIS
-	Find and install ONLY the Windows 11 Feature Update using PSWindowsUpdate.
+	Upgrade Windows 10 to Windows 11 via network share or ISO download.
+
+	.DESCRIPTION
+	Checks eligibility (TPM, Secure Boot, RAM, disk space), detects policy blockers,
+	then attempts the upgrade from a network share first, falling back to ISO download.
+	Bypasses hardware requirement checks via registry for unsupported machines.
 
 	.PARAMETER AutoReboot
-	Reboot automatically when the upgrade requires it.
+	Reboot automatically when the upgrade requires it (currently reserved for future use).
 
 	.PARAMETER LogPath
-	Path for transcript logging.
-
-	.PARAMETER WhatIfOnly
-	Show what would happen without installing.
+	Path for transcript logging. Defaults to ProgramData with timestamped filename.
 
 	.PARAMETER Force
-	Force the upgrade even if the system appears to already be running Windows 11 25H2 or newer.
+	Force the upgrade even if the system appears to already be running Windows 11 25H2+.
 
 	.PARAMETER DownloadOnly
-	Only download the Windows 11 ISO without installing. The ISO will be saved to $ITFolder\Downloads.
+	Only download the Windows 11 ISO without installing. Saved to $ITFolder\Downloads.
 
 	.PARAMETER ShowProgress
 	Run setup.exe with visible progress UI instead of quiet mode.
 
+	.PARAMETER NetworkPaths
+	Array of UNC paths to check for setup.exe in priority order.
+
 	.NOTES
-	Requires: PowerShell as Administrator, Internet access or WSUS that offers the upgrade.
+	Requires: PowerShell as Administrator, Internet access or WSUS/network share.
+	Dependencies: MauleTech PWSH functions (loaded via irm ps.mauletech.com | iex).
 	#>
 
-	[CmdletBinding(SupportsShouldProcess=$true)]
+	[CmdletBinding(SupportsShouldProcess = $true)]
 	param(
-	[switch]$AutoReboot,
-	[string]$LogPath = "$env:ProgramData\Win11-Upgrade-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
-	[switch]$WhatIfOnly,
-	[switch]$Force,
-	[switch]$DownloadOnly,
-	[switch]$ShowProgress
-	)
-
-	### Helpers
-	function Write-Info($msg){ Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
-	function Write-Warn($msg){ Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
-	function Write-Err ($msg){ Write-Host "[ERROR] $msg" -ForegroundColor Red }
-
-	### Start transcript
-	try { Start-Transcript -Path $LogPath -Force | Out-Null } catch { }
-
-	### 0) Check if already on Windows 11 25H2 or newer
-	$os = Get-CimInstance Win32_OperatingSystem
-	$buildNumber = [int]($os.BuildNumber)
-	$osCaption = $os.Caption
-
-	# Windows 11 build numbers: 22621 (22H2), 22631 (23H2), 26100 (24H2), 27000+ (25H2 estimated)
-	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 27000) {
-		Write-Info "System is already running Windows 11 25H2 or newer (Build $buildNumber)"
-		Write-Info "No upgrade needed. Exiting..."
-		try { Stop-Transcript | Out-Null } catch { }
-		return
-	}
-
-	if ($Force) {
-		Write-Warn "Force parameter specified - skipping version check and proceeding with upgrade"
-		Write-Info "Current system: $osCaption (Build $buildNumber)"
-	}
-
-	### 1) Quick eligibility checks (non-bypass)
-	$elig = [ordered]@{
-	OS               = (Get-CimInstance Win32_OperatingSystem).Caption
-	OSVersion        = (Get-CimInstance Win32_OperatingSystem).Version
-	Architecture     = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
-	RAM_GB           = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,1)
-	FreeSysDrive_GB  = [math]::Round((Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free/1GB,1)
-	TPM_Present      = $false
-	TPM_Ready        = $false
-	TPM_VersionOK    = $false
-	SecureBoot       = $false
-	}
-
-	# TPM
-	try {
-	$tpm = Get-Tpm
-	if ($tpm) {
-		$elig.TPM_Present = $true
-		$elig.TPM_Ready   = $tpm.TpmReady
-		# Windows 11 requires TPM 2.0
-		# Check ManufacturerVersion major version (TPM 2.0 = version starts with "2")
-		if ($tpm.ManufacturerVersion) {
-			$elig.TPM_VersionOK = $tpm.ManufacturerVersion -match '^2\.'
-		}
-		# Fallback: Check SpecVersion if ManufacturerVersion not available
-		elseif ($tpm.SpecVersion) {
-			$specStr = if ($tpm.SpecVersion -is [array]) { $tpm.SpecVersion[0] } else { $tpm.SpecVersion }
-			$elig.TPM_VersionOK = $specStr -match '^2\.' -or $specStr -match '2\.0'
-		}
-		# Final fallback: If TpmReady is true, assume TPM 2.0 on modern systems
-		else {
-			$elig.TPM_VersionOK = $tpm.TpmReady
-		}
-	}
-	} catch { }
-
-	# Secure Boot
-	try {
-	$elig.SecureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
-	} catch {
-	# On BIOS/Legacy this throws, leave as $false
-	}
-
-	Write-Info "Eligibility snapshot:"
-	$elig.GetEnumerator() | ForEach-Object { Write-Host (" - {0}: {1}" -f $_.Key, $_.Value) }
-
-	# Basic gates (do not hard fail, just warn)
-	if ($elig.OS -notmatch 'Windows 10' -and $elig.OS -notmatch 'Windows 11') {
-	Write-Warn "This script is intended to upgrade Windows 10 to Windows 11. Current OS: $($elig.OS)"
-	}
-	if ($elig.RAM_GB -lt 4)            { Write-Warn "RAM under 4 GB may block the upgrade." }
-
-	# Check free space and run cleanup if needed
-	if ($elig.FreeSysDrive_GB -lt 32) {
-		Write-Warn "Low free space on system drive ($($elig.FreeSysDrive_GB) GB). Running cleanup..."
-		try {
-			if (Get-Command Start-CleanupOfSystemDrive -ErrorAction SilentlyContinue) {
-				Start-CleanupOfSystemDrive
-				# Recheck free space after cleanup
-				$elig.FreeSysDrive_GB = [math]::Round((Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free/1GB,1)
-				Write-Info "Free space after cleanup: $($elig.FreeSysDrive_GB) GB"
-			} else {
-				Write-Warn "Start-CleanupOfSystemDrive command not found. Please ensure sufficient space manually."
-			}
-		} catch {
-			Write-Warn "Cleanup failed: $($_.Exception.Message). Please ensure sufficient space manually."
-		}
-	}
-
-	if (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK) { Write-Warn "TPM 2.0 not detected. Windows 11 may not be offered." }
-	if (-not $elig.SecureBoot)         { Write-Warn "Secure Boot not detected. Windows 11 may not be offered." }
-
-	### 2) Detect potential policy blockers
-	$wsusInUse = $false
-	try {
-	$wuPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-	$au       = Join-Path $wuPolicy 'AU'
-	$wsus     = Get-ItemProperty -Path $wuPolicy -Name WUServer -ErrorAction SilentlyContinue
-	if ($wsus) { $wsusInUse = $true; Write-Info "WSUS detected: $($wsus.WUServer)" }
-
-	$trlv = Get-ItemProperty -Path $wuPolicy -Name TargetReleaseVersion -ErrorAction SilentlyContinue
-	$trlvInfo = Get-ItemProperty -Path $wuPolicy -Name TargetReleaseVersionInfo -ErrorAction SilentlyContinue
-	if ($trlv -and $trlv.TargetReleaseVersion -eq 1) {
-		Write-Warn "TargetReleaseVersion pin is set. Current TargetReleaseVersionInfo: '$($trlvInfo.TargetReleaseVersionInfo)'. This can block feature upgrades."
-	}
-
-	$defer = Get-ItemProperty -Path $au -Name DeferFeatureUpdatesPeriodInDays -ErrorAction SilentlyContinue
-	if ($defer) { Write-Warn "Feature update deferral is set to $($defer.DeferFeatureUpdatesPeriodInDays) days. This can delay the Windows 11 offer." }
-	} catch { }
-
-	### 3) Download Iso
-	irm ps.mauletech.com | iex
-	#region Setup and Validation
-	# Check for administrative privileges
-	if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-		Write-Host "ERROR: This script requires administrative privileges" -ForegroundColor Red
-		exit 1
-	}
-
-	# Create logs directory if it doesn't exist
-	$LogFolder = Join-Path $ITFolder "Logs"
-	if (-not (Test-Path $LogFolder)) {
-		try {
-			New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
-			Write-Host "Created logs directory: $LogFolder" -ForegroundColor Green
-		} catch {
-			Write-Host "ERROR: Failed to create logs directory: $($_.Exception.Message)" -ForegroundColor Red
-			exit 1
-		}
-	}
-
-	# Setup logging
-	$LogFile = Join-Path $LogFolder "Win11Setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-	function Write-Log {
-		param([string]$Message, [string]$Level = "INFO")
-		$LogEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
-		Add-Content -Path $LogFile -Value $LogEntry
-		
-		switch ($Level) {
-			"ERROR" { Write-Host $Message -ForegroundColor Red }
-			"WARNING" { Write-Host $Message -ForegroundColor Yellow }
-			"SUCCESS" { Write-Host $Message -ForegroundColor Green }
-			default { Write-Host $Message -ForegroundColor Cyan }
-		}
-	}
-
-	Write-Log "Starting Windows 11 Setup Script"
-	Write-Log "Log file: $LogFile"
-	#endregion
-
-	#region Functions
-	Function Run-Win11Setup {
-		param(
-			[Parameter(Mandatory=$true)]
-			[string]$SetupPath,
-			[switch]$ShowProgress
-		)
-		
-		Write-Log "Attempting Windows 11 setup with path: $SetupPath"
-		
-		# Verify setup.exe exists
-		if (-not (Test-Path $SetupPath)) {
-			Write-Log "ERROR: setup.exe not found at $SetupPath" -Level "ERROR"
-			return $false
-		}
-		
-		try {
-			# Check and handle BitLocker before setup
-			Write-Log "Checking BitLocker status..."
-			$BitLockerVolume = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
-			
-			if ($BitLockerVolume -and $BitLockerVolume.ProtectionStatus -eq 'On') {
-				Write-Log "BitLocker encryption detected. Temporarily suspending for 5 reboots..." -Level "WARNING"
-				try {
-					Suspend-BitLocker -MountPoint "C:" -RebootCount 5 -ErrorAction Stop
-					Write-Log "BitLocker suspended successfully" -Level "SUCCESS"
-				} catch {
-					Write-Log "WARNING: Failed to suspend BitLocker: $($_.Exception.Message)" -Level "WARNING"
-					Write-Log "Continuing with setup - manual intervention may be required"
-				}
-			} else {
-				Write-Log "BitLocker not active or not found"
-			}
-			
-			Write-Log "Starting Windows 11 upgrade..." -Level "SUCCESS"
-
-			# Setup arguments - base arguments always used
-			$SetupArgs = [System.Collections.ArrayList]@(
-				"/auto", "Upgrade"
-			)
-
-			# Add quiet mode unless ShowProgress is specified
-			if (-not $ShowProgress) {
-				$SetupArgs.Add("/quiet") | Out-Null
-			}
-
-			# Add remaining arguments
-			$SetupArgs.AddRange(@(
-				"/product", "server"
-				"/DynamicUpdate", "Disable"
-				"/ShowOOBE", "None"
-				"/Telemetry", "Disable"
-				"/MigrateDrivers", "All"
-				"/Compat", "IgnoreWarning"
-				"/copylogs", "C:\IT"
-				"/EULA", "Accept"
-			))
-			
-			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
-			#Enable in place upgrade
-				# Delete registry keys (suppress errors if they don't exist)
-				Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\CompatMarkers" -Recurse -Force -ErrorAction SilentlyContinue
-				Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Shared" -Recurse -Force -ErrorAction SilentlyContinue
-				Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators" -Recurse -Force -ErrorAction SilentlyContinue
-
-				# Create/modify HwReqChk key and set MultiString value
-				$hwReqChkPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\HwReqChk"
-				if (-not (Test-Path $hwReqChkPath)) {
-					New-Item -Path $hwReqChkPath -Force | Out-Null
-				}
-				Set-ItemProperty -Path $hwReqChkPath -Name "HwReqChkVars" -Value @("SQ_SecureBootCapable=TRUE", "SQ_SecureBootEnabled=TRUE", "SQ_TpmVersion=2", "SQ_RamMB=8192") -Type MultiString -Force
-
-				# Create/modify MoSetup key and set DWORD value
-				$moSetupPath = "HKLM:\SYSTEM\Setup\MoSetup"
-				if (-not (Test-Path $moSetupPath)) {
-					New-Item -Path $moSetupPath -Force | Out-Null
-				}
-				Set-ItemProperty -Path $moSetupPath -Name "AllowUpgradesWithUnsupportedTPMOrCPU" -Value 1 -Type DWord -Force
-			
-			# Run setup with timeout
-			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $SetupArgs -Wait -PassThru
-			
-			if ($SetupProcess.ExitCode -eq 0) {
-				Write-Log "Setup completed successfully" -Level "SUCCESS"
-				return $true
-			} else {
-				Write-Log "Setup completed with exit code: $($SetupProcess.ExitCode)" -Level "WARNING"
-				return $false
-			}
-			
-		} catch {
-			Write-Log "ERROR during setup execution: $($_.Exception.Message)" -Level "ERROR"
-			return $false
-		}
-	}
-
-	Function Cleanup-TempFiles {
-		param([string]$IsoPath, [string]$TempScript)
-		
-		try {
-			if ($IsoPath -and (Test-Path $IsoPath)) {
-				Write-Log "Cleaning up ISO file: $IsoPath"
-				Remove-Item $IsoPath -Force -ErrorAction SilentlyContinue
-			}
-			
-			if ($TempScript -and (Test-Path $TempScript)) {
-				Write-Log "Cleaning up temp script: $TempScript"
-				Remove-Item $TempScript -Force -ErrorAction SilentlyContinue
-			}
-		} catch {
-			Write-Log "Warning: Cleanup failed: $($_.Exception.Message)" -Level "WARNING"
-		}
-	}
-	#endregion
-
-	#region Main Logic
-	$SetupSuccessful = $false
-	$IsoToCleanup = $null
-	$TempScriptToCleanup = $null
-
-	try {
-		# Define network paths to check (in priority order)
-		$NetworkPaths = @(
+		[switch]$AutoReboot,
+		[string]$LogPath = "$env:ProgramData\Win11-Upgrade-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
+		[switch]$Force,
+		[switch]$DownloadOnly,
+		[switch]$ShowProgress,
+		[string[]]$NetworkPaths = @(
 			"\\zeus.modrall.net\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
 			"\\dc0\Win11_24H2$\setup.exe",
 			"\\fileserver\Images\Win11\setup.exe"
 		)
+	)
 
-		# Try network paths in order
+	#region Helpers
+	function Write-Log {
+		param(
+			[Parameter(Mandatory)]
+			[string]$Message,
+			[ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS")]
+			[string]$Level = "INFO"
+		)
+		$LogEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
+		Add-Content -Path $script:LogFile -Value $LogEntry -ErrorAction SilentlyContinue
+
+		switch ($Level) {
+			"ERROR"   { Write-Host "[ERROR]   $Message" -ForegroundColor Red }
+			"WARNING" { Write-Host "[WARN]    $Message" -ForegroundColor Yellow }
+			"SUCCESS" { Write-Host "[OK]      $Message" -ForegroundColor Green }
+			default   { Write-Host "[INFO]    $Message" -ForegroundColor Cyan }
+		}
+	}
+
+	function Start-Win11Setup {
+		param(
+			[Parameter(Mandatory)]
+			[string]$SetupPath,
+			[switch]$ShowProgress
+		)
+
+		Write-Log "Attempting Windows 11 setup with path: $SetupPath"
+
+		if (-not (Test-Path $SetupPath)) {
+			Write-Log "setup.exe not found at $SetupPath" -Level "ERROR"
+			return $false
+		}
+
+		try {
+			# Suspend BitLocker if active
+			Write-Log "Checking BitLocker status..."
+			$BitLockerVolume = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+			if ($BitLockerVolume -and $BitLockerVolume.ProtectionStatus -eq 'On') {
+				Write-Log "BitLocker active -- suspending for 5 reboots..." -Level "WARNING"
+				try {
+					Suspend-BitLocker -MountPoint "C:" -RebootCount 5 -ErrorAction Stop
+					Write-Log "BitLocker suspended successfully" -Level "SUCCESS"
+				} catch {
+					Write-Log "Failed to suspend BitLocker: $($_.Exception.Message). Manual intervention may be needed." -Level "WARNING"
+				}
+			} else {
+				Write-Log "BitLocker not active or not found"
+			}
+
+			# Set registry keys to bypass hardware requirement checks
+			$AppCompatBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags"
+			Remove-Item -Path "$AppCompatBase\CompatMarkers" -Recurse -Force -ErrorAction SilentlyContinue
+			Remove-Item -Path "$AppCompatBase\Shared" -Recurse -Force -ErrorAction SilentlyContinue
+			Remove-Item -Path "$AppCompatBase\TargetVersionUpgradeExperienceIndicators" -Recurse -Force -ErrorAction SilentlyContinue
+
+			$HwReqChkPath = "$AppCompatBase\HwReqChk"
+			if (-not (Test-Path $HwReqChkPath)) {
+				New-Item -Path $HwReqChkPath -Force | Out-Null
+			}
+			Set-ItemProperty -Path $HwReqChkPath -Name "HwReqChkVars" -Type MultiString -Force -Value @(
+				"SQ_SecureBootCapable=TRUE",
+				"SQ_SecureBootEnabled=TRUE",
+				"SQ_TpmVersion=2",
+				"SQ_RamMB=8192"
+			)
+
+			$MoSetupPath = "HKLM:\SYSTEM\Setup\MoSetup"
+			if (-not (Test-Path $MoSetupPath)) {
+				New-Item -Path $MoSetupPath -Force | Out-Null
+			}
+			Set-ItemProperty -Path $MoSetupPath -Name "AllowUpgradesWithUnsupportedTPMOrCPU" -Value 1 -Type DWord -Force
+
+			Write-Log "Hardware bypass registry keys applied" -Level "SUCCESS"
+
+			# Build setup arguments
+			$SetupArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
+			if (-not $ShowProgress) {
+				$SetupArgs.Add("/quiet") | Out-Null
+			}
+			$SetupArgs.AddRange(@(
+				"/product", "server",
+				"/DynamicUpdate", "Disable",
+				"/ShowOOBE", "None",
+				"/Telemetry", "Disable",
+				"/MigrateDrivers", "All",
+				"/Compat", "IgnoreWarning",
+				"/copylogs", "C:\IT",
+				"/EULA", "Accept"
+			))
+
+			Write-Log "Starting Windows 11 upgrade..."
+			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
+
+			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $SetupArgs -Wait -PassThru
+
+			if ($SetupProcess.ExitCode -eq 0) {
+				Write-Log "Setup completed successfully" -Level "SUCCESS"
+				return $true
+			} else {
+				Write-Log "Setup exited with code: $($SetupProcess.ExitCode)" -Level "WARNING"
+				return $false
+			}
+		} catch {
+			Write-Log "Setup execution failed: $($_.Exception.Message)" -Level "ERROR"
+			return $false
+		}
+	}
+	#endregion
+
+	#region Pre-flight
+	# Check for admin privileges
+	if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+		[Security.Principal.WindowsBuiltInRole]"Administrator")) {
+		Write-Host "[ERROR]   This function requires administrative privileges." -ForegroundColor Red
+		return
+	}
+
+	# Load MauleTech functions (provides Get-FileDownload, Start-CleanupOfSystemDrive, $ITFolder, etc.)
+	irm ps.mauletech.com | iex
+
+	# Start transcript
+	try { Start-Transcript -Path $LogPath -Force | Out-Null } catch {}
+
+	# Set up log file for structured logging
+	$LogFolder = Join-Path $ITFolder "Logs"
+	if (-not (Test-Path $LogFolder)) {
+		New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+	}
+	$script:LogFile = Join-Path $LogFolder "Win11Setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+	Write-Log "Starting Update-WindowsTo11"
+	Write-Log "Log file: $($script:LogFile)"
+	Write-Log "Transcript: $LogPath"
+	#endregion
+
+	#region Version Check
+	$os = Get-CimInstance Win32_OperatingSystem
+	$buildNumber = [int]$os.BuildNumber
+	$osCaption = $os.Caption
+
+	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 26100) {
+		Write-Log "Already running Windows 11 24H2+ (Build $buildNumber) -- no upgrade needed." -Level "SUCCESS"
+		try { Stop-Transcript | Out-Null } catch {}
+		return
+	}
+
+	if ($Force) {
+		Write-Log "Force specified -- skipping version check. Current: $osCaption (Build $buildNumber)" -Level "WARNING"
+	}
+	#endregion
+
+	#region Eligibility Checks
+	$elig = [ordered]@{
+		OS              = $osCaption
+		OSVersion       = $os.Version
+		Architecture    = $os.OSArchitecture
+		RAM_GB          = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+		FreeSysDrive_GB = [math]::Round((Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free / 1GB, 1)
+		TPM_Present     = $false
+		TPM_Ready       = $false
+		TPM_VersionOK   = $false
+		SecureBoot      = $false
+	}
+
+	# TPM detection
+	try {
+		$tpm = Get-Tpm -ErrorAction Stop
+		if ($tpm) {
+			$elig.TPM_Present = $true
+			$elig.TPM_Ready   = $tpm.TpmReady
+			if ($tpm.ManufacturerVersion) {
+				$elig.TPM_VersionOK = $tpm.ManufacturerVersion -match '^2\.'
+			} elseif ($tpm.SpecVersion) {
+				$specStr = if ($tpm.SpecVersion -is [array]) { $tpm.SpecVersion[0] } else { $tpm.SpecVersion }
+				$elig.TPM_VersionOK = $specStr -match '^2\.' -or $specStr -match '2\.0'
+			} else {
+				$elig.TPM_VersionOK = $tpm.TpmReady
+			}
+		}
+	} catch {}
+
+	# Secure Boot detection
+	try {
+		$elig.SecureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
+	} catch {}
+
+	Write-Log "Eligibility snapshot:"
+	$elig.GetEnumerator() | ForEach-Object {
+		Write-Host ("   - {0}: {1}" -f $_.Key, $_.Value)
+		Add-Content -Path $script:LogFile -Value ("   {0}: {1}" -f $_.Key, $_.Value) -ErrorAction SilentlyContinue
+	}
+
+	# Warnings (non-blocking)
+	if ($elig.OS -notmatch 'Windows 10' -and $elig.OS -notmatch 'Windows 11') {
+		Write-Log "This script is intended for Windows 10/11 upgrades. Current OS: $($elig.OS)" -Level "WARNING"
+	}
+	if ($elig.RAM_GB -lt 4) {
+		Write-Log "RAM under 4 GB may block the upgrade." -Level "WARNING"
+	}
+
+	# Disk space check with auto-cleanup
+	if ($elig.FreeSysDrive_GB -lt 32) {
+		Write-Log "Low free space ($($elig.FreeSysDrive_GB) GB). Attempting cleanup..." -Level "WARNING"
+		try {
+			if (Get-Command Start-CleanupOfSystemDrive -ErrorAction SilentlyContinue) {
+				Start-CleanupOfSystemDrive
+				$elig.FreeSysDrive_GB = [math]::Round((Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free / 1GB, 1)
+				Write-Log "Free space after cleanup: $($elig.FreeSysDrive_GB) GB"
+			} else {
+				Write-Log "Start-CleanupOfSystemDrive not available. Ensure sufficient space manually." -Level "WARNING"
+			}
+		} catch {
+			Write-Log "Cleanup failed: $($_.Exception.Message)" -Level "WARNING"
+		}
+	}
+
+	if (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK) {
+		Write-Log "TPM 2.0 not detected. Bypass will be attempted via registry." -Level "WARNING"
+	}
+	if (-not $elig.SecureBoot) {
+		Write-Log "Secure Boot not detected. Bypass will be attempted via registry." -Level "WARNING"
+	}
+	#endregion
+
+	#region Policy Blocker Detection
+	$wuPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+	$auPolicy = Join-Path $wuPolicy 'AU'
+
+	try {
+		$wsus = Get-ItemProperty -Path $wuPolicy -Name WUServer -ErrorAction SilentlyContinue
+		if ($wsus) {
+			Write-Log "WSUS detected: $($wsus.WUServer)"
+		}
+
+		$trlv = Get-ItemProperty -Path $wuPolicy -Name TargetReleaseVersion -ErrorAction SilentlyContinue
+		$trlvInfo = Get-ItemProperty -Path $wuPolicy -Name TargetReleaseVersionInfo -ErrorAction SilentlyContinue
+		if ($trlv -and $trlv.TargetReleaseVersion -eq 1) {
+			Write-Log "TargetReleaseVersion pin is set (Value: '$($trlvInfo.TargetReleaseVersionInfo)'). This can block feature upgrades." -Level "WARNING"
+		}
+
+		$defer = Get-ItemProperty -Path $auPolicy -Name DeferFeatureUpdatesPeriodInDays -ErrorAction SilentlyContinue
+		if ($defer) {
+			Write-Log "Feature update deferral set to $($defer.DeferFeatureUpdatesPeriodInDays) days." -Level "WARNING"
+		}
+	} catch {}
+	#endregion
+
+	#region Main Upgrade Logic
+	$SetupSuccessful = $false
+	$IsoPath = $null
+	$TempFidoScript = $null
+
+	try {
+		# --- Attempt 1: Network share ---
 		$NetworkSetupPath = $null
 		foreach ($Path in $NetworkPaths) {
 			Write-Log "Checking network path: $Path"
 			if (Test-Path $Path -ErrorAction SilentlyContinue) {
 				$NetworkSetupPath = $Path
-				Write-Log "Network setup found at: $NetworkSetupPath" -Level "SUCCESS"
+				Write-Log "Found network setup: $NetworkSetupPath" -Level "SUCCESS"
 				break
 			}
 		}
 
 		if ($NetworkSetupPath -and -not $DownloadOnly) {
 			Write-Log "Using network installation" -Level "SUCCESS"
-			$SetupSuccessful = Run-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
-		} elseif ($DownloadOnly -and $NetworkSetupPath) {
-			Write-Log "DownloadOnly specified but network path available. Proceeding with ISO download..." -Level "WARNING"
+			$SetupSuccessful = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
 		}
 
-		if (-not $NetworkSetupPath -or $DownloadOnly) {
+		# --- Attempt 2: ISO download (fallback or DownloadOnly) ---
+		if ((-not $NetworkSetupPath -and -not $SetupSuccessful) -or $DownloadOnly) {
 			if ($DownloadOnly) {
-				Write-Log "DownloadOnly mode - proceeding with ISO download" -Level "SUCCESS"
+				Write-Log "DownloadOnly mode -- proceeding with ISO download" -Level "SUCCESS"
 			} else {
-				Write-Log "No network paths available, proceeding with ISO download" -Level "WARNING"
+				Write-Log "No usable network path found. Falling back to ISO download..." -Level "WARNING"
 			}
-			# Define the destination folder
-			If (!(Test-Path -Path "$ITFolder\Downloads\FDM\FDM.exe" -ErrorAction SilentlyContinue)){ 
-				$SaveFolder = "$ITFolder\Downloads\FDM"
 
-				# Define the URLs to download
-				$URLs = @(
-					'https://files.mauletech.com/files/Utilities/FDM.exe'
-				)
+			# Check for an existing ISO first
+			Write-Log "Checking for existing Windows 11 ISO in $ITFolder\Downloads..."
+			$ExistingISO = Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11*.iso" -ErrorAction SilentlyContinue |
+				Where-Object { $_.Length -gt 4GB } |
+				Sort-Object LastWriteTime -Descending |
+				Select-Object -First 1
 
-				# Download each file
-				foreach ($URL in $URLs) {
-					Get-FileDownload -URL $URL -SaveToFolder $SaveFolder
+			if ($ExistingISO) {
+				$IsoPath = $ExistingISO.FullName
+				$IsoSizeGB = [math]::Round($ExistingISO.Length / 1GB, 2)
+				Write-Log "Found existing ISO: $IsoPath ($IsoSizeGB GB) -- skipping download" -Level "SUCCESS"
+			} else {
+				Write-Log "No suitable existing ISO found. Downloading..."
+
+				# Get download URL via Fido
+				$TempFidoScript = Join-Path $env:TEMP "Fido_$(Get-Date -Format 'yyyyMMddHHmmss').ps1"
+				$FidoUrl = "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1"
+
+				Write-Log "Downloading Fido script for ISO URL generation..."
+				Get-FileDownload -URL $FidoUrl -SaveToFolder (Split-Path $TempFidoScript -Parent) -ShowProgress
+				# Rename to our temp name if needed
+				$DownloadedFido = Join-Path (Split-Path $TempFidoScript -Parent) "Fido.ps1"
+				if (Test-Path $DownloadedFido) {
+					if ($DownloadedFido -ne $TempFidoScript) {
+						Move-Item -Path $DownloadedFido -Destination $TempFidoScript -Force
+					}
+				} else {
+					throw "Failed to download Fido script"
 				}
-				& "$ITFolder\Downloads\FDM\FDM.exe" -y -o"$ITFolder\Downloads\FDM"
-				Get-FileDownload -URL "https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/FDM/settings.ini" -SaveToFolder "$ITFolder\Downloads\FDM\FDM\portabledata"
+
+				Write-Log "Generating Windows 11 download URL via Fido..."
+				$Win11URL = & $TempFidoScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $true -Locale "en-US"
+
+				if (-not $Win11URL) {
+					Write-Log "Fido failed to generate URL. Using MauleTech mirror as fallback." -Level "WARNING"
+					$Win11URL = "https://files.mauletech.com/files/ISOs/Win11_25H2_English_x64.iso?dl"
+				}
+
+				Write-Log "Downloading Windows 11 ISO (this may take a while)..."
+				$DownloadResult = Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads" -ShowProgress
+
+				# Get-FileDownload returns the path(s) -- grab the last element
+				if ($DownloadResult -is [array]) {
+					$IsoPath = $DownloadResult[-1]
+				} else {
+					$IsoPath = $DownloadResult
+				}
+
+				if (-not $IsoPath -or -not (Test-Path $IsoPath)) {
+					throw "ISO download failed or file not found"
+				}
+
+				Write-Log "ISO downloaded: $IsoPath" -Level "SUCCESS"
 			}
-			# Download and use ISO method
-			try {
-				# Check for existing Windows 11 ISO over 4GB
-				Write-Log "Checking for existing Windows 11 ISO in $ITFolder\Downloads..."
-				$ExistingISOs = Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11*.iso" -ErrorAction SilentlyContinue | 
-					Where-Object { $_.Length -gt 4GB } | 
-					Sort-Object LastWriteTime -Descending
-				
-				if ($ExistingISOs -and $ExistingISOs.Count -gt 0) {
-					$Win11iso = $ExistingISOs[0].FullName
-					$IsoSizeGB = [math]::Round($ExistingISOs[0].Length / 1GB, 2)
-					Write-Log "Found existing Windows 11 ISO: $Win11iso ($IsoSizeGB GB)" -Level "SUCCESS"
-					Write-Log "Skipping download and using existing ISO"
-					# Don't set $IsoToCleanup since we want to keep existing ISO
-				} else {
-					Write-Log "No suitable existing ISO found. Proceeding with download..."
-					
-					# Get Windows 11 download URL using Fido
-					Write-Log "Downloading Fido script for Windows 11 URL generation..."
-					$TempScript = [System.IO.Path]::GetTempFileName() + ".ps1"
-					$TempScriptToCleanup = $TempScript
-					
-					Invoke-ValidatedDownload -Uri "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1" -OutFile $TempScript
-					Write-Log "Fido script downloaded successfully"
-					
-					Write-Log "Generating Windows 11 download URL..."
-					$Win11URL = & $TempScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $True -Locale "en-US"
-					If ($Null -eq $Win11URL) {
-						$Win11URL = "https://files.mauletech.com/files/ISOs/Win11_25H2_English_x64.iso?dl"
-					}
-					if (-not $Win11URL) {
-						throw "Failed to generate Windows 11 download URL"
-					}
-					
-					Write-Log "Download URL generated successfully"
-					Write-Log "Downloading Windows 11 ISO..."
-					Stop-Process -Name fdm -Force -ErrorAction SilentlyContinue
-					& "$ITFolder\Downloads\FDM\FDM\fdm.exe" --url="$Win11URL" --hidden -s
-					Start-Sleep 30
-					
-					# Try to find the ISO file
-					$Win11iso = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64*" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-					
-					if ($Win11iso -and (Test-Path $Win11iso)) {
-						# ISO exists, check if download is still in progress
-						$DownloadTempFile = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64.iso.fdmdownload" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-						
-						if ($DownloadTempFile -and (Test-Path $DownloadTempFile)) {
-							Write-Log "Download in progress. Monitoring until completion..."
-							# Wait until the temp file is deleted
-							while (Test-Path $DownloadTempFile) {
-								Start-Sleep -Seconds 5
-							}
-							Write-Log "Download completed" -Level "SUCCESS"
-							Stop-Process -Name fdm -Force -ErrorAction SilentlyContinue
-							$Win11iso = (Get-ChildItem -Path "$ITFolder\Downloads" -Filter "Win11_*_English_x64*" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-						} else {
-							Write-Log "Download already completed" -Level "SUCCESS"
-						}
-					} else {
-						# ISO not found, use fallback download method
-						Write-Log "ISO not found with FDM, using fallback download method..."
-						$Win11iso = (Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads")[-1]
-					}
-					$IsoToCleanup = $Win11iso
+
+			# DownloadOnly stops here
+			if ($DownloadOnly) {
+				Write-Log "DownloadOnly complete. ISO location: $IsoPath" -Level "SUCCESS"
+				$SetupSuccessful = $true
+			} else {
+				# Mount and run setup from ISO
+				Write-Log "Mounting ISO..."
+				$MountResult = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
+				$DriveLetter = ($MountResult | Get-Volume).DriveLetter
+
+				if (-not $DriveLetter) {
+					throw "Failed to get drive letter for mounted ISO"
 				}
-				
-				if (-not (Test-Path $Win11iso)) {
-					throw "ISO download failed or file not found: $Win11iso"
+
+				Write-Log "ISO mounted to ${DriveLetter}:" -Level "SUCCESS"
+				$SetupPath = "${DriveLetter}:\setup.exe"
+
+				$SetupSuccessful = Start-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress
+
+				Write-Log "Dismounting ISO..."
+				try {
+					Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop
+					Write-Log "ISO dismounted" -Level "SUCCESS"
+				} catch {
+					Write-Log "Failed to dismount ISO: $($_.Exception.Message)" -Level "WARNING"
 				}
-				
-				Write-Log "ISO downloaded successfully: $Win11iso" -Level "SUCCESS"
-
-				# If DownloadOnly, skip the setup
-				if ($DownloadOnly) {
-					Write-Log "DownloadOnly mode - ISO download complete. Skipping installation." -Level "SUCCESS"
-					Write-Log "ISO location: $Win11iso" -Level "SUCCESS"
-					$SetupSuccessful = $true
-					# Don't cleanup the ISO when DownloadOnly is used
-					$IsoToCleanup = $null
-				} else {
-					# Mount the ISO
-					Write-Log "Mounting ISO..."
-					$MountResult = Mount-DiskImage -ImagePath $Win11iso -PassThru -ErrorAction Stop
-
-					# Get the drive letter of the mounted ISO
-					$DriveLetter = ($MountResult | Get-Volume).DriveLetter
-
-					if (-not $DriveLetter) {
-						throw "Failed to retrieve drive letter for mounted ISO"
-					}
-
-					Write-Log "ISO mounted to drive $DriveLetter`:" -Level "SUCCESS"
-
-					# Build the setup.exe path
-					$SetupPath = "$DriveLetter`:\setup.exe"
-
-					# Run the setup
-					$SetupSuccessful = Run-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress
-
-					# Dismount the ISO
-					Write-Log "Dismounting ISO..."
-					try {
-						Dismount-DiskImage -ImagePath $Win11iso -ErrorAction Stop
-						Write-Log "ISO dismounted successfully" -Level "SUCCESS"
-					} catch {
-						Write-Log "Warning: Failed to dismount ISO: $($_.Exception.Message)" -Level "WARNING"
-					}
-				}
-				
-			} catch {
-				Write-Log "ERROR in ISO download/mount process: $($_.Exception.Message)" -Level "ERROR"
 			}
 		}
-		
 	} catch {
-		Write-Log "CRITICAL ERROR in main execution: $($_.Exception.Message)" -Level "ERROR"
+		Write-Log "Critical error: $($_.Exception.Message)" -Level "ERROR"
 	} finally {
-		# Cleanup temporary files
-		# Only cleanup ISO if setup was successful; preserve it on failure for retry
-		if ($SetupSuccessful) {
-			Cleanup-TempFiles -IsoPath $IsoToCleanup -TempScript $TempScriptToCleanup
-		} else {
-			# Only cleanup temp script, keep ISO for retry
-			Cleanup-TempFiles -IsoPath $null -TempScript $TempScriptToCleanup
-			if ($IsoToCleanup) {
-				Write-Log "Preserving ISO file for retry: $IsoToCleanup" -Level "WARNING"
-			}
+		# Cleanup temp Fido script
+		if ($TempFidoScript -and (Test-Path $TempFidoScript)) {
+			Remove-Item $TempFidoScript -Force -ErrorAction SilentlyContinue
 		}
 
-		# Final status
-		if ($SetupSuccessful) {
-			Write-Log "Windows 11 setup process completed successfully!" -Level "SUCCESS"
-			Write-Log "System may require restart to complete the upgrade"
-		} else {
-			Write-Log "Windows 11 setup process failed or completed with warnings" -Level "ERROR"
-			Write-Log "Check the setup logs in C:\IT for more details"
+		# Cleanup ISO only on success (preserve on failure for retry); never cleanup in DownloadOnly mode
+		if ($SetupSuccessful -and -not $DownloadOnly -and $IsoPath -and $ExistingISO -eq $null) {
+			if (Test-Path $IsoPath) {
+				Write-Log "Cleaning up downloaded ISO..."
+				Remove-Item $IsoPath -Force -ErrorAction SilentlyContinue
+			}
+		} elseif (-not $SetupSuccessful -and $IsoPath -and (Test-Path $IsoPath)) {
+			Write-Log "Preserving ISO for retry: $IsoPath" -Level "WARNING"
 		}
-		
-		Write-Log "Script execution completed. Log saved to: $LogFile"
+
+		# Final summary
+		if ($SetupSuccessful) {
+			Write-Log "Windows 11 upgrade process completed successfully!" -Level "SUCCESS"
+			if (-not $DownloadOnly) {
+				Write-Log "A restart may be required to finish the upgrade."
+			}
+		} else {
+			Write-Log "Windows 11 upgrade process failed or completed with warnings." -Level "ERROR"
+			Write-Log "Check setup logs in C:\IT and log file: $($script:LogFile)"
+		}
+
+		try { Stop-Transcript | Out-Null } catch {}
 	}
 	#endregion
 }
-
-

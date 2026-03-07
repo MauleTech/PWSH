@@ -908,13 +908,18 @@ Function Get-FileDownload {
 			Write-Verbose 'Method 0: Checking server prerequisites for parallel download...'
 
 			# HEAD request to check server capabilities without downloading the file
+			# Use ResponseHeadersRead to avoid HttpClient's 2 GB MaxResponseContentBufferSize limit
+			# which rejects large Content-Length values even on HEAD requests with no body
 			$HeadClient  = [System.Net.Http.HttpClient]::new()
 			$HeadClient.Timeout = [TimeSpan]::FromSeconds(30)
 			$HeadRequest = [System.Net.Http.HttpRequestMessage]::new(
 				[System.Net.Http.HttpMethod]::Head,
 				$URL.AbsoluteUri
 			)
-			$HeadResponse = $HeadClient.SendAsync($HeadRequest).GetAwaiter().GetResult()
+			$HeadResponse = $HeadClient.SendAsync(
+				$HeadRequest,
+				[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+			).GetAwaiter().GetResult()
 			$null = $HeadResponse.EnsureSuccessStatusCode()
 
 			# Check if server supports byte-range requests

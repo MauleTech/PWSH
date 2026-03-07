@@ -102,28 +102,88 @@ Write-Host "[3/5] Retrieving certificate '$CertName' from vault '$VaultName'..."
 
 # The certificate's private key is accessed via the Secrets API (PFX format).
 # This requires the App Registration to have "Get" permission on Key Vault Secrets.
-$secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
-$pfxBytes = [Convert]::FromBase64String($secret)
-try {
-    # EphemeralKeySet keeps the private key in memory only, avoiding permission
-    # issues with the Windows certificate store on CI runners.
-    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-        $pfxBytes,
-        [string]::Empty,
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
-    )
+$secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName
+
+# Validate content type — we need PFX (PKCS#12), not PEM
+$contentType = $secret.ContentType
+Write-Host "  Content type: $contentType" -ForegroundColor Gray
+if ($contentType -eq 'application/x-pem-file') {
+    throw "Certificate '$CertName' uses PEM content type in Key Vault. Re-import it as PFX (PKCS#12) format so the private key can be loaded by this script."
 }
-catch {
-    throw "Failed to load PFX from Key Vault. The certificate may be password-protected or in an unexpected format. Ensure it was imported to Key Vault as an exportable PFX without a password. Inner error: $($_.Exception.Message)"
+if ($contentType -and $contentType -ne 'application/x-pkcs12') {
+    Write-Warning "Unexpected content type '$contentType'; expected 'application/x-pkcs12' (PFX). Proceeding anyway."
+}
+
+# Extract the base64-encoded PFX from the SecureString value.
+# Using Marshal rather than -AsPlainText to avoid potential encoding issues.
+$ssPtr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret.SecretValue)
+try {
+    $base64Value = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ssPtr)
 }
 finally {
-    # Zero out private key material from memory
-    [System.Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ssPtr)
+}
+
+$pfxBytes = [Convert]::FromBase64String($base64Value)
+$base64Value = $null
+Write-Host "  PFX data size: $($pfxBytes.Length) bytes" -ForegroundColor Gray
+
+# Write PFX to temp file for import
+$tempPfx = Join-Path ([System.IO.Path]::GetTempPath()) "sign-$([Guid]::NewGuid().ToString('N')).pfx"
+[System.IO.File]::WriteAllBytes($tempPfx, $pfxBytes)
+[System.Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+
+$cert = $null
+try {
+    # Import-PfxCertificate is the most reliable import method on Windows.
+    # Azure Key Vault Secrets API returns PFX with an empty password.
+    # Note: ConvertTo-SecureString rejects empty strings, so use the constructor.
+    $emptyPw = New-Object System.Security.SecureString
+    $cert = Import-PfxCertificate -FilePath $tempPfx -CertStoreLocation Cert:\CurrentUser\My `
+        -Password $emptyPw -Exportable
+    Write-Host "  Certificate imported: $($cert.Subject)" -ForegroundColor Gray
+    Write-Host "  HasPrivateKey: $($cert.HasPrivateKey)" -ForegroundColor Gray
+}
+catch {
+    $primaryError = $_.Exception.Message
+    Write-Host "  Import-PfxCertificate failed: $primaryError" -ForegroundColor Yellow
+    # Fallback: load via .NET constructor (no cert store needed)
+    try {
+        $pfxBytes2 = [System.IO.File]::ReadAllBytes($tempPfx)
+        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $pfxBytes2,
+            [string]::Empty,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+        )
+        [System.Array]::Clear($pfxBytes2, 0, $pfxBytes2.Length)
+        Write-Host "  Fallback import succeeded: $($cert.Subject)" -ForegroundColor Gray
+        Write-Host "  HasPrivateKey: $($cert.HasPrivateKey)" -ForegroundColor Gray
+    }
+    catch {
+        throw "Failed to load PFX certificate from Key Vault. Primary error: $primaryError. Fallback error: $($_.Exception.Message)"
+    }
+}
+finally {
+    Remove-Item $tempPfx -Force -ErrorAction SilentlyContinue
 }
 
 if (-not $cert.HasPrivateKey) {
-    throw "Certificate '$CertName' does not have a private key. Ensure the Key Vault certificate has an exportable private key."
+    $msg = @"
+Certificate '$CertName' does not have a private key.
+The PFX from Key Vault's Secrets API does not contain the private key.
+
+Common causes:
+  1. The certificate's key policy has 'Exportable Private Key' set to NO.
+  2. The policy was recently changed to exportable but a NEW VERSION of the
+     certificate was not created. Policy changes only take effect on new versions.
+
+To fix in Azure Portal:
+  Key Vault > Certificates > $CertName > Certificate Policy
+    > Advanced Policy Configuration > Set 'Exportable Private Key' to YES
+  Then click 'Create a new version' (or delete and re-import the certificate).
+"@
+    throw $msg
 }
 
 # Verify the certificate has the Code Signing EKU
@@ -204,30 +264,40 @@ Write-Host "[5/5] Signing scripts..." -ForegroundColor Yellow
 $signed = 0
 $failed = 0
 
-foreach ($file in $filesToSign) {
-    $relativePath = $file.FullName.Replace($RepoRoot, "").TrimStart("\", "/")
+try {
+    foreach ($file in $filesToSign) {
+        $relativePath = $file.FullName.Replace($RepoRoot, "").TrimStart("\", "/")
 
-    try {
-        $result = Set-AuthenticodeSignature -FilePath $file.FullName -Certificate $cert `
-            -TimestampServer $TimestampServer -HashAlgorithm SHA256
+        try {
+            $result = Set-AuthenticodeSignature -FilePath $file.FullName -Certificate $cert `
+                -TimestampServer $TimestampServer -HashAlgorithm SHA256
 
-        if ($result.Status -eq "Valid") {
-            Write-Host "  [SIGNED] $relativePath" -ForegroundColor Green
-            $signed++
+            if ($result.Status -eq "Valid") {
+                Write-Host "  [SIGNED] $relativePath" -ForegroundColor Green
+                $signed++
+            }
+            else {
+                Write-Host "  [FAILED] $relativePath - Status: $($result.Status) - $($result.StatusMessage)" -ForegroundColor Red
+                $failed++
+            }
         }
-        else {
-            Write-Host "  [FAILED] $relativePath - Status: $($result.Status) - $($result.StatusMessage)" -ForegroundColor Red
+        catch {
+            Write-Host "  [ERROR]  $relativePath - $($_.Exception.Message)" -ForegroundColor Red
             $failed++
         }
     }
-    catch {
-        Write-Host "  [ERROR]  $relativePath - $($_.Exception.Message)" -ForegroundColor Red
-        $failed++
+}
+finally {
+    # Always clean up: remove the imported certificate from the store and release from memory
+    if ($cert) {
+        $certThumbprint = $cert.Thumbprint
+        $cert.Dispose()
+        Get-ChildItem "Cert:\CurrentUser\My\$certThumbprint" -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+    if ($emptyPw) {
+        $emptyPw.Dispose()
     }
 }
-
-# Release the private key from memory
-$cert.Dispose()
 
 # -------------------------------------------------------------------
 # Summary

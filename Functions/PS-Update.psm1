@@ -1519,7 +1519,7 @@ Function Update-WindowsTo11 {
 				}
 
 				Write-Log "Downloading Windows 11 ISO (this may take a while)..."
-				$DownloadResult = Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads" -ShowProgress
+				$DownloadResult = Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads" -ShowProgress Checksum "D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32" -ChecksumType SHA256
 
 				# Get-FileDownload returns the path(s) -- grab the last element
 				if ($DownloadResult -is [array]) {

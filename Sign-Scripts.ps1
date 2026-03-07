@@ -110,6 +110,9 @@ Write-Host "  Content type: $contentType" -ForegroundColor Gray
 if ($contentType -eq 'application/x-pem-file') {
     throw "Certificate '$CertName' uses PEM content type in Key Vault. Re-import it as PFX (PKCS#12) format so the private key can be loaded by this script."
 }
+if ($contentType -and $contentType -ne 'application/x-pkcs12') {
+    Write-Warning "Unexpected content type '$contentType'; expected 'application/x-pkcs12' (PFX). Proceeding anyway."
+}
 
 # Extract the base64-encoded PFX from the SecureString value.
 # Using Marshal rather than -AsPlainText to avoid potential encoding issues.
@@ -142,14 +145,15 @@ try {
     Write-Host "  HasPrivateKey: $($cert.HasPrivateKey)" -ForegroundColor Gray
 }
 catch {
-    Write-Host "  Import-PfxCertificate failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    $primaryError = $_.Exception.Message
+    Write-Host "  Import-PfxCertificate failed: $primaryError" -ForegroundColor Yellow
     # Fallback: load via .NET constructor (no cert store needed)
     try {
         $pfxBytes2 = [System.IO.File]::ReadAllBytes($tempPfx)
         $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
             $pfxBytes2,
             [string]::Empty,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet -bor
             [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
         )
         [System.Array]::Clear($pfxBytes2, 0, $pfxBytes2.Length)
@@ -157,7 +161,7 @@ catch {
         Write-Host "  HasPrivateKey: $($cert.HasPrivateKey)" -ForegroundColor Gray
     }
     catch {
-        throw "Failed to load PFX certificate from Key Vault. Inner error: $($_.Exception.Message)"
+        throw "Failed to load PFX certificate from Key Vault. Primary error: $primaryError. Fallback error: $($_.Exception.Message)"
     }
 }
 finally {
@@ -260,32 +264,40 @@ Write-Host "[5/5] Signing scripts..." -ForegroundColor Yellow
 $signed = 0
 $failed = 0
 
-foreach ($file in $filesToSign) {
-    $relativePath = $file.FullName.Replace($RepoRoot, "").TrimStart("\", "/")
+try {
+    foreach ($file in $filesToSign) {
+        $relativePath = $file.FullName.Replace($RepoRoot, "").TrimStart("\", "/")
 
-    try {
-        $result = Set-AuthenticodeSignature -FilePath $file.FullName -Certificate $cert `
-            -TimestampServer $TimestampServer -HashAlgorithm SHA256
+        try {
+            $result = Set-AuthenticodeSignature -FilePath $file.FullName -Certificate $cert `
+                -TimestampServer $TimestampServer -HashAlgorithm SHA256
 
-        if ($result.Status -eq "Valid") {
-            Write-Host "  [SIGNED] $relativePath" -ForegroundColor Green
-            $signed++
+            if ($result.Status -eq "Valid") {
+                Write-Host "  [SIGNED] $relativePath" -ForegroundColor Green
+                $signed++
+            }
+            else {
+                Write-Host "  [FAILED] $relativePath - Status: $($result.Status) - $($result.StatusMessage)" -ForegroundColor Red
+                $failed++
+            }
         }
-        else {
-            Write-Host "  [FAILED] $relativePath - Status: $($result.Status) - $($result.StatusMessage)" -ForegroundColor Red
+        catch {
+            Write-Host "  [ERROR]  $relativePath - $($_.Exception.Message)" -ForegroundColor Red
             $failed++
         }
     }
-    catch {
-        Write-Host "  [ERROR]  $relativePath - $($_.Exception.Message)" -ForegroundColor Red
-        $failed++
+}
+finally {
+    # Always clean up: remove the imported certificate from the store and release from memory
+    if ($cert) {
+        $certThumbprint = $cert.Thumbprint
+        $cert.Dispose()
+        Get-ChildItem "Cert:\CurrentUser\My\$certThumbprint" -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+    if ($emptyPw) {
+        $emptyPw.Dispose()
     }
 }
-
-# Remove the imported certificate from the store and release from memory
-$certThumbprint = $cert.Thumbprint
-$cert.Dispose()
-Get-ChildItem "Cert:\CurrentUser\My\$certThumbprint" -ErrorAction SilentlyContinue | Remove-Item -Force
 
 # -------------------------------------------------------------------
 # Summary

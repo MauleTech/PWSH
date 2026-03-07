@@ -218,10 +218,9 @@ Write-Host "  Thumbprint: $($cert.Thumbprint)" -ForegroundColor Gray
 # -------------------------------------------------------------------
 Write-Host "[4/5] Discovering scripts to sign..." -ForegroundColor Yellow
 
-# Files that should never be signed (not PowerShell)
+# Files that should never be signed
 $excludeFiles = @(
     "URL-List.csv",
-    "urls.txt",
     "Sophos_certificate.pem"
 )
 
@@ -231,21 +230,8 @@ $filesToSign = @()
 $filesToSign += Get-ChildItem -Path (Join-Path $RepoRoot '*') -Include "*.ps1", "*.psm1" -Recurse -File |
     Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' }
 
-# .txt files in Functions/, OneOffs/, and Scripts/ (these are PowerShell per .gitattributes)
-$txtDirs = @("Functions", "OneOffs", "Scripts")
-foreach ($dir in $txtDirs) {
-    $dirPath = Join-Path $RepoRoot $dir
-    if (Test-Path $dirPath) {
-        $filesToSign += Get-ChildItem -Path $dirPath -Filter "*.txt" -Recurse -File |
-            Where-Object { $_.Name -notin $excludeFiles }
-    }
-}
-
-# Also include LoadFunctions.txt at the repo root
-$loadFunctions = Join-Path $RepoRoot "LoadFunctions.txt"
-if (Test-Path $loadFunctions) {
-    $filesToSign += Get-Item $loadFunctions
-}
+# Note: .txt files are excluded — Windows does not recognize them as a signable format,
+# so Set-AuthenticodeSignature will fail with "UnknownError" on .txt files.
 
 # Deduplicate
 $filesToSign = $filesToSign | Sort-Object FullName -Unique

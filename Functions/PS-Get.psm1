@@ -776,10 +776,11 @@ Function Get-FileDownload {
 	.SYNOPSIS
 		Downloads a file from a URL to the specified directory using the fastest available method.
 		Parses the file name from the URL so you don't have to manually specify the file name.
-		Supports checksum validation with auto-detection of hash algorithm.
+		Supports multi-segment parallel downloading, checksum validation, and auto-detection of hash algorithm.
 	.DESCRIPTION
 		Attempts download methods in order of speed:
-		1. System.Net.Http.HttpClient with stream-to-file (fastest; no memory buffering, no progress bar overhead)
+		0. Parallel segmented download with HttpClient (fastest for large files >= 20 MB on servers supporting Range requests)
+		1. System.Net.Http.HttpClient with stream-to-file (fastest single-stream; no memory buffering, no progress bar overhead)
 		2. Invoke-WebRequest with progress suppressed (fast, widely compatible)
 		3. System.Net.WebClient (legacy, very reliable)
 		4. curl.exe (native on Windows 10 1803+, fast and battle-tested)
@@ -801,6 +802,11 @@ Function Get-FileDownload {
 	.PARAMETER ShowProgress
 		Show download progress when possible. Note: enabling progress will slow down the download.
 		Progress is throttled to update every 10 seconds to minimize performance impact.
+	.PARAMETER ParallelSegments
+		Number of parallel segments to use when downloading large files. Default is 10.
+		Only used when the server supports HTTP Range requests and the file is >= 20 MB.
+		Set to 0 to disable parallel downloading entirely.
+		Falls back to standard single-stream methods if parallel download fails.
 	.EXAMPLE
 		Get-FileDownload -URL $Link -SaveToFolder '$ITFolder\'
 
@@ -834,7 +840,10 @@ Function Get-FileDownload {
 		[Parameter(Mandatory = $False)]
 		[ValidateSet('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')]
 		[string]$ChecksumType,
-		[switch]$ShowProgress
+		[switch]$ShowProgress,
+		[Parameter(Mandatory = $False)]
+		[ValidateRange(0, 32)]
+		[int]$ParallelSegments = 10
 	)
 
 	# Isolate file name from URL, decoding percent-encoded characters (e.g. %20 -> space)
@@ -863,6 +872,13 @@ Function Get-FileDownload {
 		Write-Warning 'Unable to set TLS 1.2/1.1 due to old .NET Framework. Upgrade to .NET 4.5+ and PowerShell v3+ if you see connection errors.'
 	}
 
+	# Load System.Net.Http assembly for HttpClient (not loaded by default on Windows PowerShell 5.1)
+	Try {
+		Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+	} Catch {
+		Write-Verbose 'System.Net.Http assembly not available. HttpClient-based methods will be skipped.'
+	}
+
 	# Remove existing file to avoid stale data
 	If (Test-Path -Path $FilePath) { Remove-Item -Path $FilePath -Force }
 
@@ -874,6 +890,322 @@ Function Get-FileDownload {
 
 	$Downloaded = $false
 	$DownloadErrors = [System.Collections.Generic.List[string]]::new()
+
+	# Method 0: Parallel segmented download
+	# Downloads the file in multiple segments simultaneously using HTTP Range requests,
+	# then merges the segments into the final file. Similar to how download managers like
+	# Free Download Manager accelerate downloads by splitting them into parallel streams.
+	# Prerequisites: server supports Accept-Ranges: bytes, Content-Length >= 20 MB.
+	If (-not $Downloaded -and $ParallelSegments -ge 2) {
+		$HeadClient    = $null
+		$HeadRequest   = $null
+		$HeadResponse  = $null
+		$RunspacePool  = $null
+		$SegmentJobs   = $null
+		$SegmentPaths  = @()
+
+		Try {
+			Write-Verbose 'Method 0: Checking server prerequisites for parallel download...'
+
+			# HEAD request to check server capabilities without downloading the file
+			$HeadClient  = [System.Net.Http.HttpClient]::new()
+			$HeadClient.Timeout = [TimeSpan]::FromSeconds(30)
+			$HeadRequest = [System.Net.Http.HttpRequestMessage]::new(
+				[System.Net.Http.HttpMethod]::Head,
+				$URL.AbsoluteUri
+			)
+			$HeadResponse = $HeadClient.SendAsync($HeadRequest).GetAwaiter().GetResult()
+			$null = $HeadResponse.EnsureSuccessStatusCode()
+
+			# Check if server supports byte-range requests
+			$ParallelEligible = $true
+			$AcceptRangesValues = $null
+			If ($HeadResponse.Headers.TryGetValues('Accept-Ranges', [ref]$AcceptRangesValues)) {
+				$AcceptRanges = $AcceptRangesValues -join ','
+			} Else {
+				$AcceptRanges = ''
+			}
+			If ($AcceptRanges -notmatch 'bytes') {
+				Write-Verbose 'Method 0: Server does not support byte-range requests. Skipping parallel download.'
+				$ParallelEligible = $false
+			}
+
+			# Check Content-Length
+			$ContentLength = $HeadResponse.Content.Headers.ContentLength
+			If ($ParallelEligible -and (-not $ContentLength -or $ContentLength -le 0)) {
+				Write-Verbose 'Method 0: Server did not report Content-Length. Skipping parallel download.'
+				$ParallelEligible = $false
+			}
+
+			# Check minimum file size (20 MB threshold — below this the overhead isn't worthwhile)
+			If ($ParallelEligible -and $ContentLength -lt 20MB) {
+				Write-Verbose ('Method 0: File is {0:N2} MB, below 20 MB threshold. Skipping parallel download.' -f ($ContentLength / 1MB))
+				$ParallelEligible = $false
+			}
+
+			If ($ParallelEligible) {
+				Write-Host ('Parallel download: {0} segments, {1:N2} MB total' -f $ParallelSegments, ($ContentLength / 1MB))
+
+				# Calculate byte ranges for each segment
+				$SegmentSize = [Math]::Floor($ContentLength / $ParallelSegments)
+				$Segments = [System.Collections.Generic.List[object]]::new()
+				For ($i = 0; $i -lt $ParallelSegments; $i++) {
+					$Start = $i * $SegmentSize
+					# Last segment absorbs remainder bytes to avoid gaps
+					$End = If ($i -eq ($ParallelSegments - 1)) { $ContentLength - 1 } Else { $Start + $SegmentSize - 1 }
+					$TempPath = Join-Path $env:TEMP "dlseg_${i}_$(Get-Random).part"
+					$Segments.Add([pscustomobject]@{
+						Index    = $i
+						Start    = $Start
+						End      = $End
+						TempPath = $TempPath
+					})
+				}
+
+				# Keep a flat list of temp paths for guaranteed cleanup in Finally
+				$SegmentPaths = $Segments | ForEach-Object { $_.TempPath }
+
+				# Self-contained scriptblock that runs in each runspace
+				# No access to outer scope — all values passed via parameters
+				[System.Management.Automation.ScriptBlock]$SegmentScriptBlock = {
+					Param(
+						[string]$SegmentURL,
+						[long]$RangeStart,
+						[long]$RangeEnd,
+						[string]$TempPath,
+						[int]$SegmentIndex
+					)
+
+					$LocalClient   = $null
+					$LocalRequest  = $null
+					$LocalResponse = $null
+					$LocalStream   = $null
+					$LocalFile     = $null
+					$Success       = $false
+					$ErrorMessage  = ''
+
+					Try {
+						$LocalClient = [System.Net.Http.HttpClient]::new()
+						$LocalClient.Timeout = [TimeSpan]::FromMinutes(30)
+
+						$LocalRequest = [System.Net.Http.HttpRequestMessage]::new(
+							[System.Net.Http.HttpMethod]::Get,
+							$SegmentURL
+						)
+						$LocalRequest.Headers.Range = [System.Net.Http.Headers.RangeHeaderValue]::new($RangeStart, $RangeEnd)
+
+						$LocalResponse = $LocalClient.SendAsync(
+							$LocalRequest,
+							[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+						).GetAwaiter().GetResult()
+						$null = $LocalResponse.EnsureSuccessStatusCode()
+
+						# Validate server actually returned a partial response (206), not the full file (200)
+						If ($LocalResponse.StatusCode -ne [System.Net.HttpStatusCode]::PartialContent) {
+							Throw "Server returned $($LocalResponse.StatusCode) instead of 206 PartialContent. Range requests may not be supported."
+						}
+
+						$LocalStream = $LocalResponse.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+						$LocalFile = [System.IO.FileStream]::new(
+							$TempPath,
+							[System.IO.FileMode]::Create,
+							[System.IO.FileAccess]::Write,
+							[System.IO.FileShare]::None,
+							81920
+						)
+						$LocalStream.CopyTo($LocalFile, 81920)
+						$Success = $true
+					} Catch {
+						$ErrorMessage = $_.ToString()
+					} Finally {
+						If ($LocalFile)     { $LocalFile.Dispose() }
+						If ($LocalStream)   { $LocalStream.Dispose() }
+						If ($LocalResponse) { $LocalResponse.Dispose() }
+						If ($LocalRequest)  { $LocalRequest.Dispose() }
+						If ($LocalClient)   { $LocalClient.Dispose() }
+						If (-not $Success -and (Test-Path $TempPath)) {
+							Remove-Item $TempPath -Force -ErrorAction SilentlyContinue
+						}
+					}
+
+					[pscustomobject]@{
+						Index        = $SegmentIndex
+						TempPath     = $TempPath
+						Success      = $Success
+						ErrorMessage = $ErrorMessage
+					}
+				}
+
+				# Create RunspacePool and queue all segment downloads
+				$RunspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(
+					1, $ParallelSegments, $Host
+				)
+				$RunspacePool.Open()
+
+				$SegmentJobs = [System.Collections.ArrayList]::new()
+				ForEach ($Seg in $Segments) {
+					$ScriptParams = @{
+						SegmentURL   = $URL.AbsoluteUri
+						RangeStart   = $Seg.Start
+						RangeEnd     = $Seg.End
+						TempPath     = $Seg.TempPath
+						SegmentIndex = $Seg.Index
+					}
+					$Job = [System.Management.Automation.PowerShell]::Create()
+					$null = $Job.AddScript($SegmentScriptBlock).AddParameters($ScriptParams)
+					$Job.RunspacePool = $RunspacePool
+					$null = $SegmentJobs.Add([pscustomobject]@{
+						Pipe   = $Job
+						Result = $Job.BeginInvoke()
+					})
+				}
+
+				# Wait for all segment jobs, reporting progress on 10-second intervals
+				$Jobs_Total      = $SegmentJobs.Count
+				$SegmentResults  = [System.Collections.Generic.List[object]]::new()
+				$ProgressStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+				$LastProgressUpdate = [long]-10000
+
+				Do {
+					$Completed = $SegmentJobs | Where-Object { $_.Result.IsCompleted }
+					$Remaining = @($SegmentJobs | Where-Object { -not $_.Result.IsCompleted }).Count
+
+					If ($ShowProgress -and ($ProgressStopwatch.ElapsedMilliseconds - $LastProgressUpdate -ge 10000)) {
+						$LastProgressUpdate = $ProgressStopwatch.ElapsedMilliseconds
+						$DonePct = If ($Jobs_Total -gt 0) { [int](100 * ($Jobs_Total - $Remaining) / $Jobs_Total) } Else { 100 }
+						Write-Progress -Activity "Downloading $FileName (Parallel, $Jobs_Total segments)" `
+							-Status "$($Jobs_Total - $Remaining) of $Jobs_Total segments complete" `
+							-PercentComplete $DonePct
+					}
+
+					If ($null -eq $Completed) {
+						Start-Sleep -Milliseconds 250
+						Continue
+					}
+
+					ForEach ($Job in @($Completed)) {
+						Try {
+							$JobOutput = $Job.Pipe.EndInvoke($Job.Result)
+							# EndInvoke returns a PSDataCollection — unwrap to the single result object
+							If ($JobOutput -and $JobOutput.Count -gt 0) { $SegmentResults.Add($JobOutput[0]) }
+						} Catch {
+							Write-Verbose "Method 0: EndInvoke failed for a segment: $_"
+						}
+						$Job.Pipe.Dispose()
+						$SegmentJobs.Remove($Job)
+					}
+				} While ($SegmentJobs.Count -gt 0)
+
+				If ($ShowProgress) {
+					Write-Progress -Activity "Downloading $FileName (Parallel, $Jobs_Total segments)" -Completed
+				}
+
+				$RunspacePool.Close()
+				$RunspacePool.Dispose()
+				$RunspacePool = $null
+
+				# Evaluate segment results — if any failed, fall through to single-stream methods
+				$SegmentErrors = [System.Collections.Generic.List[string]]::new()
+				ForEach ($R in $SegmentResults) {
+					If (-not $R.Success) {
+						$SegmentErrors.Add("Segment $($R.Index): $($R.ErrorMessage)")
+					}
+				}
+
+				If ($SegmentErrors.Count -gt 0) {
+					$ErrSummary = $SegmentErrors -join '; '
+					Write-Verbose "Method 0: $($SegmentErrors.Count) segment(s) failed: $ErrSummary"
+					$DownloadErrors.Add("ParallelDownload: $ErrSummary")
+				} ElseIf ($SegmentResults.Count -ne $ParallelSegments) {
+					Write-Verbose "Method 0: Expected $ParallelSegments results, got $($SegmentResults.Count). Aborting merge."
+					$DownloadErrors.Add("ParallelDownload: incomplete segment results ($($SegmentResults.Count)/$ParallelSegments)")
+				} Else {
+					# All segments succeeded — merge temp files into the final file in order
+					Write-Verbose 'Method 0: All segments downloaded. Merging...'
+					$MergeStream = $null
+					$MergeSuccess = $false
+					Try {
+						$MergeStream = [System.IO.FileStream]::new(
+							$FilePath,
+							[System.IO.FileMode]::Create,
+							[System.IO.FileAccess]::Write,
+							[System.IO.FileShare]::None,
+							81920
+						)
+						$SortedResults = $SegmentResults | Sort-Object -Property Index
+						ForEach ($R in $SortedResults) {
+							$PartStream = $null
+							Try {
+								$PartStream = [System.IO.FileStream]::new(
+									$R.TempPath,
+									[System.IO.FileMode]::Open,
+									[System.IO.FileAccess]::Read,
+									[System.IO.FileShare]::Read,
+									81920
+								)
+								$PartStream.CopyTo($MergeStream, 81920)
+							} Finally {
+								If ($PartStream) { $PartStream.Dispose() }
+							}
+						}
+						$MergeSuccess = $true
+					} Catch {
+						Write-Verbose "Method 0: Merge failed: $_"
+						$DownloadErrors.Add("ParallelDownload merge: $_")
+					} Finally {
+						If ($MergeStream) { $MergeStream.Dispose() }
+						If (-not $MergeSuccess -and (Test-Path $FilePath)) {
+							Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+						}
+					}
+
+					If ($MergeSuccess) {
+						# Verify merged file size matches expected Content-Length
+						$ActualSize = (Get-Item $FilePath).Length
+						If ($ActualSize -ne $ContentLength) {
+							Write-Verbose "Method 0: Final file size ($ActualSize) does not match Content-Length ($ContentLength). Discarding corrupt file."
+							$DownloadErrors.Add("ParallelDownload: size mismatch (expected $ContentLength, got $ActualSize)")
+							Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+						} Else {
+							$Downloaded = $true
+							Write-Verbose 'Method 0: Parallel download and merge completed successfully.'
+							Write-Host ('Parallel download complete ({0} segments merged, {1:N2} MB).' -f $ParallelSegments, ($ContentLength / 1MB))
+						}
+					}
+				}
+			}
+		} Catch {
+			Write-Verbose "Method 0: Unexpected error: $_"
+			$DownloadErrors.Add("ParallelDownload setup: $_")
+		} Finally {
+			# Guaranteed cleanup: stop/drain remaining jobs, then dispose RunspacePool, then delete temp files
+			If ($SegmentJobs) {
+				ForEach ($Job in @($SegmentJobs)) {
+					Try {
+						If (-not $Job.Result.IsCompleted) {
+							$Job.Pipe.Stop()
+						}
+						$null = $Job.Pipe.EndInvoke($Job.Result)
+						$Job.Pipe.Dispose()
+					} Catch {}
+				}
+			}
+			If ($RunspacePool) {
+				Try { $RunspacePool.Close() }   Catch {}
+				Try { $RunspacePool.Dispose() } Catch {}
+			}
+			If ($SegmentPaths) {
+				ForEach ($TempPath in $SegmentPaths) {
+					If (Test-Path $TempPath) {
+						Remove-Item $TempPath -Force -ErrorAction SilentlyContinue
+					}
+				}
+			}
+			If ($HeadResponse) { $HeadResponse.Dispose() }
+			If ($HeadRequest)  { $HeadRequest.Dispose() }
+			If ($HeadClient)   { $HeadClient.Dispose() }
+		}
+	}
 
 	# Method 1: HttpClient with stream-to-file
 	# Fastest option: streams directly to disk with an 80 KB buffer, no memory buffering

@@ -1200,7 +1200,7 @@ Function Update-WindowsTo11 {
 		[switch]$DownloadOnly,
 		[switch]$ShowProgress,
 		[string[]]$NetworkPaths = @(
-			"\\zeus.modrall.net\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
+			"\\zeus\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
 			"\\dc0\Win11_24H2$\setup.exe",
 			"\\fileserver\Images\Win11\setup.exe"
 		)

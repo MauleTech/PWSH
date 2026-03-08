@@ -1184,6 +1184,11 @@ Function Update-WindowsTo11 {
 	.PARAMETER ShowProgress
 	Run setup.exe with visible progress UI instead of quiet mode.
 
+	.PARAMETER DownloadUrl
+	A manually-provided direct download URL for the Windows 11 ISO. When specified,
+	the Fido URL-generation step is skipped entirely and this URL is used instead.
+	Useful when auto-generation via Fido fails.
+
 	.PARAMETER NetworkPaths
 	Array of UNC paths to check for setup.exe in priority order.
 
@@ -1192,13 +1197,14 @@ Function Update-WindowsTo11 {
 	Dependencies: MauleTech PWSH functions (loaded via irm ps.mauletech.com | iex).
 	#>
 
-	[CmdletBinding(SupportsShouldProcess = $true)]
+	[CmdletBinding()]
 	param(
 		[switch]$AutoReboot,
 		[string]$LogPath = "$env:ProgramData\Win11-Upgrade-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
 		[switch]$Force,
 		[switch]$DownloadOnly,
 		[switch]$ShowProgress,
+		[string]$DownloadUrl,
 		[string[]]$NetworkPaths = @(
 			"\\zeus\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
 			"\\dc0\Win11_24H2$\setup.exe",
@@ -1239,6 +1245,14 @@ Function Update-WindowsTo11 {
 			return $false
 		}
 
+		# Verify Authenticode signature before execution
+		$sig = Get-AuthenticodeSignature -FilePath $SetupPath -ErrorAction SilentlyContinue
+		if (-not $sig -or $sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+			Write-Log "setup.exe Authenticode signature validation failed (Status: $($sig.Status)). Aborting." -Level "ERROR"
+			return $false
+		}
+		Write-Log "Authenticode signature verified: $($sig.SignerCertificate.Subject)"
+
 		try {
 			# Suspend BitLocker if active
 			Write-Log "Checking BitLocker status..."
@@ -1246,7 +1260,8 @@ Function Update-WindowsTo11 {
 			if ($BitLockerVolume -and $BitLockerVolume.ProtectionStatus -eq 'On') {
 				Write-Log "BitLocker active -- suspending for 5 reboots..." -Level "WARNING"
 				try {
-					Suspend-BitLocker -MountPoint "C:" -RebootCount 5 -ErrorAction Stop
+					Suspend-BitLocker -MountPoint "C:" -RebootCount 5 -ErrorAction Stop | Out-Null
+					$script:BitLockerWasSuspended = $true
 					Write-Log "BitLocker suspended successfully" -Level "SUCCESS"
 				} catch {
 					Write-Log "Failed to suspend BitLocker: $($_.Exception.Message). Manual intervention may be needed." -Level "WARNING"
@@ -1316,6 +1331,9 @@ Function Update-WindowsTo11 {
 	#endregion
 
 	#region Pre-flight
+	# Ensure $ITFolder is set
+	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+
 	# Check for admin privileges
 	if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
 		[Security.Principal.WindowsBuiltInRole]"Administrator")) {
@@ -1377,7 +1395,7 @@ Function Update-WindowsTo11 {
 				$elig.TPM_VersionOK = $tpm.ManufacturerVersion -match '^2\.'
 			} elseif ($tpm.SpecVersion) {
 				$specStr = if ($tpm.SpecVersion -is [array]) { $tpm.SpecVersion[0] } else { $tpm.SpecVersion }
-				$elig.TPM_VersionOK = $specStr -match '^2\.' -or $specStr -match '2\.0'
+				$elig.TPM_VersionOK = $specStr -match '^2\.'
 			} else {
 				$elig.TPM_VersionOK = $tpm.TpmReady
 			}
@@ -1454,28 +1472,37 @@ Function Update-WindowsTo11 {
 	$SetupSuccessful = $false
 	$IsoPath = $null
 	$TempFidoScript = $null
+	$ExistingISO = $null
+	$MountedIsoPath = $null
+	$script:BitLockerWasSuspended = $false
 
 	try {
-		# --- Attempt 1: Network share ---
+		# --- Attempt 1: Network share (skipped when -DownloadUrl is provided) ---
 		$NetworkSetupPath = $null
-		foreach ($Path in $NetworkPaths) {
-			Write-Log "Checking network path: $Path"
-			if (Test-Path $Path -ErrorAction SilentlyContinue) {
-				$NetworkSetupPath = $Path
-				Write-Log "Found network setup: $NetworkSetupPath" -Level "SUCCESS"
-				break
+		if (-not $DownloadUrl) {
+			foreach ($Path in $NetworkPaths) {
+				Write-Log "Checking network path: $Path"
+				if (Test-Path $Path -ErrorAction SilentlyContinue) {
+					$NetworkSetupPath = $Path
+					Write-Log "Found network setup: $NetworkSetupPath" -Level "SUCCESS"
+					break
+				}
+			}
+
+			if ($NetworkSetupPath -and -not $DownloadOnly) {
+				Write-Log "Using network installation" -Level "SUCCESS"
+				$SetupSuccessful = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
 			}
 		}
 
-		if ($NetworkSetupPath -and -not $DownloadOnly) {
-			Write-Log "Using network installation" -Level "SUCCESS"
-			$SetupSuccessful = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
-		}
-
-		# --- Attempt 2: ISO download (fallback or DownloadOnly) ---
-		if ((-not $NetworkSetupPath -and -not $SetupSuccessful) -or $DownloadOnly) {
+		# --- Attempt 2: ISO download (fallback or DownloadOnly or DownloadUrl) ---
+		if (-not $SetupSuccessful -or $DownloadOnly) {
 			if ($DownloadOnly) {
 				Write-Log "DownloadOnly mode -- proceeding with ISO download" -Level "SUCCESS"
+			} elseif ($DownloadUrl) {
+				Write-Log "Using provided download URL for ISO..." -Level "SUCCESS"
+			} elseif ($NetworkSetupPath) {
+				Write-Log "Network setup failed. Falling back to ISO download..." -Level "WARNING"
 			} else {
 				Write-Log "No usable network path found. Falling back to ISO download..." -Level "WARNING"
 			}
@@ -1494,32 +1521,53 @@ Function Update-WindowsTo11 {
 			} else {
 				Write-Log "No suitable existing ISO found. Downloading..."
 
-				# Get download URL via Fido
-				$TempFidoScript = Join-Path $env:TEMP "Fido_$(Get-Date -Format 'yyyyMMddHHmmss').ps1"
-				$FidoUrl = "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1"
-
-				Write-Log "Downloading Fido script for ISO URL generation..."
-				Get-FileDownload -URL $FidoUrl -SaveToFolder (Split-Path $TempFidoScript -Parent) -ShowProgress
-				# Rename to our temp name if needed
-				$DownloadedFido = Join-Path (Split-Path $TempFidoScript -Parent) "Fido.ps1"
-				if (Test-Path $DownloadedFido) {
-					if ($DownloadedFido -ne $TempFidoScript) {
-						Move-Item -Path $DownloadedFido -Destination $TempFidoScript -Force
-					}
+				$UsedMirrorFallback = $false
+				if ($DownloadUrl) {
+					# Use the manually-provided download URL directly
+					Write-Log "Using user-provided download URL: $DownloadUrl" -Level "SUCCESS"
+					$Win11URL = $DownloadUrl
 				} else {
-					throw "Failed to download Fido script"
-				}
+					# Get download URL via Fido
+					$TempFidoScript = Join-Path $env:TEMP "Fido_$(Get-Date -Format 'yyyyMMddHHmmss').ps1"
+					$FidoUrl = "https://github.com/pbatard/Fido/raw/refs/heads/master/Fido.ps1"
 
-				Write-Log "Generating Windows 11 download URL via Fido..."
-				$Win11URL = & $TempFidoScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $true -Locale "en-US"
+					Write-Log "Downloading Fido script for ISO URL generation..."
+					$null = Get-FileDownload -URL $FidoUrl -SaveToFolder (Split-Path $TempFidoScript -Parent) -ShowProgress:$ShowProgress
+					# Rename to our temp name if needed
+					$DownloadedFido = Join-Path (Split-Path $TempFidoScript -Parent) "Fido.ps1"
+					if (Test-Path $DownloadedFido) {
+						if ($DownloadedFido -ne $TempFidoScript) {
+							Move-Item -Path $DownloadedFido -Destination $TempFidoScript -Force
+						}
+					} else {
+						throw "Failed to download Fido script"
+					}
 
-				if (-not $Win11URL) {
-					Write-Log "Fido failed to generate URL. Using MauleTech mirror as fallback." -Level "WARNING"
-					$Win11URL = "https://files.mauletech.com/files/ISOs/Win11_25H2_English_x64.iso?dl"
+					Write-Log "Generating Windows 11 download URL via Fido..."
+					$FidoOutput = & $TempFidoScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $true -Locale "en-US"
+					# Fido may emit multiple lines; extract the last one as the URL
+					$Win11URL = if ($FidoOutput -is [array]) { $FidoOutput[-1] } else { $FidoOutput }
+					$UsedMirrorFallback = $false
+
+					if (-not $Win11URL) {
+						Write-Log "Fido failed to generate URL. Using MauleTech mirror as fallback." -Level "WARNING"
+						$Win11URL = "https://files.mauletech.com/files/ISOs/Win11_25H2_English_x64.iso?dl"
+						$UsedMirrorFallback = $true
+					}
 				}
 
 				Write-Log "Downloading Windows 11 ISO (this may take a while)..."
-				$DownloadResult = Get-FileDownload -URL $Win11URL -SaveToFolder "$ITFolder\Downloads" -ShowProgress Checksum "D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32" -ChecksumType SHA256
+				$DownloadArgs = @{
+					URL          = $Win11URL
+					SaveToFolder = "$ITFolder\Downloads"
+					ShowProgress = $ShowProgress.IsPresent
+				}
+				if ($UsedMirrorFallback) {
+					# Only validate checksum when using the known MauleTech mirror
+					$DownloadArgs.Checksum     = "D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32"
+					$DownloadArgs.ChecksumType = "SHA256"
+				}
+				$DownloadResult = Get-FileDownload @DownloadArgs
 
 				# Get-FileDownload returns the path(s) -- grab the last element
 				if ($DownloadResult -is [array]) {
@@ -1543,6 +1591,7 @@ Function Update-WindowsTo11 {
 				# Mount and run setup from ISO
 				Write-Log "Mounting ISO..."
 				$MountResult = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
+				$MountedIsoPath = $IsoPath
 				$DriveLetter = ($MountResult | Get-Volume).DriveLetter
 
 				if (-not $DriveLetter) {
@@ -1557,6 +1606,7 @@ Function Update-WindowsTo11 {
 				Write-Log "Dismounting ISO..."
 				try {
 					Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop
+					$MountedIsoPath = $null
 					Write-Log "ISO dismounted" -Level "SUCCESS"
 				} catch {
 					Write-Log "Failed to dismount ISO: $($_.Exception.Message)" -Level "WARNING"
@@ -1566,13 +1616,35 @@ Function Update-WindowsTo11 {
 	} catch {
 		Write-Log "Critical error: $($_.Exception.Message)" -Level "ERROR"
 	} finally {
-		# Cleanup temp Fido script
+		# Dismount ISO if still mounted (exception safety)
+		if ($MountedIsoPath) {
+			try {
+				Dismount-DiskImage -ImagePath $MountedIsoPath -ErrorAction SilentlyContinue
+				Write-Log "ISO dismounted during cleanup" -Level "WARNING"
+			} catch {}
+		}
+
+		# Restore BitLocker if it was suspended and the upgrade failed
+		if ($script:BitLockerWasSuspended -and -not $SetupSuccessful) {
+			try {
+				Resume-BitLocker -MountPoint "C:" -ErrorAction Stop
+				Write-Log "BitLocker re-enabled after failed upgrade" -Level "SUCCESS"
+			} catch {
+				Write-Log "Failed to re-enable BitLocker: $($_.Exception.Message)" -Level "WARNING"
+			}
+		}
+
+		# Cleanup temp Fido script (both the renamed and original copies)
 		if ($TempFidoScript -and (Test-Path $TempFidoScript)) {
 			Remove-Item $TempFidoScript -Force -ErrorAction SilentlyContinue
 		}
+		$OriginalFido = Join-Path $env:TEMP "Fido.ps1"
+		if (Test-Path $OriginalFido) {
+			Remove-Item $OriginalFido -Force -ErrorAction SilentlyContinue
+		}
 
 		# Cleanup ISO only on success (preserve on failure for retry); never cleanup in DownloadOnly mode
-		if ($SetupSuccessful -and -not $DownloadOnly -and $IsoPath -and $ExistingISO -eq $null) {
+		if ($SetupSuccessful -and (-not $DownloadOnly) -and $IsoPath -and ($null -eq $ExistingISO)) {
 			if (Test-Path $IsoPath) {
 				Write-Log "Cleaning up downloaded ISO..."
 				Remove-Item $IsoPath -Force -ErrorAction SilentlyContinue
@@ -1582,11 +1654,11 @@ Function Update-WindowsTo11 {
 		}
 
 		# Final summary
-		if ($SetupSuccessful) {
+		if ($SetupSuccessful -and $DownloadOnly) {
+			Write-Log "ISO download completed successfully! Location: $IsoPath" -Level "SUCCESS"
+		} elseif ($SetupSuccessful) {
 			Write-Log "Windows 11 upgrade process completed successfully!" -Level "SUCCESS"
-			if (-not $DownloadOnly) {
-				Write-Log "A restart may be required to finish the upgrade."
-			}
+			Write-Log "A restart may be required to finish the upgrade."
 		} else {
 			Write-Log "Windows 11 upgrade process failed or completed with warnings." -Level "ERROR"
 			Write-Log "Check setup logs in C:\IT and log file: $($script:LogFile)"

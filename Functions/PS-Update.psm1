@@ -438,56 +438,9 @@ Function Update-Everything {
 	Restart-ComputerSafely -Force
 }
 
-Function Global:Update-ITFunctions {
-	Write-Host "Updating IT Functions from GitHub..." -ForegroundColor Yellow
-	if (Test-Path $PWSHFolder) {
-		try {
-			Push-Location $PWSHFolder
-			
-			# Determine which git to use
-			$GitCommand = if (Test-Path $GitExePath) { $GitExePath } else { "git" }
-			
-			# Show current status
-			Write-Host "Current status:" -ForegroundColor Yellow
-			& $GitCommand status --porcelain
-			
-			# Fetch all remotes
-			Write-Host "Fetching latest changes..." -ForegroundColor Yellow
-			& $GitCommand fetch origin
-			
-			# Check what branch we're on
-			$CurrentBranch = (& $GitCommand branch --show-current).Trim()
-			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
-			
-			# Reset to the remote version of current branch
-			Write-Host "Resetting to origin/$CurrentBranch..." -ForegroundColor Yellow
-			& $GitCommand reset --hard "origin/$CurrentBranch"
-			
-			# Show final status
-			Write-Host "Updated successfully! Current commit:" -ForegroundColor Green
-			& $GitCommand log --oneline -1
-			
-			Pop-Location
-			
-			# Reload functions
-			$FunctionFiles = Get-ChildItem -Path $FunctionsFolder -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
-			$FunctionFiles | ForEach-Object {
-				If (Test-Path $_ -ErrorAction SilentlyContinue) {
-					Import-Module $_ -Global -Force
-				}
-			}
-			Write-Host "IT Functions updated and reloaded successfully!" -ForegroundColor Green
-		}
-		catch {
-			Write-Host "Failed to update functions: $_" -ForegroundColor Red
-			if ((Get-Location).Path -eq $PWSHFolder) {
-				Pop-Location
-			}
-		}
-	} else {
-		Write-Host "PowerShell Functions repository not found. Please run the main script again." -ForegroundColor Red
-	}
-}
+# Update-ITFunctions is defined in LoadFunctions.txt using Sync-PWSHRepository
+# (with Invoke-Git timeout protection, GIT_TERMINAL_PROMPT=0, and remote-branch fallback).
+# Do NOT redefine it here — this module loads after the bootstrap and would shadow the better version.
 
 Function Update-ITS247Agent {
 	$DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion

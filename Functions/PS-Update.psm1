@@ -454,11 +454,25 @@ Function Global:Update-ITFunctions {
 			# Fetch all remotes
 			Write-Host "Fetching latest changes..." -ForegroundColor Yellow
 			& $GitCommand fetch origin
-			
+
 			# Check what branch we're on
 			$CurrentBranch = (& $GitCommand branch --show-current).Trim()
 			Write-Host "Current branch: $CurrentBranch" -ForegroundColor Yellow
-			
+
+			# Verify the remote tracking branch exists before resetting
+			$remoteRefCheck = & $GitCommand rev-parse --verify "origin/$CurrentBranch" 2>&1
+			if ($LASTEXITCODE -ne 0) {
+				# Remote branch doesn't exist — fall back to default branch
+				$DefaultBranch = "main"
+				try {
+					$headRef = (& $GitCommand symbolic-ref refs/remotes/origin/HEAD 2>$null).Trim()
+					if ($headRef) { $DefaultBranch = $headRef -replace '^refs/remotes/origin/', '' }
+				} catch { }
+				Write-Host "Remote branch 'origin/$CurrentBranch' does not exist. Falling back to '$DefaultBranch'..." -ForegroundColor Yellow
+				& $GitCommand checkout $DefaultBranch
+				$CurrentBranch = $DefaultBranch
+			}
+
 			# Reset to the remote version of current branch
 			Write-Host "Resetting to origin/$CurrentBranch..." -ForegroundColor Yellow
 			& $GitCommand reset --hard "origin/$CurrentBranch"

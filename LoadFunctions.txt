@@ -343,36 +343,32 @@ function Sync-PWSHRepository {
     $branch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
     if ($ShowProgress) { Write-Host "Current branch: $branch" -ForegroundColor Yellow }
 
+    # Fetch all refs in one call — avoids ambiguous "branch not found vs network error" on single-branch fetch
     if ($ShowProgress) { Write-Host "Fetching latest changes..." -ForegroundColor Yellow }
-    try {
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $branch) -WorkingDirectory $Global:PWSHFolder | Out-Null
-    }
-    catch {
-        # Branch may not exist on remote — fall back to fetching all refs
-        if ($ShowProgress) { Write-Host "Branch '$branch' not found on remote, fetching all..." -ForegroundColor Yellow }
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $Global:PWSHFolder | Out-Null
-    }
+    Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin") -WorkingDirectory $Global:PWSHFolder | Out-Null
 
-    # Verify the remote tracking ref exists before resetting
+    # Verify the remote tracking ref exists; fall back to default branch if not
     $remoteRef = "origin/$branch"
     try {
         Invoke-Git -GitPath $Global:GitCommand -Arguments @("rev-parse", "--verify", $remoteRef) -WorkingDirectory $Global:PWSHFolder | Out-Null
     }
     catch {
-        # Remote branch doesn't exist — fall back to default branch
         $defaultBranch = "main"
         try {
             $headRef = ((Invoke-Git -GitPath $Global:GitCommand -Arguments @("symbolic-ref", "refs/remotes/origin/HEAD") -WorkingDirectory $Global:PWSHFolder) -join "").Trim()
             $defaultBranch = $headRef -replace '^refs/remotes/origin/', ''
         }
-        catch { }
+        catch {
+            Write-Warning "Could not resolve remote default branch, assuming 'main'"
+        }
         if ($ShowProgress) { Write-Host "Remote branch 'origin/$branch' does not exist. Falling back to '$defaultBranch'..." -ForegroundColor Yellow }
         $remoteRef = "origin/$defaultBranch"
         $branch = $defaultBranch
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("checkout", $branch) -WorkingDirectory $Global:PWSHFolder | Out-Null
     }
 
+    # Force-switch branch and reset — checkout -B handles dirty tree safely
     if ($ShowProgress) { Write-Host "Resetting to $remoteRef..." -ForegroundColor Yellow }
+    Invoke-Git -GitPath $Global:GitCommand -Arguments @("checkout", "-B", $branch, $remoteRef) -WorkingDirectory $Global:PWSHFolder | Out-Null
     Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", $remoteRef) -WorkingDirectory $Global:PWSHFolder | Out-Null
 
     if ($ShowProgress) {
@@ -484,13 +480,7 @@ if ($MinGitReady) {
 if (Test-Path $Global:PWSHFolder) {
     Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
     try {
-        Set-GitSafeDirectory -Git $Global:GitCommand -Path $Global:PWSHFolder
-
-        $CurrentBranch = Get-CurrentBranch -Git $Global:GitCommand -WorkDir $Global:PWSHFolder
-        # Suppress git stdout — "Repository updated successfully!" is the explicit confirmation
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("fetch", "origin", $CurrentBranch) -WorkingDirectory $Global:PWSHFolder | Out-Null
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("reset", "--hard", "origin/$CurrentBranch") -WorkingDirectory $Global:PWSHFolder | Out-Null
-
+        Sync-PWSHRepository
         Write-Host "Repository updated successfully!" -ForegroundColor Green
     }
     catch {

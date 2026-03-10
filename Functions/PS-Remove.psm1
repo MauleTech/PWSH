@@ -527,8 +527,8 @@ Function Remove-PathForcefully {
 			Write-Host -ForegroundColor Green -BackgroundColor Black "Deletion of $Path succeeded."
 		}
 		catch {
-			# Slow path: some files were locked. Clean up what we can individually.
-			Write-Host "Bulk delete of $Path had locked files. Cleaning up individually..."
+			# Slow path: bulk delete failed (locked or protected files). Clean up what we can individually.
+			Write-Host "Bulk delete of $Path failed: $($_.Exception.Message). Cleaning up individually..."
 			$SubFiles = Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue
 			$SubFolders = Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue
 			If ($SubFiles -or $SubFolders) {

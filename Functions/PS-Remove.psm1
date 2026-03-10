@@ -503,10 +503,10 @@ Function Remove-PathForcefully {
 			[parameter(Mandatory = $true)]
 			[string] $SubPath
 		)
-		$SubPath = (Resolve-Path $SubPath -ErrorAction SilentlyContinue).Path
+		$SubPath = (Resolve-Path -LiteralPath $SubPath -ErrorAction SilentlyContinue).Path
 		If ($SubPath) {
 			try {
-				Remove-Item $SubPath -Force -Recurse -ErrorAction Stop
+				Remove-Item -LiteralPath $SubPath -Force -Recurse -ErrorAction Stop
 				Write-Host -ForegroundColor Green -BackgroundColor Black "Deletion of $SubPath succeeded."
 			}
 			catch {
@@ -520,16 +520,26 @@ Function Remove-PathForcefully {
 			}
 		}
 	}
-	If (Test-Path -Path $Path -Verbose) {
-		$SubFiles = Get-ChildItem -Path $Path -Recurse -Force -File
-		$SubFolders = Get-ChildItem -Path $Path -Recurse -Force -Directory
-		If ($SubFiles -or $SubFolders) {
-			$SubFiles | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
-			$SubFolders | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
-			Remove-SubPath -SubPath $Path
+	If (Test-Path -LiteralPath $Path -Verbose) {
+		# Fast path: try to delete everything in one shot
+		try {
+			Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
+			Write-Host -ForegroundColor Green -BackgroundColor Black "Deletion of $Path succeeded."
 		}
-		Else {
-			Remove-SubPath -SubPath $Path
+		catch {
+			# Slow path: bulk delete failed (locked or protected files). Clean up what we can individually.
+			Write-Host "Bulk delete of $Path failed: $($_.Exception.Message). Cleaning up individually..."
+			$SubFiles = Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue
+			$SubFolders = Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue
+			If ($SubFiles -or $SubFolders) {
+				$SubFiles | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
+				# Sort folders deepest-first so children are removed before parents
+				$SubFolders | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
+				Remove-SubPath -SubPath $Path
+			}
+			Else {
+				Remove-SubPath -SubPath $Path
+			}
 		}
 	}
  Else {
@@ -560,12 +570,12 @@ Function Remove-StaleObjects {
 	#$DaysOld = 30
 	$thresholdDate = (Get-Date).AddDays(-$DaysOld)
 	
-	If (! $(Test-Path $targetDirectory -ErrorAction SilentlyContinue)) {
+	If (! $(Test-Path -LiteralPath $targetDirectory -ErrorAction SilentlyContinue)) {
 		Write-Warning "$targetDirectory does not exist."
 		Break
 	}
 	# Recursively get all files and folders in the target directory
-	$itemsToDelete = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
+	$itemsToDelete = Get-ChildItem -LiteralPath $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
 		$_.LastWriteTime -lt $thresholdDate
 	}
 	#$itemsToDelete.FullName
@@ -573,44 +583,44 @@ Function Remove-StaleObjects {
 	foreach ($item in $itemsToDelete) {
 		if ($item.PSIsContainer) {
 			# If it's a folder, remove it recursively
-			Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+			Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
 			If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Verbose "Deleted folder: $($item.FullName)" }
 		}
 		else {
 			# If it's a file, remove it
-			Remove-Item -Path $item.FullName -Force -ErrorAction SilentlyContinue
+			Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
 			If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Verbose "Deleted file: $($item.FullName)" }
 		}
 	}
 
 	# Get all empty folders recursively
-	$emptyFolders = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
-		$_.PSIsContainer -and @(Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
+	$emptyFolders = Get-ChildItem -LiteralPath $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
+		$_.PSIsContainer -and @(Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
 	}
 
 	foreach ($folder in $emptyFolders) {
-		Remove-Item -Path $folder.FullName -Force -ErrorAction SilentlyContinue
+		Remove-Item -LiteralPath $folder.FullName -Force -ErrorAction SilentlyContinue
 		If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Host "Deleted empty folder: $($folder.FullName)" }
 	}
-	$itemsUnableToDelete = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
+	$itemsUnableToDelete = Get-ChildItem -LiteralPath $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
 		$_.LastWriteTime -lt $thresholdDate
 	}
 
 	#Try again for stubborn items.
 	ForEach ($StubbornItem in $itemsUnableToDelete) {
-		Remove-PathForcefully -Path $StubbornItem.PSPath -Verbose
+		Remove-PathForcefully -Path $StubbornItem.FullName -Verbose
 	}
 
 	# Get all empty folders recursively
-	$emptyFolders = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
-		$_.PSIsContainer -and @(Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
+	$emptyFolders = Get-ChildItem -LiteralPath $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
+		$_.PSIsContainer -and @(Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
 	}
 
 	foreach ($folder in $emptyFolders) {
 		Remove-PathForcefully -Path $folder.FullName -Verbose
 		If ( $PSBoundParameters['Verbose'] -or $VerbosePreference -eq 'Continue' ) { Write-Host "Deleted empty folder: $($folder.FullName)" }
 	}
-	$itemsUnableToDelete = Get-ChildItem -Path $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
+	$itemsUnableToDelete = Get-ChildItem -LiteralPath $targetDirectory -Recurse -ErrorAction SilentlyContinue | Where-Object {
 		$_.LastWriteTime -lt $thresholdDate
 	}
 

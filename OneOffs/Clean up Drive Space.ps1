@@ -11,22 +11,125 @@ $VerbosePreference = "SilentlyContinue"
 $DaysToDelete = 7
 $ErrorActionPreference = "SilentlyContinue"
 
-# Assign the pre-cleanup storage state to a variable.
-$PreClean = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object -Property DriveType -EQ 3 | Where-Object -Property DeviceID -EQ $Env:SystemDrive | Select-Object -Property @{ Name = 'Drive'; Expression = { ($PSItem.DeviceID) } },
-	@{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($PSItem.Size / 1GB) } },
-	@{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($PSItem.Freespace / 1GB) } },
-	@{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($PSItem.FreeSpace / $PSItem.Size) } }
+#region Helper Functions
 
-#Show what we're working with
-Write-Host "`nBefore Clean-up:`n$(($PreClean | Format-Table | Out-String).Trim())"
-Write-Host ((Get-Date).DateTime)
-Write-Host $env:COMPUTERNAME
-Start-Sleep -Seconds 10
+# Returns current free space in GB on the system drive
+Function Get-FreeSpaceGB {
+	$disk = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object -Property DriveType -EQ 3 | Where-Object -Property DeviceID -EQ $Env:SystemDrive
+	return [math]::Round($disk.FreeSpace / 1GB, 2)
+}
 
-# Assign the local and global paths to their own variables for easier path building.
-$GlobalAppData = $Env:APPDATA.Replace($Env:USERPROFILE, ($Env:Public).Replace('Public', '*'))
-$LocalAppData = $Env:LOCALAPPDATA.Replace($Env:USERPROFILE, ($Env:Public).Replace('Public', '*'))
-$RootAppData = "$(Split-Path -Path $LocalAppData)\*"
+# Tracks space freed per step and writes a status line
+$Script:StepLog = [System.Collections.ArrayList]::new()
+$Script:LastFreeSpace = $null
+
+Function Write-StepStatus {
+	param(
+		[string]$StepName,
+		[switch]$Start
+	)
+	$currentFree = Get-FreeSpaceGB
+	if ($Start) {
+		$Script:LastFreeSpace = $currentFree
+		Write-Host "`n=== Starting: $StepName ===" -ForegroundColor Cyan
+		return
+	}
+	$freed = [math]::Round($currentFree - $Script:LastFreeSpace, 2)
+	$totalFreed = [math]::Round($currentFree - $Script:InitialFreeSpace, 2)
+	[void]$Script:StepLog.Add([PSCustomObject]@{
+		Step    = $StepName
+		FreedGB = $freed
+	})
+	if ($freed -gt 0) {
+		Write-Host "--- $StepName freed ${freed} GB (total so far: ${totalFreed} GB free) ---" -ForegroundColor Green
+	} else {
+		Write-Host "--- $StepName: no additional space freed (total so far: ${totalFreed} GB free) ---" -ForegroundColor Yellow
+	}
+	$Script:LastFreeSpace = $currentFree
+}
+
+Function Enable-NTFSCompression {
+	param(
+		[string]$Path
+	)
+	if (Test-Path $Path) {
+		Write-Host "Compressing: $Path"
+		$result = compact /C /S:"$Path" /I /Q 2>&1
+		Write-Host "  $($result | Select-Object -Last 1)"
+	} else {
+		Write-Host "Path not found, skipping: $Path"
+	}
+}
+
+Function Clear-DeliveryOptimizationCache {
+	try {
+		Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
+		Write-Host "Cleared Delivery Optimization cache via cmdlet."
+	} catch {
+		$doPath = Join-Path -Path $Env:SystemRoot -ChildPath "SoftwareDistribution\DeliveryOptimization"
+		if (Test-Path $doPath) {
+			Remove-PathForcefully -Path $doPath
+			Write-Host "Cleared Delivery Optimization cache via manual deletion."
+		}
+	}
+}
+
+Function Invoke-OneDriveDehydration {
+	param(
+		[int]$InactiveDays = 14
+	)
+
+	Write-Host "Checking for OneDrive files to dehydrate for users inactive > $InactiveDays days"
+
+	$InactiveProfiles = Get-CimInstance -ClassName Win32_UserProfile |
+		Where-Object { $_.Loaded -eq $false } |
+		Where-Object { $_.LastUseTime -lt (Get-Date).AddDays(-$InactiveDays) } |
+		Where-Object { $_.LocalPath -notmatch 'admin|Remote Support|Default|Public|systemprofile|LocalService|NetworkService' }
+
+	foreach ($profile in $InactiveProfiles) {
+		$userName = Split-Path $profile.LocalPath -Leaf
+		$OneDriveFolders = @()
+
+		$bizFolders = Get-ChildItem -Path $profile.LocalPath -Directory -Filter "OneDrive -*" -ErrorAction SilentlyContinue
+		if ($bizFolders) { $OneDriveFolders += $bizFolders.FullName }
+
+		$personalPath = Join-Path $profile.LocalPath "OneDrive"
+		if (Test-Path $personalPath) { $OneDriveFolders += $personalPath }
+
+		foreach ($odPath in $OneDriveFolders) {
+			Write-Host "Dehydrating OneDrive files for '$userName': $odPath"
+			$dehydratedCount = 0
+			Get-ChildItem -Path $odPath -Force -File -Recurse -ErrorAction SilentlyContinue |
+				ForEach-Object {
+					$null = attrib.exe $_.FullName +U -P /s 2>&1
+					$dehydratedCount++
+				}
+			Write-Host "  Processed $dehydratedCount files in $odPath"
+		}
+	}
+}
+
+Function Reset-WindowsSearchIndex {
+	Write-Host "Resetting Windows Search Index..."
+	$searchService = Get-Service -Name WSearch -ErrorAction SilentlyContinue
+	if ($null -eq $searchService) {
+		Write-Host "  Windows Search service not found, skipping."
+		return
+	}
+	Stop-Service -Name WSearch -Force -ErrorAction SilentlyContinue
+	$edbPath = Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Search\Data\Applications\Windows\Windows.edb"
+	if (Test-Path $edbPath) {
+		$sizeMB = [math]::Round((Get-Item $edbPath -Force).Length / 1MB, 1)
+		Write-Host "  Deleting Windows.edb ($sizeMB MB)"
+		Remove-Item -Path $edbPath -Force -ErrorAction SilentlyContinue
+	}
+	Start-Service -Name WSearch -ErrorAction SilentlyContinue
+	Write-Host "  Windows Search service restarted; index will rebuild."
+}
+
+#endregion Helper Functions
+
+#region Existing Functions
 
 Function Invoke-WindowsCleanMgr {
 	# Set registry keys to check all Disk Cleanup boxes
@@ -172,92 +275,178 @@ Function Remove-StaleProfiles {
 	}
 }
 
-#$PreReqCommandsToRun = @(
-	Write-Host "Reclaim space from .NET Native Images" ; Get-Item "$Env:windir\Microsoft.NET\Framework\*\ngen.exe" -Force | ForEach-Object { & $($_.FullName) update } | Out-Null
-	Get-Service -Name wuauserv | Stop-Service -Force -Verbose #Stops Windows Update so we can clean it out.
-	powercfg -h off
-	$EdgePackageName = Get-AppxPackage -Name Microsoft.MicrosoftEdge | Select-Object -ExpandProperty PackageFamilyName
-	If ((Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Caption) -notlike "Microsoft Windows Server*") { #Let's not remove profiles on a server by default.
-		Remove-StaleProfiles
-	}
-#)
+#endregion Existing Functions
 
-## State which files or folders to clean up old files
-$FoldersToClean = @(
-	#Cleans up windows update service.
-	"$Env:TEMP" ## Deletes the contents of the C:\Windows\Temp\ folder.
+########################################
+# PHASE 1: PRE-REQUISITES
+########################################
+
+# Record pre-cleanup disk state
+$PreClean = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object -Property DriveType -EQ 3 | Where-Object -Property DeviceID -EQ $Env:SystemDrive | Select-Object -Property @{ Name = 'Drive'; Expression = { ($PSItem.DeviceID) } },
+	@{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($PSItem.Size / 1GB) } },
+	@{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($PSItem.Freespace / 1GB) } },
+	@{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($PSItem.FreeSpace / $PSItem.Size) } }
+
+Write-Host "`nBefore Clean-up:`n$(($PreClean | Format-Table | Out-String).Trim())"
+Write-Host ((Get-Date).DateTime)
+Write-Host $env:COMPUTERNAME
+Start-Sleep -Seconds 10
+
+$Script:InitialFreeSpace = Get-FreeSpaceGB
+
+# Assign the local and global paths to their own variables for easier path building.
+$GlobalAppData = $Env:APPDATA.Replace($Env:USERPROFILE, ($Env:Public).Replace('Public', '*'))
+$LocalAppData = $Env:LOCALAPPDATA.Replace($Env:USERPROFILE, ($Env:Public).Replace('Public', '*'))
+$RootAppData = "$(Split-Path -Path $LocalAppData)\*"
+
+# Pre-requisite commands
+Write-Host "Reclaim space from .NET Native Images" ; Get-Item "$Env:windir\Microsoft.NET\Framework\*\ngen.exe" -Force | ForEach-Object { & $($_.FullName) update } | Out-Null
+Get-Service -Name wuauserv | Stop-Service -Force -Verbose #Stops Windows Update so we can clean it out.
+$EdgePackageName = Get-AppxPackage -Name Microsoft.MicrosoftEdge | Select-Object -ExpandProperty PackageFamilyName
+
+# Block Chrome on-device AI model downloads (Gemini Nano, ~4 GB per user)
+Write-Host "Setting Chrome policy to block on-device AI model downloads"
+New-Item -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "GenAILocalFoundationalModelSettings" -Value 1 -Type DWord
+
+########################################
+# PHASE 2: HIGHEST IMPACT (multi-GB each)
+########################################
+
+# --- Disable Hibernation (2-8+ GB, instant) ---
+Write-StepStatus -StepName "Disable Hibernation" -Start
+powercfg -h off
+Write-StepStatus -StepName "Disable Hibernation"
+
+# --- Delete Windows.old (~10-30 GB when present) ---
+Write-StepStatus -StepName "Delete Windows.old" -Start
+@(
+	(Join-Path -Path $Env:SystemDrive -ChildPath "Windows.old")
+) | ForEach-Object {
+	if (Test-Path $_) { Remove-PathForcefully -Path $_ }
+}
+Write-StepStatus -StepName "Delete Windows.old"
+
+# --- Delete Windows upgrade remnants (5-20 GB) ---
+Write-StepStatus -StepName "Delete Windows upgrade remnants" -Start
+@(
+	(Join-Path -Path $Env:SystemDrive -ChildPath '$GetCurrent')
+	(Join-Path -Path $Env:SystemDrive -ChildPath '$WINDOWS.~BT')
+	(Join-Path -Path $Env:SystemDrive -ChildPath '$WINDOWS.~WS')
+	(Join-Path -Path $Env:SystemDrive -ChildPath '$WinREAgent')
+	(Join-Path -Path $Env:SystemDrive -ChildPath "Windows10Upgrade")
+) | ForEach-Object {
+	if (Test-Path $_) { Remove-PathForcefully -Path $_ }
+}
+Write-StepStatus -StepName "Delete Windows upgrade remnants"
+
+# --- WinSxS cleanup via DISM (1-5+ GB) ---
+Write-StepStatus -StepName "WinSxS cleanup (DISM)" -Start
+Write-Host "Reducing the size of the WinSxS folder"
+Dism.exe /online /Cleanup-Image /StartComponentCleanup
+Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase
+Dism.exe /online /Cleanup-Image /SPSuperseded
+Write-StepStatus -StepName "WinSxS cleanup (DISM)"
+
+# --- StartComponentCleanup scheduled task ---
+Write-StepStatus -StepName "StartComponentCleanup task" -Start
+Start-ScheduledTask -TaskPath "\Microsoft\Windows\Servicing" -TaskName "StartComponentCleanup" -Verbose:$false
+Write-StepStatus -StepName "StartComponentCleanup task"
+
+# --- Disable Reserved Storage (~7 GB) ---
+Write-StepStatus -StepName "Disable Reserved Storage" -Start
+DISM.exe /Online /Set-ReservedStorageState /State:Disabled
+Write-StepStatus -StepName "Disable Reserved Storage"
+
+# --- Remove stale user profiles (multi-GB per profile) ---
+Write-StepStatus -StepName "Remove stale user profiles" -Start
+If ((Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Caption) -notlike "Microsoft Windows Server*") {
+	Remove-StaleProfiles
+}
+Write-StepStatus -StepName "Remove stale user profiles"
+
+# --- Empty Recycle Bin (highly variable) ---
+Write-StepStatus -StepName "Empty Recycle Bin" -Start
+Write-Host "Emptying Recycle Bin" ; Clear-RecycleBin -Force
+Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-PathForcefully -ErrorAction SilentlyContinue
+Write-StepStatus -StepName "Empty Recycle Bin"
+
+# --- Delete MEMORY.dmp (can be full RAM size) ---
+Write-StepStatus -StepName "Delete MEMORY.dmp" -Start
+$memDmp = Join-Path -Path $Env:SystemRoot -ChildPath "MEMORY.dmp"
+if (Test-Path $memDmp) { Remove-PathForcefully -Path $memDmp }
+Write-StepStatus -StepName "Delete MEMORY.dmp"
+
+# --- Delete MSOCache (Office install cache, 1-3 GB) ---
+Write-StepStatus -StepName "Delete MSOCache" -Start
+$msoCache = Join-Path -Path $Env:SystemDrive -ChildPath "MSOCache"
+if (Test-Path $msoCache) { Remove-PathForcefully -Path $msoCache }
+Write-StepStatus -StepName "Delete MSOCache"
+
+# --- Clean Windows Update downloads (1-5 GB) ---
+Write-StepStatus -StepName "Clean Windows Update downloads" -Start
+@(
 	(Join-Path -Path $Env:SystemRoot -ChildPath "SoftwareDistribution\Download")
 	(Join-Path -Path $Env:SystemRoot -ChildPath "SoftwareDistribution\DataStore\Logs")
 	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\WindowsUpdate")
 	(Join-Path -Path $Env:ProgramData -ChildPath "USOShared\Logs")
-	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\WER\ReportArchive")
-	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\WER\ReportQueue")
-	(Join-Path -Path $LocalAppData -ChildPath "Temp") ## Deletes all files and folders in user's Temp folder.
+) | ForEach-Object {
+	if (Test-Path $_) { Remove-StaleObjects -targetDirectory $_ -DaysOld $DaysToDelete }
+}
+Write-StepStatus -StepName "Clean Windows Update downloads"
+
+# --- Delivery Optimization Cache (1-5 GB) ---
+Write-StepStatus -StepName "Delivery Optimization Cache" -Start
+Clear-DeliveryOptimizationCache
+Write-StepStatus -StepName "Delivery Optimization Cache"
+
+# --- Chrome AI model files (~4 GB per user) ---
+Write-StepStatus -StepName "Delete Chrome AI model files" -Start
+@(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\OptGuideOnDeviceModel") -Force) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+Write-StepStatus -StepName "Delete Chrome AI model files"
+
+########################################
+# PHASE 3: MEDIUM IMPACT (hundreds of MB to a few GB)
+########################################
+
+# --- Temp folder cleanup ---
+Write-StepStatus -StepName "Temp folder cleanup" -Start
+@(
+	"$Env:TEMP"
+	(Join-Path -Path $LocalAppData -ChildPath "Temp")
 	(Join-Path -Path $Env:SystemDrive -ChildPath "Temp")
-	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Windows\Temporary Internet Files") ## Remove all files and folders in user's Temporary Internet Files.
+) | ForEach-Object {
+	if (@(Get-Item $_ -Force)) {
+		Get-Item $_ -Force | ForEach-Object { Remove-StaleObjects -targetDirectory $_.FullName -DaysOld $DaysToDelete }
+	}
+}
+Write-StepStatus -StepName "Temp folder cleanup"
+
+# --- Browser caches (Chrome, Edge, Firefox, IE — combined 1-5 GB) ---
+Write-StepStatus -StepName "Browser cache cleanup" -Start
+
+# Age-based browser cache cleanup
+$BrowserFoldersToClean = @(
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Windows\Temporary Internet Files")
 	(Join-Path -Path $GlobalAppData -ChildPath "Microsoft\Windows\Cookies")
-	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "inetpub\logs\LogFiles") ## Cleans IIS Logs
-	(Join-Path -Path ($Env:Public).Replace('Public', '*') -ChildPath "AppData\Locallow\sun\java\deployment\cache") ## Remove all files and folders in user's Java Cache.
-	(Join-Path -Path $LocalAppData -ChildPath "Mozilla\Firefox\Profiles\*.default\Cache") ## Remove all files and folders in user's Firefox Cache.
-	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\Cache") ## Remove all files and folders in user's Chrome Cache.
-	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Default\Cache") ## Remove all files and folders in user's Edge Cache.
-	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Windows\Temporary Internet Files\Content.IE5") ## Internet Explorer temp files
-	(Join-Path -Path $GlobalAppData -ChildPath "Macromedia\Flash Player\macromedia.com\support\flashplayer\sys") ## Flash temp files
-	(Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "ITSPlatform\agentcore\download") ##Continuum downloader
-	(Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Common Files\Adobe\Reader\Temp") ##Adobe Installer
-	(Join-Path -Path $env:ProgramData -ChildPath "Adobe\ARM") ## https://community.adobe.com/t5/acrobat-reader-discussions/can-arm-folders-be-deleted/td-p/5141447
-	(Join-Path -Path $RootAppData -ChildPath "Microsoft\Windows\WER")
-	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Terminal Server Client\Cache")
-	(Join-Path -Path $RootAppData -ChildPath "Microsoft\Terminal Server Client\Cache")
-	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\RetailDemo")
-	(Join-Path -Path $LocalAppData -ChildPath "IsolatedStorage\")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\DISM")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "minidump")
-	(Join-Path -Path $Env:SystemRoot -ChildPath Prefetch)
-	(Join-Path -Path $Env:SystemRoot -ChildPath "security\logs")
-	(Join-Path -Path $Env:SystemDrive -ChildPath swsetup)
-	(Join-Path -Path $Env:SystemDrive -ChildPath swtools)
-	(Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Dropbox\Temp")
+	(Join-Path -Path $LocalAppData -ChildPath "Mozilla\Firefox\Profiles\*.default\Cache")
+	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\Default\Cache")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Edge\User Data\Default\Cache")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Windows\Temporary Internet Files\Content.IE5")
+	(Join-Path -Path $GlobalAppData -ChildPath "Macromedia\Flash Player\macromedia.com\support\flashplayer\sys")
 	(Join-Path -Path $Env:SystemRoot -ChildPath "SysWOW64\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\IE")
 )
+$BrowserFoldersToClean | ForEach-Object {
+	if (@(Get-Item $_ -Force)) {
+		Get-Item $_ -Force | ForEach-Object { Remove-StaleObjects -targetDirectory $_.FullName -DaysOld $DaysToDelete }
+	}
+}
 
-## State which files or folders to just delete
-$PathsToDelete = @(
-	(Join-Path -Path $Env:SystemRoot -ChildPath "MEMORY.dmp") ## Delete Windows memory dumps
-	(Join-Path -Path $Env:SystemDrive -ChildPath "hiberfil.sys") #Removes Hibernate file
-	## Remove folders related to windows update process
-		(Join-Path -Path $Env:SystemDrive -ChildPath '$GetCurrent')
-		(Join-Path -Path $Env:SystemDrive -ChildPath '$WINDOWS.~BT')
-		(Join-Path -Path $Env:SystemDrive -ChildPath '$WINDOWS.~WS')
-		(Join-Path -Path $Env:SystemDrive -ChildPath '$WinREAgent')
-	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.ost") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST files that haven't been used in more than 30 days
-	@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.bak") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) ## OST backup files that haven't been used in more than 30 days
-	(Join-Path -Path $Env:SystemDrive -ChildPath "Windows.old") ##Old windows install
-	(Join-Path -Path $Env:SystemDrive -ChildPath "IT\NiniteDownloads")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "adobeTemp")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "debug\WIA\*.log")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "INF\*.log*")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\CBS\*Persist*")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\dosvc\*.*")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\MeasuredBoot\*.log")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\NetSetup\*.*")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\SIH\*.*")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\WindowsBackup\*.etl")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "Panther\UnattendGC\*.log")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "TMP")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "TempPath")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "OneDriveTemp")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "MSOCache")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "Windows10Upgrade")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "WinSxS\ManifestCache\*")
-	#(Join-Path -Path $Env:SystemRoot -ChildPath "*.log")
-	(Join-Path -Path $Env:SystemRoot -ChildPath "*.dmp")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "*.dmp")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "File*.chk")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "Found.*\*.chk")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "LiveKernelReports\*.dmp")
-	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "Intel")
-	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "PerfLogs")
+# Full browser cache deletions
+$BrowserPathsToDelete = @(
 	#Chrome
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\*.pma")
 	(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\BrowserMetrics\*.pma")
@@ -415,56 +604,63 @@ $PathsToDelete = @(
 	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\EdgeUpdate\Log\*")
 	(Join-Path -Path ${Env:ProgramFiles(x86)} -ChildPath "Microsoft\Edge\Application\SetupMetrics\*.pma")
 	(Join-Path -Path ${Env:ProgramFiles(x86)} -ChildPath "Microsoft\EdgeUpdate\Download\*")
-	#Quickbooks
-	(Join-Path -Path $Env:ProgramData -ChildPath "Intuit\QuickBooks*\Components\DownloadQB*")
-	(Join-Path -Path $Env:ProgramData -ChildPath "Intuit\QuickBooks*\Components\QBUpdateCache")
-	#Worldox
-	#(Join-Path -Path $LocalAppData -ChildPath "Worldox\ZMS\*")
 )
+$BrowserPathsToDelete | ForEach-Object {
+	if (@(Get-Item $_ -Force)) {
+		ForEach ($SubItem in @($_)) {
+			if (Get-Item $SubItem -Force) {
+				Try {
+					Get-Item $SubItem -Force | ForEach-Object { Remove-PathForcefully -Path $_.FullName }
+				} Catch {
+					Write-Host "Not worth it for $SubItem"
+				}
+			}
+		}
+	}
+}
+Write-StepStatus -StepName "Browser cache cleanup"
 
+# --- cleanmgr.exe runs ---
+Write-StepStatus -StepName "Windows Disk Cleanup Manager" -Start
+Invoke-WindowsCleanMgr
+Write-StepStatus -StepName "Windows Disk Cleanup Manager"
+
+# --- Orphaned MSI/MSP installer files ---
+Write-StepStatus -StepName "Orphaned installer files" -Start
+Write-Host "Removing Orphaned Installer Files" ; Remove-OrphanedInstallerFiles
+Write-StepStatus -StepName "Orphaned installer files"
+
+# --- Stale Outlook OST/BAK files (1-10 GB each) ---
+Write-StepStatus -StepName "Stale Outlook files" -Start
+@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.ost") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+@($(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Outlook\*.bak") -Force) | Where-Object -Property "LastWriteTime" -lt $((Get-Date).AddDays(-30))) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+Write-StepStatus -StepName "Stale Outlook files"
+
+# --- Outlook temp attachments (Content.Outlook) ---
+Write-StepStatus -StepName "Outlook temp attachments" -Start
+@(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Windows\INetCache\Content.Outlook\*") -Force) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+Write-StepStatus -StepName "Outlook temp attachments"
+
+# --- Remove Restore Points / Shadow Copies ---
+Write-StepStatus -StepName "Remove Restore Points" -Start
+Write-Host "Removing Restore Points" ; Remove-WindowsRestorePoints
+Write-StepStatus -StepName "Remove Restore Points"
+
+# --- Downloads deduplication ---
+Write-StepStatus -StepName "Downloads deduplication" -Start
 $FoldersToDeDuplicate = @(
 	(Join-Path -Path ($Env:Public).Replace('Public', '*') -ChildPath "Downloads")
 )
-
-#Clean up folders
-$FoldersToClean | ForEach-Object {
-	If (@(Get-Item $_ -Force)) {
-		ForEach ($SubItem in @($_)) {
-			If (Get-Item $SubItem -Force) {
-				Try {
-					Get-Item $SubItem -Force | ForEach-Object {
-						Remove-StaleObjects -targetDirectory $_.FullName -DaysOld $DaysToDelete
-					}
-				} Catch {
-					Write-Host "Not worth it for $SubItem"
-				}
-			}
-		}
-	}
-}
-
-#Delete the folders / files
-$PathsToDelete | ForEach-Object {
-	If (@(Get-Item $_ -Force)) {
-		ForEach ($SubItem in @($_)) {
-			If (Get-Item $SubItem -Force) {
-				Try {
-					Get-Item $SubItem -Force | ForEach-Object {
-						Remove-PathForcefully -Path $_.FullName
-					}
-				} Catch {
-					Write-Host "Not worth it for $SubItem"
-				}
-			}
-		}
-	}
-}
-
-#DeDuplicate files in these folders
 $FoldersToDeDuplicate | ForEach-Object {
-	If (@(Get-Item $_ -Force)) {
+	if (@(Get-Item $_ -Force)) {
 		ForEach ($SubItem in @($_)) {
-			If (Get-Item $SubItem -Force) {
+			if (Get-Item $SubItem -Force) {
 				Write-Host $SubItem
 				Try {
 					Get-Item $SubItem -Force | ForEach-Object {
@@ -479,261 +675,257 @@ $FoldersToDeDuplicate | ForEach-Object {
 		}
 	}
 }
+Write-StepStatus -StepName "Downloads deduplication"
 
-#$CommandsToRun = @(
-	Start-ScheduledTask -TaskPath "\Microsoft\Windows\Servicing" -TaskName "StartComponentCleanup" -Verbose:$false ## Run the StartComponentCleanup task
-	Write-Host "Emptying Recycle Bin" ;Clear-RecycleBin -Force ## Empties Recycle Bin
-	Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-	Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-PathForcefully -ErrorAction SilentlyContinue
-	## Reduce the size of the WinSxS folder
-	Write-Host "Reducing the size of the WinSxS folder"
-	Dism.exe /online /Cleanup-Image /StartComponentCleanup
-	Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase
-	Dism.exe /online /Cleanup-Image /SPSuperseded
-	DISM.exe /Online /Set-ReservedStorageState /State:Disabled
-	Write-Host "Cleaning up the WMI Repository" ; Winmgmt /salvagerepository ## Cleans up WMI Repository
-	Write-Host "Erasing IE Temp Data" ;Start-Process -FilePath rundll32.exe -ArgumentList 'inetcpl.cpl,ClearMyTracksByProcess 4351' -Wait -NoNewWindow ## erase Internet Explorer temp data
-	Write-Host "Removing Restore Points" ;Remove-WindowsRestorePoints
-	Write-Host "Clearing Event Logs" ;Remove-EventLogs
-	Write-Host "Removing Duplicate Drivers" ;Remove-DuplicateDrivers
-	Write-Host "Removing Orphaned Installer Files" ;Remove-OrphanedInstallerFiles
-	Invoke-WindowsCleanMgr
-#)
+# --- Teams cache cleanup ---
+Write-StepStatus -StepName "Teams cache cleanup" -Start
+# Teams Classic
+$TeamsClassicPaths = @(
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Teams\Cache")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Teams\blob_storage")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Teams\databases")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Teams\GPUCache")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Teams\IndexedDB")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Teams\Local Storage")
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Teams\tmp")
+)
+$TeamsClassicPaths | ForEach-Object {
+	@(Get-Item $_ -Force) | ForEach-Object {
+		if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+	}
+}
+# New Teams (ms-teams)
+@(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Packages\MSTeams_*\LocalCache") -Force) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+Write-StepStatus -StepName "Teams cache cleanup"
 
-#$PostReqCommandsToRun = @(
-	Get-Service -Name wuauserv | Start-Service -Verbose #Starts Windows Update.
-#)
+# --- OneDrive dehydration for inactive users ---
+Write-StepStatus -StepName "OneDrive dehydration" -Start
+Invoke-OneDriveDehydration
+Write-StepStatus -StepName "OneDrive dehydration"
+
+########################################
+# PHASE 4: LOWER IMPACT (tens to hundreds of MB)
+########################################
+
+# --- Crash dumps ---
+Write-StepStatus -StepName "Crash dump cleanup" -Start
+$CrashDumpPaths = @(
+	(Join-Path -Path $Env:SystemRoot -ChildPath "*.dmp")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "*.dmp")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "LiveKernelReports\*.dmp")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "minidump")
+	(Join-Path -Path $LocalAppData -ChildPath "CrashDumps")
+	(Join-Path -Path $RootAppData -ChildPath "CrashDumps")
+)
+$CrashDumpPaths | ForEach-Object {
+	@(Get-Item $_ -Force) | ForEach-Object {
+		if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+	}
+}
+Write-StepStatus -StepName "Crash dump cleanup"
+
+# --- Log file cleanup ---
+Write-StepStatus -StepName "Log file cleanup" -Start
+$LogPaths = @(
+	(Join-Path -Path $Env:SystemRoot -ChildPath "debug\WIA\*.log")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "INF\*.log*")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\CBS\*Persist*")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\dosvc\*.*")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\MeasuredBoot\*.log")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\NetSetup\*.*")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\SIH\*.*")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\WindowsBackup\*.etl")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Panther\UnattendGC\*.log")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "Logs\DISM")
+	(Join-Path -Path $Env:SystemRoot -ChildPath "security\logs")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\WER\ReportArchive")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\WER\ReportQueue")
+	(Join-Path -Path $RootAppData -ChildPath "Microsoft\Windows\WER")
+)
+$LogPaths | ForEach-Object {
+	@(Get-Item $_ -Force) | ForEach-Object {
+		if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+	}
+}
+Write-StepStatus -StepName "Log file cleanup"
+
+# --- Duplicate driver removal ---
+Write-StepStatus -StepName "Duplicate driver removal" -Start
+Write-Host "Removing Duplicate Drivers" ; Remove-DuplicateDrivers
+Write-StepStatus -StepName "Duplicate driver removal"
+
+# --- WMI repository salvage ---
+Write-StepStatus -StepName "WMI repository cleanup" -Start
+Write-Host "Cleaning up the WMI Repository" ; Winmgmt /salvagerepository
+Write-StepStatus -StepName "WMI repository cleanup"
+
+# --- IE temp data via rundll32 ---
+Write-StepStatus -StepName "IE temp data cleanup" -Start
+Write-Host "Erasing IE Temp Data" ; Start-Process -FilePath rundll32.exe -ArgumentList 'inetcpl.cpl,ClearMyTracksByProcess 4351' -Wait -NoNewWindow
+Write-StepStatus -StepName "IE temp data cleanup"
+
+# --- Event log clearing ---
+Write-StepStatus -StepName "Event log clearing" -Start
+Write-Host "Clearing Event Logs" ; Remove-EventLogs
+Write-StepStatus -StepName "Event log clearing"
+
+# --- Prefetch cleanup ---
+Write-StepStatus -StepName "Prefetch cleanup" -Start
+$prefetchPath = Join-Path -Path $Env:SystemRoot -ChildPath "Prefetch"
+if (Test-Path $prefetchPath) { Remove-StaleObjects -targetDirectory $prefetchPath -DaysOld $DaysToDelete }
+Write-StepStatus -StepName "Prefetch cleanup"
+
+# --- Java/Flash/Adobe caches ---
+Write-StepStatus -StepName "Java/Flash/Adobe cache cleanup" -Start
+$AppCachePaths = @(
+	(Join-Path -Path ($Env:Public).Replace('Public', '*') -ChildPath "AppData\Locallow\sun\java\deployment\cache")
+	(Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Common Files\Adobe\Reader\Temp")
+	(Join-Path -Path $env:ProgramData -ChildPath "Adobe\ARM")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "adobeTemp")
+)
+$AppCachePaths | ForEach-Object {
+	@(Get-Item $_ -Force) | ForEach-Object {
+		if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+	}
+}
+Write-StepStatus -StepName "Java/Flash/Adobe cache cleanup"
+
+# --- RDP cache files ---
+Write-StepStatus -StepName "RDP cache cleanup" -Start
+@(
+	(Join-Path -Path $LocalAppData -ChildPath "Microsoft\Terminal Server Client\Cache")
+	(Join-Path -Path $RootAppData -ChildPath "Microsoft\Terminal Server Client\Cache")
+) | ForEach-Object {
+	if (@(Get-Item $_ -Force)) {
+		Get-Item $_ -Force | ForEach-Object { Remove-StaleObjects -targetDirectory $_.FullName -DaysOld $DaysToDelete }
+	}
+}
+Write-StepStatus -StepName "RDP cache cleanup"
+
+# --- WinSxS ManifestCache ---
+Write-StepStatus -StepName "WinSxS ManifestCache" -Start
+@(Get-Item -Path (Join-Path -Path $Env:SystemRoot -ChildPath "WinSxS\ManifestCache\*") -Force) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+Write-StepStatus -StepName "WinSxS ManifestCache"
+
+# --- Misc system paths (Intel, PerfLogs, swsetup, swtools, etc.) ---
+Write-StepStatus -StepName "Misc system folder cleanup" -Start
+$MiscPaths = @(
+	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "Intel")
+	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "PerfLogs")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "swsetup")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "swtools")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "TMP")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "TempPath")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "OneDriveTemp")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "IT\NiniteDownloads")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "File*.chk")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "Found.*\*.chk")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "*.tmp")
+	(Join-Path -Path $Env:SystemDrive -ChildPath "hiberfil.sys")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\RetailDemo")
+	(Join-Path -Path $LocalAppData -ChildPath "IsolatedStorage\")
+	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "inetpub\logs\LogFiles")
+	(Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "ITSPlatform\agentcore\download")
+	#Quickbooks
+	(Join-Path -Path $Env:ProgramData -ChildPath "Intuit\QuickBooks*\Components\DownloadQB*")
+	(Join-Path -Path $Env:ProgramData -ChildPath "Intuit\QuickBooks*\Components\QBUpdateCache")
+)
+$MiscPaths | ForEach-Object {
+	@(Get-Item $_ -Force) | ForEach-Object {
+		if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+	}
+}
+Write-StepStatus -StepName "Misc system folder cleanup"
+
+# --- GPU shader caches ---
+Write-StepStatus -StepName "GPU shader cache cleanup" -Start
+$GpuCachePaths = @(
+	(Join-Path -Path $LocalAppData -ChildPath "NVIDIA\DXCache")
+	(Join-Path -Path $LocalAppData -ChildPath "NVIDIA\GLCache")
+	(Join-Path -Path $LocalAppData -ChildPath "AMD\DxCache")
+	(Join-Path -Path $LocalAppData -ChildPath "AMD\GLCache")
+)
+$GpuCachePaths | ForEach-Object {
+	@(Get-Item $_ -Force) | ForEach-Object {
+		if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+	}
+}
+Write-StepStatus -StepName "GPU shader cache cleanup"
+
+# --- Thumbnail caches ---
+Write-StepStatus -StepName "Thumbnail cache cleanup" -Start
+@(Get-Item -Path (Join-Path -Path $LocalAppData -ChildPath "Microsoft\Windows\Explorer\thumbcache_*.db") -Force) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+Write-StepStatus -StepName "Thumbnail cache cleanup"
+
+# --- Font cache files ---
+Write-StepStatus -StepName "Font cache cleanup" -Start
+@(Get-Item -Path (Join-Path -Path $Env:SystemRoot -ChildPath "ServiceProfiles\LocalService\AppData\Local\FontCache\*.dat") -Force) | ForEach-Object {
+	if ($_ -and (Test-Path $_.FullName)) { Remove-PathForcefully -Path $_.FullName }
+}
+Write-StepStatus -StepName "Font cache cleanup"
+
+########################################
+# PHASE 5: NTFS COMPRESSION (non-destructive, reclaims space in-place)
+########################################
+
+Write-StepStatus -StepName "NTFS Compression" -Start
+Enable-NTFSCompression -Path "$Env:SystemRoot\Installer"
+Enable-NTFSCompression -Path "$Env:SystemRoot\Logs"
+Enable-NTFSCompression -Path "$Env:SystemRoot\WinSxS\Backup"
+Enable-NTFSCompression -Path "$Env:SystemRoot\INF"
+Enable-NTFSCompression -Path "$Env:SystemRoot\Help"
+Write-StepStatus -StepName "NTFS Compression"
+
+########################################
+# PHASE 6: EMERGENCY — Windows Search Index (only if <10 GB free)
+########################################
+
+$currentFreeGB = Get-FreeSpaceGB
+if ($currentFreeGB -lt 10) {
+	Write-StepStatus -StepName "Windows Search Index reset (emergency)" -Start
+	Write-Host "Free space is ${currentFreeGB} GB (< 10 GB). Resetting Windows Search Index as emergency measure."
+	Reset-WindowsSearchIndex
+	Write-StepStatus -StepName "Windows Search Index reset (emergency)"
+} else {
+	Write-Host "`n--- Skipping Windows Search Index reset: ${currentFreeGB} GB free (>= 10 GB threshold) ---" -ForegroundColor Yellow
+}
+
+########################################
+# PHASE 7: POST-CLEANUP
+########################################
+
+Get-Service -Name wuauserv | Start-Service -Verbose #Starts Windows Update.
 
 $PostClean = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object -Property DriveType -EQ 3 | Where-Object -Property DeviceID -EQ $Env:SystemDrive | Select-Object -Property @{ Name = 'Drive'; Expression = { ($PSItem.DeviceID) } },
 	@{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($PSItem.Size / 1GB) } },
 	@{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($PSItem.Freespace / 1GB) } },
 	@{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($PSItem.FreeSpace / $PSItem.Size) } }
 
-## Sends some before and after info for ticketing purposes
-#$Wrapup = @(
-	Write-Host "`nBefore Clean-up:`n$(($PreClean | Format-Table | Out-String).Trim())"
-	Write-Host "`nAfter Clean-up:`n$(($PostClean | Format-Table | Out-String).Trim())"
-	Write-Host -ForegroundColor Green "`nFreed up: $($PostClean.'FreeSpace (GB)' - $PreClean.'FreeSpace (GB)') GB ($((($PostClean.PercentFree).Replace('%','')) - (($PreClean.PercentFree).Replace('%',''))) %)"
-	## Completed Successfully!
-	Write-Host ((Get-Date).DateTime)
-	Write-Host $env:COMPUTERNAME
+## Before and after info for ticketing purposes
+Write-Host "`n========================================"
+Write-Host "         CLEANUP COMPLETE"
+Write-Host "========================================" -ForegroundColor Cyan
 
-#)
+Write-Host "`nBefore Clean-up:`n$(($PreClean | Format-Table | Out-String).Trim())"
+Write-Host "`nAfter Clean-up:`n$(($PostClean | Format-Table | Out-String).Trim())"
+Write-Host -ForegroundColor Green "`nFreed up: $($PostClean.'FreeSpace (GB)' - $PreClean.'FreeSpace (GB)') GB ($((($PostClean.PercentFree).Replace('%','')) - (($PreClean.PercentFree).Replace('%',''))) %)"
 
+## Per-step summary
+Write-Host "`n--- Space Freed Per Step ---" -ForegroundColor Cyan
+$Script:StepLog | Where-Object { $_.FreedGB -gt 0 } | Sort-Object FreedGB -Descending | Format-Table -Property @{
+	Name = 'Step'; Expression = { $_.Step }; Width = 45
+}, @{
+	Name = 'Freed (GB)'; Expression = { '{0:N2}' -f $_.FreedGB }; Width = 12
+} | Out-String | Write-Host
 
-# SIG # Begin signature block
-# MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
-# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCtbjZ86dJ8/Q4p
-# QK+2S7IPnoZhdHNtinD5H6SHcGNA1KCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
-# 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
-# EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
-# BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
-# Fw0zMTExMDkyMzU5NTlaMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2Vy
-# dCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lD
-# ZXJ0IFRydXN0ZWQgUm9vdCBHNDCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoC
-# ggIBAL/mkHNo3rvkXUo8MCIwaTPswqclLskhPfKK2FnC4SmnPVirdprNrnsbhA3E
-# MB/zG6Q4FutWxpdtHauyefLKEdLkX9YFPFIPUh/GnhWlfr6fqVcWWVVyr2iTcMKy
-# unWZanMylNEQRBAu34LzB4TmdDttceItDBvuINXJIB1jKS3O7F5OyJP4IWGbNOsF
-# xl7sWxq868nPzaw0QF+xembud8hIqGZXV59UWI4MK7dPpzDZVu7Ke13jrclPXuU1
-# 5zHL2pNe3I6PgNq2kZhAkHnDeMe2scS1ahg4AxCN2NQ3pC4FfYj1gj4QkXCrVYJB
-# MtfbBHMqbpEBfCFM1LyuGwN1XXhm2ToxRJozQL8I11pJpMLmqaBn3aQnvKFPObUR
-# WBf3JFxGj2T3wWmIdph2PVldQnaHiZdpekjw4KISG2aadMreSx7nDmOu5tTvkpI6
-# nj3cAORFJYm2mkQZK37AlLTSYW3rM9nF30sEAMx9HJXDj/chsrIRt7t/8tWMcCxB
-# YKqxYxhElRp2Yn72gLD76GSmM9GJB+G9t+ZDpBi4pncB4Q+UDCEdslQpJYls5Q5S
-# UUd0viastkF13nqsX40/ybzTQRESW+UQUOsxxcpyFiIJ33xMdT9j7CFfxCBRa2+x
-# q4aLT8LWRV+dIPyhHsXAj6KxfgommfXkaS+YHS312amyHeUbAgMBAAGjggE6MIIB
-# NjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBTs1+OC0nFdZEzfLmc/57qYrhwP
-# TzAfBgNVHSMEGDAWgBRF66Kv9JLLgjEtUYunpyGd823IDzAOBgNVHQ8BAf8EBAMC
-# AYYweQYIKwYBBQUHAQEEbTBrMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdp
-# Y2VydC5jb20wQwYIKwYBBQUHMAKGN2h0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNv
-# bS9EaWdpQ2VydEFzc3VyZWRJRFJvb3RDQS5jcnQwRQYDVR0fBD4wPDA6oDigNoY0
-# aHR0cDovL2NybDMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0QXNzdXJlZElEUm9vdENB
-# LmNybDARBgNVHSAECjAIMAYGBFUdIAAwDQYJKoZIhvcNAQEMBQADggEBAHCgv0Nc
-# Vec4X6CjdBs9thbX979XB72arKGHLOyFXqkauyL4hxppVCLtpIh3bb0aFPQTSnov
-# Lbc47/T/gLn4offyct4kvFIDyE7QKt76LVbP+fT3rDB6mouyXtTP0UNEm0Mh65Zy
-# oUi0mcudT6cGAxN3J0TU53/oWajwvy8LpunyNDzs9wPHh6jSTEAZNUZqaVSwuKFW
-# juyk1T3osdz9HNj0d1pcVIxv76FQPfx2CWiEn2/K2yCNNWAcAgPLILCsWKAOQGPF
-# mCLBsln1VWvPJ6tsds5vIy30fnFqI2si/xK4VC0nftg62fC2h5b9W9FcrBjDTZ9z
-# twGpn1eqXijiuZQwggahMIIEiaADAgECAhAHhD2tAcEVwnTuQacoIkZ5MA0GCSqG
-# SIb3DQEBCwUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMx
-# GTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lDZXJ0IFRy
-# dXN0ZWQgUm9vdCBHNDAeFw0yMjA2MjMwMDAwMDBaFw0zMjA2MjIyMzU5NTlaMFox
-# CzAJBgNVBAYTAkxWMRkwFwYDVQQKExBFblZlcnMgR3JvdXAgU0lBMTAwLgYDVQQD
-# EydHb0dldFNTTCBHNCBDUyBSU0E0MDk2IFNIQTI1NiAyMDIyIENBLTEwggIiMA0G
-# CSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCtHvQHskNmiqJndyWVCqX4FtYp5FfJ
-# LO9Sh0BuwXuvBeNYt21xf8h/pLJ/7YzeKcNq9z4zEhecqtD0xhbvSB8ksBAfWBMZ
-# O0NLfOT0j7WyNuD7rv+ZFza+mxIQ79s1dCiwUMwGonaoDK7mqZfDpKEExR6UyKBh
-# 3aatT73U2Imx/x+fYTmQFq+N8FrLs6Fh6YEGWJTgsxyw1fAChCfgtEcZkdtcgK7q
-# uqskHtW6PJ9l5VNJ7T3WXpznsOOxrz3qx0CzWjwK8+3Kv2X6piWvd8YRfAOycSrT
-# 4/PM0cHLFc5xs/4m/ek4FCnYSem43doFftBxZBQkHKoPW3Bt6VIrhVIwvO7hrUjh
-# chJJZYdSld3bANDviJ5/ToP7ENv97U9MtKFvmC5dzd1p4HxFR0p5wWmYQbW+y3RF
-# m0np6H9m57MUMNp0ysmdJjb0f7+dVLX3OEBUb6H+r1LRLZT/xEOTuwOxGg2S4w25
-# KGL9SCBUW4nkBljPHeJToU+THt0P8ZQf4B9IFlGxtLK0g3uOAnwSFgKtmNjhkTl8
-# caLAQwbgEINCqrhc0b6k2Z8+QwgVAL0nIuzM9ckKP8xtIcWg85L3/l0cTkHQde+j
-# KGDG2CdxBHtflLIUtwqD7JA2uCxWlIzRNgwT0kH2en0+QV8KziSGaqO2r06kwboq
-# 2/xy4e98CEfSYwIDAQABo4IBWTCCAVUwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNV
-# HQ4EFgQUyfwQ71DIy2t/vQhE7zpik+1bXpowHwYDVR0jBBgwFoAU7NfjgtJxXWRM
-# 3y5nP+e6mK4cD08wDgYDVR0PAQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMD
-# MHcGCCsGAQUFBwEBBGswaTAkBggrBgEFBQcwAYYYaHR0cDovL29jc3AuZGlnaWNl
-# cnQuY29tMEEGCCsGAQUFBzAChjVodHRwOi8vY2FjZXJ0cy5kaWdpY2VydC5jb20v
-# RGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNydDBDBgNVHR8EPDA6MDigNqA0hjJodHRw
-# Oi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNybDAc
-# BgNVHSAEFTATMAcGBWeBDAEDMAgGBmeBDAEEATANBgkqhkiG9w0BAQsFAAOCAgEA
-# C9sK17IdmKTCUatEs7+yewhJnJ4tyrLwNEnfl6HrG8Pm7HZ0b+5Jc+GGqJT8kRc7
-# mihuVrdsYNHdicueDL9imhtCusI/rUmjwhtflp+XgLkmgLGrmsEho1b+lGiRp7LC
-# /10di8SAOilDkHj5Zx142xRvBrrWj9eOdSGHwYubAsEd6CDojwcaVz9pfXMzYO3k
-# c0O6PXg1TkcgkYlCUAuDHuk/sZx68W0FVj1P2iMh+VUq9lL1puroAydoeWVUh/+c
-# MXeqfgpBqlAW+r8ma5F6yKL0stVQH8vYb1ES0mJSIPyIfkIjC1V0pbZS3p0QWsKa
-# afEor8fLfLNfSxntVI/ugut0+6ekluPWRpEXH+JAiNdRjbLbZchCREe3/Xl0Ylwk
-# A+eQVJfM0A7XiuFtY/mOpK2AN+E25t5mQYFhpdxZX5LTDKWgDnb+A6QnEt4iNyuk
-# cLaJuS8IPgPz0E2ALZLt3Rqs+lXifK/GwnNIWQNbf7FmLDB9ph8i8dvsR1hsjc2K
-# PEW4bAsbvLcz8hN1zE1/QbOV92vDGoFjwZOi2koQ+UyEh0e8jDFHAKJeTI+p8EPE
-# /mqvojLFAnt31yXIA2tjt0ERtsjkhBNmZY6SEOfnIoOwvyqavLPya1Ut3/2cOFLu
-# NQ8Ql6HaZsNQErnnzn+ZEAaUTkPZaeVyoHIkODECLzkwgga0MIIEnKADAgECAhAN
-# x6xXBf8hmS5AQyIMOkmGMA0GCSqGSIb3DQEBCwUAMGIxCzAJBgNVBAYTAlVTMRUw
-# EwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20x
-# ITAfBgNVBAMTGERpZ2lDZXJ0IFRydXN0ZWQgUm9vdCBHNDAeFw0yNTA1MDcwMDAw
-# MDBaFw0zODAxMTQyMzU5NTlaMGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdp
-# Q2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3Rh
-# bXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTEwggIiMA0GCSqGSIb3DQEBAQUA
-# A4ICDwAwggIKAoICAQC0eDHTCphBcr48RsAcrHXbo0ZodLRRF51NrY0NlLWZloMs
-# VO1DahGPNRcybEKq+RuwOnPhof6pvF4uGjwjqNjfEvUi6wuim5bap+0lgloM2zX4
-# kftn5B1IpYzTqpyFQ/4Bt0mAxAHeHYNnQxqXmRinvuNgxVBdJkf77S2uPoCj7GH8
-# BLuxBG5AvftBdsOECS1UkxBvMgEdgkFiDNYiOTx4OtiFcMSkqTtF2hfQz3zQSku2
-# Ws3IfDReb6e3mmdglTcaarps0wjUjsZvkgFkriK9tUKJm/s80FiocSk1VYLZlDwF
-# t+cVFBURJg6zMUjZa/zbCclF83bRVFLeGkuAhHiGPMvSGmhgaTzVyhYn4p0+8y9o
-# HRaQT/aofEnS5xLrfxnGpTXiUOeSLsJygoLPp66bkDX1ZlAeSpQl92QOMeRxykvq
-# 6gbylsXQskBBBnGy3tW/AMOMCZIVNSaz7BX8VtYGqLt9MmeOreGPRdtBx3yGOP+r
-# x3rKWDEJlIqLXvJWnY0v5ydPpOjL6s36czwzsucuoKs7Yk/ehb//Wx+5kMqIMRvU
-# BDx6z1ev+7psNOdgJMoiwOrUG2ZdSoQbU2rMkpLiQ6bGRinZbI4OLu9BMIFm1UUl
-# 9VnePs6BaaeEWvjJSjNm2qA+sdFUeEY0qVjPKOWug/G6X5uAiynM7Bu2ayBjUwID
-# AQABo4IBXTCCAVkwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU729TSunk
-# Bnx6yuKQVvYv1Ensy04wHwYDVR0jBBgwFoAU7NfjgtJxXWRM3y5nP+e6mK4cD08w
-# DgYDVR0PAQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMIMHcGCCsGAQUFBwEB
-# BGswaTAkBggrBgEFBQcwAYYYaHR0cDovL29jc3AuZGlnaWNlcnQuY29tMEEGCCsG
-# AQUFBzAChjVodHRwOi8vY2FjZXJ0cy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVz
-# dGVkUm9vdEc0LmNydDBDBgNVHR8EPDA6MDigNqA0hjJodHRwOi8vY3JsMy5kaWdp
-# Y2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNybDAgBgNVHSAEGTAXMAgG
-# BmeBDAEEAjALBglghkgBhv1sBwEwDQYJKoZIhvcNAQELBQADggIBABfO+xaAHP4H
-# PRF2cTC9vgvItTSmf83Qh8WIGjB/T8ObXAZz8OjuhUxjaaFdleMM0lBryPTQM2qE
-# JPe36zwbSI/mS83afsl3YTj+IQhQE7jU/kXjjytJgnn0hvrV6hqWGd3rLAUt6vJy
-# 9lMDPjTLxLgXf9r5nWMQwr8Myb9rEVKChHyfpzee5kH0F8HABBgr0UdqirZ7bowe
-# 9Vj2AIMD8liyrukZ2iA/wdG2th9y1IsA0QF8dTXqvcnTmpfeQh35k5zOCPmSNq1U
-# H410ANVko43+Cdmu4y81hjajV/gxdEkMx1NKU4uHQcKfZxAvBAKqMVuqte69M9J6
-# A47OvgRaPs+2ykgcGV00TYr2Lr3ty9qIijanrUR3anzEwlvzZiiyfTPjLbnFRsjs
-# Yg39OlV8cipDoq7+qNNjqFzeGxcytL5TTLL4ZaoBdqbhOhZ3ZRDUphPvSRmMThi0
-# vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
-# Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
-# xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
-# RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
-# ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
-# B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
-# CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
-# UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
-# bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
-# UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
-# aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
-# c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
-# EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
-# OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
-# NTlaMHkxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpOZXcgTWV4aWNvMREwDwYDVQQH
-# EwhDb3JyYWxlczEgMB4GA1UEChMXTWF1bGUgVGVjaG5vbG9naWVzLCBMTEMxIDAe
-# BgNVBAMTF01hdWxlIFRlY2hub2xvZ2llcywgTExDMIICIjANBgkqhkiG9w0BAQEF
-# AAOCAg8AMIICCgKCAgEA405RMEf+gTALcHgTvYpBVK47g85sfrdA7AcQMhlEgvnQ
-# D0CKFGJslMouuo6t1kJho1IGE+w+JILQ11wz9TNaGq20eTPuC6dtXaZe8mIHMiOQ
-# /gXQiDgP/b74T0xZzUe8PvK8ZVH+CRxGmgvY3Gwd+UkFe+XlA5WW7FZJljriACEY
-# +FJay6Gk9y16Ghb6J5utjQJEeKXGAsjJp+GDx9LNhMZEW2mKw10warcZmzU6PAk6
-# Bj/huN5h99RrV3s+4IpazdQmjlI5nuvF1BaH4XP6/nMzRVSqGYV7ANekkZTaa5Fu
-# QUppuj2FgM7sIVZkzqEF1uQJrxSK0/loEWtefCAgXil8ZIFWl/PUMnO/ks2uPLoa
-# EgPWeEjNZT8yN9SmgCfNESpb9voJFOw8NMIR6IqWM5UEQYU0A5xnAeBhibtP2BOa
-# 4bH9s8KdGG+DsZpuCPMDv/9LS2YUsnGwNLtzvfnOx81O34OceAMT4Eo5wAfxYGlP
-# Tsl4KHmtP0jaoD9RXI8VQhQvCSA49naI/Zahn1DdVf7ix64792CMqveW/LFY/FYl
-# lLV4F96t8jcvi23bOasqPIPHxO1SDHhO4tGTbS5tq50AYZOLWrb7U899LEn/LfTU
-# XcToPN4RfW/Pg3SB7Q+pI5V2vemteIZuVLBJ9yh70PrChpY0O8T3LzPkwmIReCkC
-# AwEAAaOCAdQwggHQMB8GA1UdIwQYMBaAFMn8EO9QyMtrf70IRO86YpPtW16aMB0G
-# A1UdDgQWBBS4gw5O24Kh4dLnb/qbH2fxlwUijjA+BgNVHSAENzA1MDMGBmeBDAEE
-# ATApMCcGCCsGAQUFBwIBFhtodHRwOi8vd3d3LmRpZ2ljZXJ0LmNvbS9DUFMwDgYD
-# VR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMDMIGXBgNVHR8EgY8wgYww
-# RKBCoECGPmh0dHA6Ly9jcmwzLmRpZ2ljZXJ0LmNvbS9Hb0dldFNTTEc0Q1NSU0E0
-# MDk2U0hBMjU2MjAyMkNBLTEuY3JsMESgQqBAhj5odHRwOi8vY3JsNC5kaWdpY2Vy
-# dC5jb20vR29HZXRTU0xHNENTUlNBNDA5NlNIQTI1NjIwMjJDQS0xLmNybDCBgwYI
-# KwYBBQUHAQEEdzB1MCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5j
-# b20wTQYIKwYBBQUHMAKGQWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9Hb0dl
-# dFNTTEc0Q1NSU0E0MDk2U0hBMjU2MjAyMkNBLTEuY3J0MAkGA1UdEwQCMAAwDQYJ
-# KoZIhvcNAQELBQADggIBAACeH7mDMx2b2AunxE/pho1rcPKjLwGv2WECIUXDOF7M
-# 7P9nPsZNuE1u93ztEFFxc8tkYwIXRoXweQ7tW8BlJoVHxA4Bxi7ZozZPMEUrhUc2
-# SdJAPXBd/k0UIl+Zj1KzpBkWiFV5MyXNv0N0YpBGt36GB2v9yOfUIxDk6y95rs7k
-# 8oQZ/HdELvnoUPhIN+65H01japtITcGO13/cvFcE2lAuSXyy+oT7qRV4QQyp1ykx
-# AGK3uS+lTqCcojTTm1lw2MgtVpA2TzK80P7XBWA62cSu1PtULULTCNibKvHimYSI
-# wcboxm4Lqe6dF8MYkAO0n1zUeI3dxq4DtKc1JsZ7xF9mQevuso299AfuCeD35sRo
-# FVcdx4OxrULLIaelOEv4xap5wjQZLaNEI7N354AQfBucgohvytE2sQ7vcPomaJEM
-# V0+vc0TvZ/qwY2vnWPBqw8Q7SMidZ+7sk6YQ5IiyILphytDVTBz/878UqNofpn5D
-# RHxt6EaBao81BX9EgbAnPKbsFAzVcm/uzt2oBYlrGccG+DQi0/k+6XzylWmQVu3y
-# oAtIOSF7UClzvRae6JsWEUi/4KFNGA9zxQRQD+IEjhv2nSxQQDlKGWzoMqGM+aGR
-# 9nEGH6cXzRujUpFBlKxNupzobg9gjDXSLkP234HOeDCS2WGSU2C1CQvjybdp/rxZ
-# MYIGSjCCBkYCAQEwbjBaMQswCQYDVQQGEwJMVjEZMBcGA1UEChMQRW5WZXJzIEdy
-# b3VwIFNJQTEwMC4GA1UEAxMnR29HZXRTU0wgRzQgQ1MgUlNBNDA5NiBTSEEyNTYg
-# MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
-# CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
-# AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IDrzxLjjskwiyb8LxmFf2Y1cBDxb0m1UI/XhhMXanx2GMA0GCSqGSIb3DQEBAQUA
-# BIICAEqw8hSZK+WBUz0drMt7Ha6l6W9Rkvlx0uiEZZFO3dPURNWU1+yN1qYU4euz
-# XC1XOrjfxZNhny0nQWj70r5Bj6NJfMSOAGvm5uXkJtPZlAzZf60Qzk0IRdJRhSmU
-# wzjp1NTq6xMGbhvBP573ZlI3i9lmI+yb4EH1BZCHSaVSAowSy4O9615OFhGGUreG
-# Xzc6u1O5Ej3srRZNn/S7z+mqPZb8iRgBX66mhPqKk7HO4R68/HBMbdL5yojKJEzL
-# OSb0yuFr6UJQipMWFfqKufex2F8axFfOZQAXp5W0W+E61V3yC80QUBQCCnRdkOPi
-# hzRwJCGTRiQjWlc3YhCFRmGEbNaFbErDBaW62h8fGJSoNxOOrhj3Y+3KIKPOUGJR
-# 1OgHT0uy+Y1Yeit2ht46ym+XXNa9CMe2vWW+6h9k2tYfvEGlBu9Xul32zS/O07r1
-# +vaOt1r6fj80pd1BP1+Qw/4uXxtU5e+pM6ORJKKXDCgSe+aiaJrhGX1DU+kBBLuU
-# M1mR4dD9RpNpfR24MEaThAalcolDwb5e0x5rEIlQ/cu15WybRmevYENAia62zeTF
-# rDUoZ8SmaN9OtR7rb7ntAk4Wt0poTn2Th6PxCOQhWCnSYlZsp6+7eEvnJkSWYqrd
-# sHEPssSlTOVKdXE7pEwEk0TEa45Kfcm0gCKSTgYh7srD6XdToYIDJjCCAyIGCSqG
-# SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
-# Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDMwOTE3MjAxMVowLwYJKoZIhvcNAQkEMSIEIAx6r12o
-# TrYC8UD92DbFKTbBPXSW44A2onaueCJamv8QMA0GCSqGSIb3DQEBAQUABIICABSy
-# wXQtfsMySlISHotOEqE9HsD2M7zrd6GHgNFyZRKInbCaiF7RQ18/sq7rTGNOW6/0
-# fCFUsVSXkYz78UjR+/B2V9edVIZjXqSr90Tnkp2osl0VUK5KAcyihKllWVicVIAW
-# obzwQToB4PhAIbNN8vmlwlSunpBYP3hk8bicpkq+2R9AFBNW59sKHNYtqKN1ftz+
-# Sem2wtx0jJzMpf3KMYOSDKNcU6EhLa+P/zhZcQIOJ8d8DTPhO0kEkXJWzPsMvqhN
-# xcoKa/UNILJlLrNM0un6s2QDXUtEU3GuGbNd/X1iCdJXzEtEOONqahg5sw6vT+ak
-# Nv65t+B3ghLfw5SKJ+Dg5GgiI9uILxBO5bcdpuqJN0dqiuTUM+Obf9PTIAH6VvZH
-# JQZvUSoQc2palqFKDNEydhbWZ/4aWSd2rRN0SbB8E9G7YolzWlt2MizpcF5yoB3f
-# fgp9KNwRY36MYNkBO4SPanuXVhp6KbPH869kHfwY3p5loEQt16OUplQ0BzwHaN18
-# 9Y1EPGRX3Y7I5XubAf15Ll+tUeJL8OJR8W5lxHBEamajM5scgA1ZH8OmDDDQtKDl
-# iIaDaLXpQ2P+tl3NorYANKa8fsZelclqU2zz/QFkoY8FTWpgja/ml2/Ot2uzqJA6
-# t4R1KXSSCEU14IzFDP8Qc+eFuFZrwOGMPwQiVx47
-# SIG # End signature block
+$totalFreed = [math]::Round(($Script:StepLog | Measure-Object -Property FreedGB -Sum).Sum, 2)
+Write-Host "Total freed across all steps: ${totalFreed} GB" -ForegroundColor Green
+
+Write-Host ((Get-Date).DateTime)
+Write-Host $env:COMPUTERNAME

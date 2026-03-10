@@ -106,7 +106,7 @@ Function Invoke-OneDriveDehydration {
 			$dehydratedCount = 0
 			Get-ChildItem -Path $odPath -Force -File -Recurse -ErrorAction SilentlyContinue |
 				ForEach-Object {
-					$null = attrib.exe $_.FullName +U -P 2>&1
+					$null = attrib.exe "$($_.FullName)" +U -P 2>&1
 					$dehydratedCount++
 				}
 			Write-Host "  Processed $dehydratedCount files in $odPath"
@@ -923,7 +923,7 @@ Write-Host -ForegroundColor Green "`nFreed up: ${FreedGB} GB"
 
 ## Per-step summary
 Write-Host "`n--- Space Freed Per Step ---" -ForegroundColor Cyan
-$Script:StepLog | Where-Object { $_.FreedGB -gt 0 } | Sort-Object FreedGB -Descending | Format-Table -Property @{
+$Script:StepLog | Where-Object { $_.FreedGB -ne 0 } | Sort-Object FreedGB -Descending | Format-Table -Property @{
 	Name = 'Step'; Expression = { $_.Step }; Width = 45
 }, @{
 	Name = 'Freed (GB)'; Expression = { '{0:N2}' -f $_.FreedGB }; Width = 12

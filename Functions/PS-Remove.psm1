@@ -521,15 +521,25 @@ Function Remove-PathForcefully {
 		}
 	}
 	If (Test-Path -LiteralPath $Path -Verbose) {
-		$SubFiles = Get-ChildItem -LiteralPath $Path -Recurse -Force -File
-		$SubFolders = Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory
-		If ($SubFiles -or $SubFolders) {
-			$SubFiles | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
-			$SubFolders | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
-			Remove-SubPath -SubPath $Path
+		# Fast path: try to delete everything in one shot
+		try {
+			Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
+			Write-Host -ForegroundColor Green -BackgroundColor Black "Deletion of $Path succeeded."
 		}
-		Else {
-			Remove-SubPath -SubPath $Path
+		catch {
+			# Slow path: some files were locked. Clean up what we can individually.
+			Write-Host "Bulk delete of $Path had locked files. Cleaning up individually..."
+			$SubFiles = Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue
+			$SubFolders = Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue
+			If ($SubFiles -or $SubFolders) {
+				$SubFiles | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
+				# Sort folders deepest-first so children are removed before parents
+				$SubFolders | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { Remove-SubPath -SubPath $_.FullName }
+				Remove-SubPath -SubPath $Path
+			}
+			Else {
+				Remove-SubPath -SubPath $Path
+			}
 		}
 	}
  Else {

@@ -43,7 +43,7 @@ Function Write-StepStatus {
 	if ($freed -gt 0) {
 		Write-Host "--- $StepName freed ${freed} GB (total so far: ${totalFreed} GB free) ---" -ForegroundColor Green
 	} else {
-		Write-Host "--- $StepName: no additional space freed (total so far: ${totalFreed} GB free) ---" -ForegroundColor Yellow
+		Write-Host "--- $StepName : no additional space freed (total so far: ${totalFreed} GB free) ---" -ForegroundColor Yellow
 	}
 	$Script:LastFreeSpace = $currentFree
 }

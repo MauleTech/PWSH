@@ -204,11 +204,139 @@ Wrap `Delete-DeliveryOptimizationCache` with a fallback to manual path deletion 
 
 ---
 
+## Recommendation 4: Block Chrome On-Device AI Model Downloads (NEW)
+
+Chrome silently downloads Gemini Nano (~4 GB per user profile) into `AppData\Local\Google\Chrome\User Data\OptGuideOnDeviceModel\weights.bin`. Deleting the file alone doesn't help — Chrome re-downloads it automatically.
+
+### A. Set machine-wide registry policy to prevent future downloads
+
+Add to the script's pre-requisites phase:
+
+```powershell
+# Block Chrome from downloading the on-device AI model (Gemini Nano, ~4 GB per user)
+New-Item -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "GenAILocalFoundationalModelSettings" -Value 1 -Type DWord
+```
+
+- **Value `0`** (or not set) = Allowed — model downloads automatically
+- **Value `1`** = Disabled — model will not download
+
+This sets the `GenAILocalFoundationalModelSettings` enterprise policy. Users can verify it took effect at `chrome://policy`. This is the officially supported enterprise mechanism from Google.
+
+### B. Delete existing model files during cleanup
+
+Add the following path to `$PathsToDelete` (these are full deletions, not age-based):
+
+```powershell
+(Join-Path -Path $LocalAppData -ChildPath "Google\Chrome\User Data\OptGuideOnDeviceModel")
+```
+
+This targets all user profiles via the `$LocalAppData` wildcard pattern already established in the script.
+
+### C. Placement in execution order
+
+- The **registry policy** should run in **Phase 1 (Pre-requisites)** — it's instant, prevents re-download during the cleanup run itself, and is non-destructive.
+- The **file deletion** belongs in **Phase 2 (Highest Impact)** alongside the browser cache cleanup — at ~4 GB per user profile, this is one of the highest-yield per-user cleanups.
+
+### D. Impact estimate
+
+- **Per user profile:** ~4 GB recovered
+- **Machine with 5 user profiles:** ~20 GB recovered
+- **Risk:** None — the policy is the officially supported Chrome enterprise mechanism. Disabling it only prevents local AI inference; all other Chrome features work normally.
+
+---
+
+## Recommendation 5: Dehydrate OneDrive Files for Inactive Users (NEW)
+
+OneDrive Files On-Demand keeps local copies of cloud files cached on disk. For users who haven't logged in recently, these cached files waste space. We can "dehydrate" them — converting locally-cached files back to cloud-only stubs — using NTFS attributes via `attrib.exe`.
+
+### A. New function: `Invoke-OneDriveDehydration`
+
+```powershell
+Function Invoke-OneDriveDehydration {
+    param(
+        [int]$InactiveDays = 14
+    )
+
+    Write-Host "Checking for OneDrive files to dehydrate for users inactive > $InactiveDays days"
+
+    # Get inactive, unloaded user profiles (exclude system/service accounts)
+    $InactiveProfiles = Get-CimInstance -ClassName Win32_UserProfile |
+        Where-Object { $_.Loaded -eq $false } |
+        Where-Object { $_.LastUseTime -lt (Get-Date).AddDays(-$InactiveDays) } |
+        Where-Object { $_.LocalPath -notmatch 'admin|Remote Support|Default|Public|systemprofile|LocalService|NetworkService' }
+
+    foreach ($profile in $InactiveProfiles) {
+        $userName = Split-Path $profile.LocalPath -Leaf
+
+        # Find OneDrive folders (Business and Personal)
+        $OneDriveFolders = @()
+
+        # OneDrive for Business folders (typically "OneDrive - CompanyName")
+        $bizFolders = Get-ChildItem -Path $profile.LocalPath -Directory -Filter "OneDrive -*" -ErrorAction SilentlyContinue
+        if ($bizFolders) { $OneDriveFolders += $bizFolders.FullName }
+
+        # OneDrive Personal folder
+        $personalPath = Join-Path $profile.LocalPath "OneDrive"
+        if (Test-Path $personalPath) { $OneDriveFolders += $personalPath }
+
+        foreach ($odPath in $OneDriveFolders) {
+            Write-Host "Dehydrating OneDrive files for '$userName': $odPath"
+
+            $dehydratedCount = 0
+            Get-ChildItem -Path $odPath -Force -File -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    # Only dehydrate files that are locally cached (have content on disk)
+                    # Files already online-only have the 'U' attribute and zero local size
+                    $result = attrib.exe $_.FullName +U -P /s 2>&1
+                    $dehydratedCount++
+                }
+
+            Write-Host "  Processed $dehydratedCount files in $odPath"
+        }
+    }
+}
+```
+
+### B. How it works
+
+- **`attrib.exe +U -P`** sets files to "online-only" — removes local file content and leaves a cloud stub
+- **`+U`** = set Unpinned (online-only) attribute
+- **`-P`** = clear Pinned (always available) attribute — this also unpins files the user had manually pinned
+- The `/s` flag applies the change recursively
+- **Non-destructive:** Files remain in OneDrive cloud storage; users simply re-download them on next access
+- Works on profiles that are **not loaded** (user not logged in)
+
+### C. Placement in execution order
+
+This should run in **Phase 3 (Medium Impact)** — after the high-impact system-level deletions but before the lower-impact log/cache cleanup. The space recovered is highly variable depending on how much OneDrive content users have cached locally.
+
+### D. Safety considerations
+
+| Concern | Mitigation |
+|---------|------------|
+| User loses files | No — files remain in OneDrive cloud; only local cache is freed |
+| Pinned files get unpinned | Yes, intentionally — inactive users won't notice; files re-pin on next use |
+| OneDrive sync conflicts | None — dehydration only removes the local copy, doesn't modify cloud state |
+| Profile is loaded/in-use | Filtered out — only targets profiles where `Loaded -eq $false` |
+| System/service accounts | Excluded via `-notmatch` filter |
+| OneDrive not installed/configured | `Get-ChildItem` and `Test-Path` gracefully return nothing; no errors |
+
+### E. Impact estimate
+
+- **Per user profile:** Highly variable — could be hundreds of MB to tens of GB depending on synced content
+- **Best case (heavy OneDrive user, inactive 2+ weeks):** 5-50+ GB recovered per profile
+- **Worst case (user barely uses OneDrive):** Minimal, but no harm done
+
+---
+
 ## Summary of Changes
 
 | Category | Items | Expected Impact |
 |----------|-------|-----------------|
 | New cleanup targets | 10 new paths/operations | Moderate to High |
 | NTFS compression targets | 5 directories | Moderate (non-destructive) |
+| Chrome AI model blocking | Registry policy + file deletion | ~4 GB per user profile |
+| OneDrive dehydration | New function for inactive users | Variable, potentially very high |
 | Reordering by impact | All existing + new items | Script is more effective if interrupted early |
 | Structural improvements | 4 changes | Better maintainability |

@@ -61,10 +61,15 @@ Function Enable-NTFSCompression {
 	}
 }
 
-Function Clear-DeliveryOptimizationCache {
+Function Invoke-DeliveryOptimizationCacheCleanup {
 	try {
-		Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
-		Write-Host "Cleared Delivery Optimization cache via cmdlet."
+		$doCmdlet = Get-Command -Name 'Delete-DeliveryOptimizationCache' -ErrorAction SilentlyContinue
+		if ($doCmdlet) {
+			Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
+			Write-Host "Cleared Delivery Optimization cache via cmdlet."
+		} else {
+			throw "Cmdlet not available"
+		}
 	} catch {
 		$doPath = Join-Path -Path $Env:SystemRoot -ChildPath "SoftwareDistribution\DeliveryOptimization"
 		if (Test-Path $doPath) {
@@ -101,7 +106,7 @@ Function Invoke-OneDriveDehydration {
 			$dehydratedCount = 0
 			Get-ChildItem -Path $odPath -Force -File -Recurse -ErrorAction SilentlyContinue |
 				ForEach-Object {
-					$null = attrib.exe $_.FullName +U -P /s 2>&1
+					$null = attrib.exe $_.FullName +U -P 2>&1
 					$dehydratedCount++
 				}
 			Write-Host "  Processed $dehydratedCount files in $odPath"
@@ -146,7 +151,9 @@ Function Invoke-WindowsCleanMgr {
 		$sameTickCount = 0
 		$WaitInterval = 30
 		$SameTickMax = 8
-		$process = Get-Process cleanmgr -ErrorAction SilentlyContinue
+		# Wait briefly for cleanmgr to start
+		Start-Sleep -Seconds 5
+		$process = Get-Process cleanmgr -ErrorAction SilentlyContinue | Select-Object -First 1
 
 		if ($null -eq $process) {
 			Write-Host "cleanmgr.exe is not running."
@@ -156,7 +163,7 @@ Function Invoke-WindowsCleanMgr {
 		while ($true) {
 			Start-Sleep -Seconds $WaitInterval
 
-			$process = Get-Process cleanmgr -ErrorAction SilentlyContinue
+			$process = Get-Process cleanmgr -ErrorAction SilentlyContinue | Select-Object -First 1
 			if ($null -eq $process) {
 				Write-Host "cleanmgr.exe has exited."
 				return $false
@@ -254,19 +261,17 @@ Function Remove-StaleProfiles {
 				Write-Host "$($mostRecentDir.FullName) was most recently updated $([int]$ageInDays.TotalDays) days ago."
 				If ($ageInDays.TotalDays -gt 360) {
 					Write-Host "Deleting $localPath (Last modified: $($mostRecentDir.LastWriteTime))"
-					Write-Host "Deleting inactive profile: $($profile.LocalPath)"
-					Write-Host "$profile"
-					Remove-CimInstance $profile -Verbose -Confirm:$false
+					Write-Host "Deleting inactive profile: $($profile.LocalPath) (SID: $($profile.SID))"
 					$targetSID = $profile.SID
-
-					# Construct the registry path for the user profile
-					$registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ProfileList\$targetSID"
-
-					# Delete the registry key
-					Remove-Item -Path $registryPath -Force
-					Write-Host "User profile with SID $targetSID has been deleted from the registry."
-					# Delete the Users Path
-					Remove-PathForcefully -Path $Profile.LocalPath
+					$targetPath = $profile.LocalPath
+					# Remove-CimInstance on Win32_UserProfile handles registry + files
+					Remove-CimInstance $profile -Verbose -Confirm:$false
+					Write-Host "Profile $targetSID removed via WMI."
+					# Fallback: force-remove leftover files if WMI didn't fully clean up
+					if (Test-Path $targetPath) {
+						Remove-PathForcefully -Path $targetPath
+						Write-Host "Cleaned up leftover files at $targetPath"
+					}
 				}
 			}
 		}
@@ -300,7 +305,7 @@ $LocalAppData = $Env:LOCALAPPDATA.Replace($Env:USERPROFILE, ($Env:Public).Replac
 $RootAppData = "$(Split-Path -Path $LocalAppData)\*"
 
 # Pre-requisite commands
-Write-Host "Reclaim space from .NET Native Images" ; Get-Item "$Env:windir\Microsoft.NET\Framework\*\ngen.exe" -Force | ForEach-Object { & $($_.FullName) update } | Out-Null
+Write-Host "Reclaim space from .NET Native Images" ; Get-Item "$Env:windir\Microsoft.NET\Framework\*\ngen.exe","$Env:windir\Microsoft.NET\Framework64\*\ngen.exe" -Force -ErrorAction SilentlyContinue | ForEach-Object { & $($_.FullName) update } | Out-Null
 Get-Service -Name wuauserv | Stop-Service -Force -Verbose #Stops Windows Update so we can clean it out.
 $EdgePackageName = Get-AppxPackage -Name Microsoft.MicrosoftEdge | Select-Object -ExpandProperty PackageFamilyName
 
@@ -369,7 +374,6 @@ Write-StepStatus -StepName "Remove stale user profiles"
 Write-StepStatus -StepName "Empty Recycle Bin" -Start
 Write-Host "Emptying Recycle Bin" ; Clear-RecycleBin -Force
 Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-Get-ChildItem -Path 'C:\$Recycle.Bin' -Recurse -Force | Remove-PathForcefully -ErrorAction SilentlyContinue
 Write-StepStatus -StepName "Empty Recycle Bin"
 
 # --- Delete MEMORY.dmp (can be full RAM size) ---
@@ -398,7 +402,7 @@ Write-StepStatus -StepName "Clean Windows Update downloads"
 
 # --- Delivery Optimization Cache (1-5 GB) ---
 Write-StepStatus -StepName "Delivery Optimization Cache" -Start
-Clear-DeliveryOptimizationCache
+Invoke-DeliveryOptimizationCacheCleanup
 Write-StepStatus -StepName "Delivery Optimization Cache"
 
 # --- Chrome AI model files (~4 GB per user) ---
@@ -825,7 +829,6 @@ $MiscPaths = @(
 	(Join-Path -Path $Env:SystemDrive -ChildPath "File*.chk")
 	(Join-Path -Path $Env:SystemDrive -ChildPath "Found.*\*.chk")
 	(Join-Path -Path $Env:SystemDrive -ChildPath "*.tmp")
-	(Join-Path -Path $Env:SystemDrive -ChildPath "hiberfil.sys")
 	(Join-Path -Path $Env:ProgramData -ChildPath "Microsoft\Windows\RetailDemo")
 	(Join-Path -Path $LocalAppData -ChildPath "IsolatedStorage\")
 	(Join-Path -Path $Env:HOMEDRIVE -ChildPath "inetpub\logs\LogFiles")
@@ -914,7 +917,9 @@ Write-Host "========================================" -ForegroundColor Cyan
 
 Write-Host "`nBefore Clean-up:`n$(($PreClean | Format-Table | Out-String).Trim())"
 Write-Host "`nAfter Clean-up:`n$(($PostClean | Format-Table | Out-String).Trim())"
-Write-Host -ForegroundColor Green "`nFreed up: $($PostClean.'FreeSpace (GB)' - $PreClean.'FreeSpace (GB)') GB ($((($PostClean.PercentFree).Replace('%','')) - (($PreClean.PercentFree).Replace('%',''))) %)"
+$PostFreeGB = Get-FreeSpaceGB
+$FreedGB = [math]::Round($PostFreeGB - $Script:InitialFreeSpace, 2)
+Write-Host -ForegroundColor Green "`nFreed up: ${FreedGB} GB"
 
 ## Per-step summary
 Write-Host "`n--- Space Freed Per Step ---" -ForegroundColor Cyan

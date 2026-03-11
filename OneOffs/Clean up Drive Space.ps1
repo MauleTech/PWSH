@@ -149,8 +149,11 @@ Function Invoke-WindowsCleanMgr {
 	function Wait-CleanMgr {
 		# cleanmgr spawns a child worker process then the parent exits,
 		# so we wait for the worker to appear, then wait for all instances to finish.
+		# If the process lingers (e.g. a completion dialog), we fall back to
+		# CPU inactivity detection to know when the real work is done.
 		$TimeoutMinutes = 30
 		$PollInterval = 10
+		$IdleMaxSeconds = 120
 		$Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 
 		# Wait for cleanmgr to spawn (up to 30 seconds)
@@ -160,21 +163,46 @@ Function Invoke-WindowsCleanMgr {
 			$spawnWait += 2
 		}
 
-		if (-not (Get-Process cleanmgr -ErrorAction SilentlyContinue)) {
+		$process = Get-Process cleanmgr -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -eq $process) {
 			Write-Host "cleanmgr.exe did not start."
 			return
 		}
 
 		Write-Host "cleanmgr.exe is running. Waiting for it to finish (timeout: $TimeoutMinutes minutes)..."
-		while (Get-Process cleanmgr -ErrorAction SilentlyContinue) {
+		$prevTicks = -1
+		$idleSeconds = 0
+
+		while ($true) {
+			Start-Sleep -Seconds $PollInterval
+
+			$process = Get-Process cleanmgr -ErrorAction SilentlyContinue | Select-Object -First 1
+			if ($null -eq $process) {
+				Write-Host "cleanmgr.exe has exited."
+				return
+			}
+
 			if ((Get-Date) -gt $Deadline) {
 				Write-Host "cleanmgr.exe timed out after $TimeoutMinutes minutes. Terminating."
 				Stop-Process -Name cleanmgr -Force -ErrorAction SilentlyContinue
 				return
 			}
-			Start-Sleep -Seconds $PollInterval
+
+			# Detect if cleanmgr is lingering after finishing work
+			$currentTicks = $process.TotalProcessorTime.Ticks
+			if ($prevTicks -ge 0 -and $currentTicks -eq $prevTicks) {
+				$idleSeconds += $PollInterval
+				Write-Host "cleanmgr CPU idle for ${idleSeconds}s / ${IdleMaxSeconds}s"
+				if ($idleSeconds -ge $IdleMaxSeconds) {
+					Write-Host "cleanmgr.exe appears idle (no CPU usage for ${IdleMaxSeconds}s). Terminating lingering process."
+					Stop-Process -Name cleanmgr -Force -ErrorAction SilentlyContinue
+					return
+				}
+			} else {
+				$idleSeconds = 0
+			}
+			$prevTicks = $currentTicks
 		}
-		Write-Host "cleanmgr.exe has finished."
 	}
 
 	Write-Host "Starting cleanmgr.exe /verylowdisk..."

@@ -1309,17 +1309,35 @@ Function Update-WindowsTo11 {
 				Write-Log "wdscore.dll: sources=$srcVer, System32=$dstVer"
 
 				if ($srcVer -ne $dstVer) {
-					# Backup the existing System32 copy so we can restore it if setup fails
-					if (Test-Path $WdsDst) {
-						$script:WdscoreBackupPath = "$env:SystemRoot\System32\wdscore.dll.win10bak"
-						Copy-Item $WdsDst $script:WdscoreBackupPath -Force -ErrorAction SilentlyContinue
+					try {
+						# Backup the existing System32 copy so we can restore it if setup fails
+						if (Test-Path $WdsDst) {
+							$script:WdscoreBackupPath = "$env:SystemRoot\System32\wdscore.dll.win10bak"
+							Copy-Item $WdsDst $script:WdscoreBackupPath -Force -ErrorAction SilentlyContinue
+						}
+						# Replace with Win11 version -- requires taking ownership of the system file
+						& takeown /f $WdsDst 2>&1 | Out-Null
+						& icacls $WdsDst /grant "administrators:F" 2>&1 | Out-Null
+						try {
+							Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
+						} catch {
+							# File is likely locked by another process -- try to kill it and retry
+							Write-Log "Copy failed (file likely locked): $($_.Exception.Message) -- attempting to release lock" -Level "WARNING"
+							$lockers = Get-Process | Where-Object {
+								try { $_.Modules.FileName -contains $WdsDst } catch { $false }
+							}
+							foreach ($proc in $lockers) {
+								Write-Log "Stopping process holding wdscore.dll: $($proc.Name) (PID $($proc.Id))" -Level "WARNING"
+								Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+							}
+							if ($lockers) { Start-Sleep -Seconds 1 }
+							Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
+						}
+						$script:WdscoreSeeded = $true
+						Write-Log "Win11 wdscore.dll ($srcVer) seeded into System32" -Level "SUCCESS"
+					} catch {
+						Write-Log "Failed to seed wdscore.dll into System32: $($_.Exception.Message). Continuing without DLL replacement -- setup may still succeed." -Level "WARNING"
 					}
-					# Replace with Win11 version -- requires taking ownership of the system file
-					& takeown /f $WdsDst 2>&1 | Out-Null
-					& icacls $WdsDst /grant "administrators:F" 2>&1 | Out-Null
-					Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
-					$script:WdscoreSeeded = $true
-					Write-Log "Win11 wdscore.dll ($srcVer) seeded into System32" -Level "SUCCESS"
 				} else {
 					Write-Log "wdscore.dll already matches ISO version -- no seeding needed"
 				}

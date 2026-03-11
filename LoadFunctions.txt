@@ -155,14 +155,25 @@ function Install-MinGit {
         # finally block ensures it is always removed, even on failure
         [void](New-Item -ItemType Directory -Path $TempPath -Force)
         try {
-            $FilePath = "$TempPath\$($releaseInfo.FileName)"
+            $FilePath    = "$TempPath\$($releaseInfo.FileName)"
+            $primaryUrl  = $releaseInfo.DownloadUrl
+            $fallbackUrl = "https://files.mauletech.com/files/Utilities/MinGit-2.53.0.2-64-bit.zip?dl"
+
             Write-Host "Downloading MinGit $LatestVersion from:" -ForegroundColor Green
-            Write-Host "  $($releaseInfo.DownloadUrl)" -ForegroundColor Yellow
+            Write-Host "  $primaryUrl" -ForegroundColor Yellow
 
             $savedProgressPreference = $ProgressPreference
             try {
                 $ProgressPreference = 'SilentlyContinue'
-                Invoke-WebRequest -Uri $releaseInfo.DownloadUrl -OutFile $FilePath -UseBasicParsing
+                try {
+                    Invoke-WebRequest -Uri $primaryUrl -OutFile $FilePath -UseBasicParsing
+                }
+                catch {
+                    Write-Host "Primary download failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-Host "Trying fallback URL..." -ForegroundColor Yellow
+                    Write-Host "  $fallbackUrl" -ForegroundColor Yellow
+                    Invoke-WebRequest -Uri $fallbackUrl -OutFile $FilePath -UseBasicParsing
+                }
             }
             finally {
                 $ProgressPreference = $savedProgressPreference

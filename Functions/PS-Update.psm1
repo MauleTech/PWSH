@@ -1167,7 +1167,8 @@ Function Update-WindowsTo11 {
 		[int]0x80070005 = @{ Message = "Access denied -- insufficient privileges";                   Retryable = $false }
 		[int]0x80070070 = @{ Message = "Not enough disk space";                                      Retryable = $false }
 		[int]0x80070002 = @{ Message = "File not found";                                             Retryable = $false }
-		[int]0x8007007F = @{ Message = "ERROR_PROC_NOT_FOUND -- DLL version mismatch (wdscore.dll)"; Retryable = $true  }
+		[int]0x8007007F = @{ Message = "ERROR_PROC_NOT_FOUND -- DLL version mismatch (wdscore.dll / wimgapi.dll)"; Retryable = $true  }
+		[int]0xC06D007F = @{ Message = "Delay-load DLL failure (ERROR_PROC_NOT_FOUND) -- wimgapi.dll version mismatch"; Retryable = $true  }
 		[int]0x80070490 = @{ Message = "Element not found";                                          Retryable = $false }
 		[int]0x800704DD = @{ Message = "User cancelled the operation";                               Retryable = $false }
 		[int]0xC1900101 = @{ Message = "SAFE_OS phase error -- driver or hardware issue";            Retryable = $false }
@@ -1376,6 +1377,87 @@ Function Update-WindowsTo11 {
 				}
 			} else {
 				Write-Log "wdscore.dll not found at $WdsSrc -- seeding skipped" -Level "WARNING"
+			}
+
+			# Fix: copy wimgapi.dll from the sources directory into System32.
+			# SetupPlatform.dll delay-loads WIMExtractImagePathByWimHandle from wimgapi.dll.
+			# If the System32 copy is too old (Win10 RTM-era) the procedure isn't exported,
+			# causing 0xC06D007F and a fatal SetupHost.exe crash.
+			$script:WimgapiSeeded     = $false
+			$script:WimgapiBackupPath = $null
+			$WimSrc = Join-Path $SourcesDir "wimgapi.dll"
+			$WimDst = "$env:SystemRoot\System32\wimgapi.dll"
+
+			if (Test-Path $WimSrc) {
+				$wimSrcVer = (Get-Item $WimSrc).VersionInfo.FileVersion
+				$wimDstVer = (Get-Item $WimDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				Write-Log "wimgapi.dll: sources=$wimSrcVer, System32=$wimDstVer"
+
+				if ($wimSrcVer -ne $wimDstVer) {
+					try {
+						# Backup the existing System32 copy so we can restore it if setup fails
+						if (Test-Path $WimDst) {
+							$script:WimgapiBackupPath = "$env:SystemRoot\System32\wimgapi.dll.win10bak"
+							Copy-Item $WimDst $script:WimgapiBackupPath -Force -ErrorAction SilentlyContinue
+						}
+						# Replace with Win11 version -- requires taking ownership of the system file
+						& takeown /f $WimDst 2>&1 | Out-Null
+						& icacls $WimDst /grant "administrators:F" 2>&1 | Out-Null
+						try {
+							Copy-Item $WimSrc $WimDst -Force -ErrorAction Stop
+						} catch {
+							# File is likely locked by another process -- try to release and retry
+							Write-Log "Copy failed (file likely locked): $($_.Exception.Message) -- attempting to release lock" -Level "WARNING"
+
+							$WimDstNorm = [System.IO.Path]::GetFullPath($WimDst)
+							$lockers = Get-Process | Where-Object {
+								try {
+									$_.Modules -and ($_.Modules | Where-Object {
+										[System.IO.Path]::GetFullPath($_.FileName) -eq $WimDstNorm
+									})
+								} catch { $false }
+							}
+
+							$stoppedServices = @()
+							foreach ($proc in $lockers) {
+								# Prefer stopping the owning service over killing the process
+								$svc = Get-CimInstance Win32_Service -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue |
+									Where-Object { $_.State -eq 'Running' }
+								if ($svc) {
+									foreach ($s in $svc) {
+										Write-Log "Stopping service '$($s.Name)' (PID $($proc.Id)) to release wimgapi.dll" -Level "WARNING"
+										Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue
+										$stoppedServices += $s.Name
+									}
+								} else {
+									Write-Log "Stopping process $($proc.Name) (PID $($proc.Id)) to release wimgapi.dll" -Level "WARNING"
+									Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+								}
+							}
+
+							if (-not $lockers) {
+								Write-Log "No process found with wimgapi.dll loaded as a module -- lock may be held by a file handle (AV, indexer, etc.)" -Level "WARNING"
+							}
+
+							# Always wait before retry -- gives time for AV / indexer / transient locks to clear
+							Start-Sleep -Seconds 2
+							Copy-Item $WimSrc $WimDst -Force -ErrorAction Stop
+
+							# Restart any services we stopped
+							foreach ($svcName in $stoppedServices) {
+								Start-Service -Name $svcName -ErrorAction SilentlyContinue
+							}
+						}
+						$script:WimgapiSeeded = $true
+						Write-Log "Win11 wimgapi.dll ($wimSrcVer) seeded into System32" -Level "SUCCESS"
+					} catch {
+						Write-Log "Failed to seed wimgapi.dll into System32: $($_.Exception.Message). Continuing without DLL replacement -- setup may still succeed." -Level "WARNING"
+					}
+				} else {
+					Write-Log "wimgapi.dll already matches ISO version -- no seeding needed"
+				}
+			} else {
+				Write-Log "wimgapi.dll not found at $WimSrc -- seeding skipped" -Level "WARNING"
 			}
 
 			# Build setup arguments -- /auto Upgrade handles decisions non-interactively.

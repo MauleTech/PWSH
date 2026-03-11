@@ -1300,7 +1300,7 @@ Function Update-WindowsTo11 {
 			$SourcesDir = Join-Path (Split-Path $SetupPath -Parent) "sources"
 			$WdsSrc     = Join-Path $SourcesDir "wdscore.dll"
 			$SetupDir   = Split-Path $SetupPath -Parent
-			$LocalDir   = Join-Path $SetupDir "setup.exe.local"
+			$LocalDir   = Join-Path $SetupDir "setup.exe"
 			if (Test-Path $WdsSrc) {
 				$srcVer = (Get-Item $WdsSrc).VersionInfo.FileVersion
 				$dstVer = (Get-Item "$env:SystemRoot\System32\wdscore.dll" -ErrorAction SilentlyContinue).VersionInfo.FileVersion

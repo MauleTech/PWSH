@@ -1321,17 +1321,50 @@ Function Update-WindowsTo11 {
 						try {
 							Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
 						} catch {
-							# File is likely locked by another process -- try to kill it and retry
+							# File is likely locked by another process -- try to release and retry
 							Write-Log "Copy failed (file likely locked): $($_.Exception.Message) -- attempting to release lock" -Level "WARNING"
+
+							# Stop any Windows services that have wdscore.dll loaded. Stopping
+							# the service (rather than killing the host process) avoids tearing
+							# down unrelated services that share the same svchost instance.
+							$WdsDstNorm = [System.IO.Path]::GetFullPath($WdsDst)
 							$lockers = Get-Process | Where-Object {
-								try { $_.Modules.FileName -contains $WdsDst } catch { $false }
+								try {
+									$_.Modules -and ($_.Modules | Where-Object {
+										[System.IO.Path]::GetFullPath($_.FileName) -eq $WdsDstNorm
+									})
+								} catch { $false }
 							}
+
+							$stoppedServices = @()
 							foreach ($proc in $lockers) {
-								Write-Log "Stopping process holding wdscore.dll: $($proc.Name) (PID $($proc.Id))" -Level "WARNING"
-								Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+								# Prefer stopping the owning service over killing the process
+								$svc = Get-CimInstance Win32_Service -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue |
+									Where-Object { $_.State -eq 'Running' }
+								if ($svc) {
+									foreach ($s in $svc) {
+										Write-Log "Stopping service '$($s.Name)' (PID $($proc.Id)) to release wdscore.dll" -Level "WARNING"
+										Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue
+										$stoppedServices += $s.Name
+									}
+								} else {
+									Write-Log "Stopping process $($proc.Name) (PID $($proc.Id)) to release wdscore.dll" -Level "WARNING"
+									Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+								}
 							}
-							if ($lockers) { Start-Sleep -Seconds 1 }
+
+							if (-not $lockers) {
+								Write-Log "No process found with wdscore.dll loaded as a module -- lock may be held by a file handle (AV, indexer, etc.)" -Level "WARNING"
+							}
+
+							# Always wait before retry -- gives time for AV / indexer / transient locks to clear
+							Start-Sleep -Seconds 2
 							Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
+
+							# Restart any services we stopped
+							foreach ($svcName in $stoppedServices) {
+								Start-Service -Name $svcName -ErrorAction SilentlyContinue
+							}
 						}
 						$script:WdscoreSeeded = $true
 						Write-Log "Win11 wdscore.dll ($srcVer) seeded into System32" -Level "SUCCESS"

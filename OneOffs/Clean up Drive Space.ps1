@@ -146,66 +146,44 @@ Function Invoke-WindowsCleanMgr {
 	ForEach ($VC in $VolCaches) { New-ItemProperty -Path "$($VC.PSPath)" -Name $StateFlags -Value 1 -Type DWORD -Force | Out-Null }
 	ForEach ($Location in $Locations) { Set-ItemProperty -Path $($Base + $Location) -Name $SageSet -Type DWORD -Value 2 | Out-Null }
 	$CleanMgrArgs = "/sagerun:$([string]([int]$SageSet.Substring($SageSet.Length - 4)))"
-	function Watch-CleanMgr {
-		$prevTicks = 0
-		$sameTickCount = 0
-		$WaitInterval = 30
-		$SameTickMax = 8
-		# Wait briefly for cleanmgr to start
-		Start-Sleep -Seconds 5
-		$process = Get-Process cleanmgr -ErrorAction SilentlyContinue | Select-Object -First 1
+	function Wait-CleanMgr {
+		# cleanmgr spawns a child worker process then the parent exits,
+		# so we wait for the worker to appear, then wait for all instances to finish.
+		$TimeoutMinutes = 30
+		$PollInterval = 10
+		$Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 
-		if ($null -eq $process) {
-			Write-Host "cleanmgr.exe is not running."
-			return $false
+		# Wait for cleanmgr to spawn (up to 30 seconds)
+		$spawnWait = 0
+		while (-not (Get-Process cleanmgr -ErrorAction SilentlyContinue) -and $spawnWait -lt 30) {
+			Start-Sleep -Seconds 2
+			$spawnWait += 2
 		}
 
-		while ($true) {
-			Start-Sleep -Seconds $WaitInterval
-
-			$process = Get-Process cleanmgr -ErrorAction SilentlyContinue | Select-Object -First 1
-			if ($null -eq $process) {
-				Write-Host "cleanmgr.exe has exited."
-				return $false
-			}
-			$currentTicks = $process.TotalProcessorTime.Ticks
-			Write-Host "Checking on cleanmgr CPU usage: $currentTicks"
-			if ($currentTicks -eq $prevTicks) {
-				$sameTickCount++
-				Write-Host "Cleanmgr hasn't used the CPU in the last $WaitInterval seconds. If it does this $($SameTickMax - $sameTickCount) more times, we'll move on."
-				if ($sameTickCount -eq $SameTickMax) { #CPU count hasn't changed for 4 minutes (30 seconds * 8)
-					Write-Host "cleanmgr.exe appears to be inactive. Terminating process."
-					Stop-Process -Name cleanmgr -Force
-					return $true
-				}
-			} else {
-				$sameTickCount = 0
-			}
-
-			$prevTicks = $currentTicks
+		if (-not (Get-Process cleanmgr -ErrorAction SilentlyContinue)) {
+			Write-Host "cleanmgr.exe did not start."
+			return
 		}
+
+		Write-Host "cleanmgr.exe is running. Waiting for it to finish (timeout: $TimeoutMinutes minutes)..."
+		while (Get-Process cleanmgr -ErrorAction SilentlyContinue) {
+			if ((Get-Date) -gt $Deadline) {
+				Write-Host "cleanmgr.exe timed out after $TimeoutMinutes minutes. Terminating."
+				Stop-Process -Name cleanmgr -Force -ErrorAction SilentlyContinue
+				return
+			}
+			Start-Sleep -Seconds $PollInterval
+		}
+		Write-Host "cleanmgr.exe has finished."
 	}
-	Write-Host "Starting cleanmgr.exe /verylowdisk for a first attempt."
+
+	Write-Host "Starting cleanmgr.exe /verylowdisk..."
 	Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList "/verylowdisk /d c" -WindowStyle Hidden
-	$terminated = Watch-CleanMgr
+	Wait-CleanMgr
 
-	# Second attempt if the first one was terminated
-	if ($terminated) {
-		Write-Host "Restarting cleanmgr.exe for a second attempt."
-		Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList "/verylowdisk /d c" -WindowStyle Hidden
-		Watch-CleanMgr
-	}
-
-	Write-Host "Starting cleanmgr.exe $CleanMgrArgs for a first attempt."
+	Write-Host "Starting cleanmgr.exe $CleanMgrArgs..."
 	Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList $CleanMgrArgs -WindowStyle Hidden
-	$terminated = Watch-CleanMgr
-
-	# Second attempt if the first one was terminated
-	if ($terminated) {
-		Write-Host "Restarting cleanmgr.exe $CleanMgrArgs for a second attempt."
-		Start-Process "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList $CleanMgrArgs -WindowStyle Hidden
-		Watch-CleanMgr
-	}
+	Wait-CleanMgr
 }
 
 Function Remove-WindowsRestorePoints {

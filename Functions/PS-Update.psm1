@@ -1116,11 +1116,8 @@ Function Update-WindowsTo11 {
 	then attempts the upgrade from a network share first, falling back to ISO download.
 	Bypasses hardware requirement checks via registry for unsupported machines.
 
-	.PARAMETER AutoReboot
-	Reboot automatically when the upgrade requires it (currently reserved for future use).
-
 	.PARAMETER LogPath
-	Path for transcript logging. Defaults to ProgramData with timestamped filename.
+	Path for structured log file. Defaults to $ITFolder\Logs with timestamped filename.
 
 	.PARAMETER Force
 	Force the upgrade even if the system appears to already be running Windows 11 25H2+.
@@ -1129,7 +1126,7 @@ Function Update-WindowsTo11 {
 	Only download the Windows 11 ISO without installing. Saved to $ITFolder\Downloads.
 
 	.PARAMETER ShowProgress
-	Run setup.exe with visible progress UI instead of quiet mode.
+	Run setup.exe with visible progress UI instead of quiet mode (/quiet flag omitted).
 
 	.PARAMETER DownloadUrl
 	A manually-provided direct download URL for the Windows 11 ISO. When specified,
@@ -1146,8 +1143,7 @@ Function Update-WindowsTo11 {
 
 	[CmdletBinding()]
 	param(
-		[switch]$AutoReboot,
-		[string]$LogPath = "$env:ProgramData\Win11-Upgrade-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
+		[string]$LogPath,
 		[switch]$Force,
 		[switch]$DownloadOnly,
 		[switch]$ShowProgress,
@@ -1160,6 +1156,24 @@ Function Update-WindowsTo11 {
 	)
 
 	#region Helpers
+	# Known setup.exe exit codes and whether they are retryable
+	$SetupExitCodes = @{
+		[int]0x00000000 = @{ Message = "Success";                                                    Retryable = $false }
+		[int]0xC1900210 = @{ Message = "No compatibility issues found";                              Retryable = $false }
+		[int]0xC1900208 = @{ Message = "Compatibility issues found (actionable)";                    Retryable = $false }
+		[int]0xC1900204 = @{ Message = "Migration choice not available";                             Retryable = $false }
+		[int]0xC1900200 = @{ Message = "Machine does not meet minimum requirements";                 Retryable = $false }
+		[int]0xC190020E = @{ Message = "Machine does not meet minimum requirements (disk space)";    Retryable = $false }
+		[int]0x80070005 = @{ Message = "Access denied -- insufficient privileges";                   Retryable = $false }
+		[int]0x80070070 = @{ Message = "Not enough disk space";                                      Retryable = $false }
+		[int]0x80070002 = @{ Message = "File not found";                                             Retryable = $false }
+		[int]0x8007007F = @{ Message = "ERROR_PROC_NOT_FOUND -- DLL version mismatch (wdscore.dll)"; Retryable = $true  }
+		[int]0x80070490 = @{ Message = "Element not found";                                          Retryable = $false }
+		[int]0x800704DD = @{ Message = "User cancelled the operation";                               Retryable = $false }
+		[int]0xC1900101 = @{ Message = "SAFE_OS phase error -- driver or hardware issue";            Retryable = $false }
+		[int]0xC1420127 = @{ Message = "Disk space error during installation";                       Retryable = $false }
+	}
+
 	function Write-Log {
 		param(
 			[Parameter(Mandatory)]
@@ -1178,29 +1192,67 @@ Function Update-WindowsTo11 {
 		}
 	}
 
+	function Get-SetupExitInfo {
+		param([int]$ExitCode)
+		# Convert to unsigned for lookup (PowerShell treats large hex as negative int)
+		$UnsignedCode = [uint32]("0x{0:X8}" -f $ExitCode)
+		$info = $SetupExitCodes[[int]$UnsignedCode]
+		if ($info) { return $info }
+		# Unknown code -- assume not retryable
+		return @{ Message = "Unknown exit code: 0x$("{0:X8}" -f $UnsignedCode)"; Retryable = $false }
+	}
+
 	function Start-Win11Setup {
+		<#
+		.DESCRIPTION
+		Runs setup.exe with registry bypasses and returns a result object
+		with .Success (bool) and .BitLockerSuspended (bool).
+		#>
 		param(
 			[Parameter(Mandatory)]
 			[string]$SetupPath,
 			[switch]$ShowProgress
 		)
 
+		$Result = [PSCustomObject]@{
+			Success            = $false
+			BitLockerSuspended = $false
+		}
+
 		Write-Log "Attempting Windows 11 setup with path: $SetupPath"
 
 		if (-not (Test-Path $SetupPath)) {
 			Write-Log "setup.exe not found at $SetupPath" -Level "ERROR"
-			return $false
+			return $Result
 		}
 
 		# Verify Authenticode signature before execution
 		$sig = Get-AuthenticodeSignature -FilePath $SetupPath -ErrorAction SilentlyContinue
-		if (-not $sig -or $sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+		if (-not $sig -or $sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
 			Write-Log "setup.exe Authenticode signature validation failed (Status: $($sig.Status)). Aborting." -Level "ERROR"
-			return $false
+			return $Result
 		}
 		Write-Log "Authenticode signature verified: $($sig.SignerCertificate.Subject)"
 
 		try {
+			# FIX: Remove stale C:\$WINDOWS.~BT before running setup.
+			# A prior failed upgrade leaves behind old DLLs (e.g. SetupCore.dll from a different
+			# build) that setup.exe re-uses on the next run, causing CAutomationManager to load
+			# a mismatched DLL and fail with 0x8007007F (ERROR_PROC_NOT_FOUND).
+			$BtPath = 'C:\$WINDOWS.~BT'
+			if (Test-Path -LiteralPath $BtPath) {
+				Write-Log "Removing stale $BtPath to prevent DLL version conflicts..." -Level "WARNING"
+				& takeown /f $BtPath /a /r /d y 2>&1 | Out-Null
+				& icacls $BtPath /grant "administrators:F" /t /q 2>&1 | Out-Null
+				& icacls $BtPath /grant "SYSTEM:F" /t /q 2>&1 | Out-Null
+				Remove-Item -LiteralPath $BtPath -Recurse -Force -ErrorAction SilentlyContinue
+				if (Test-Path -LiteralPath $BtPath) {
+					Write-Log "$BtPath could not be fully removed (locked files may remain). Setup may reuse stale DLLs." -Level "WARNING"
+				} else {
+					Write-Log "Stale upgrade cache cleared" -Level "SUCCESS"
+				}
+			}
+
 			# Suspend BitLocker if active
 			Write-Log "Checking BitLocker status..."
 			$BitLockerVolume = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
@@ -1208,7 +1260,7 @@ Function Update-WindowsTo11 {
 				Write-Log "BitLocker active -- suspending for 5 reboots..." -Level "WARNING"
 				try {
 					Suspend-BitLocker -MountPoint "C:" -RebootCount 5 -ErrorAction Stop | Out-Null
-					$script:BitLockerWasSuspended = $true
+					$Result.BitLockerSuspended = $true
 					Write-Log "BitLocker suspended successfully" -Level "SUCCESS"
 				} catch {
 					Write-Log "Failed to suspend BitLocker: $($_.Exception.Message). Manual intervention may be needed." -Level "WARNING"
@@ -1242,7 +1294,31 @@ Function Update-WindowsTo11 {
 
 			Write-Log "Hardware bypass registry keys applied" -Level "SUCCESS"
 
-			# Build setup arguments
+			# FIX: Pre-seed wdscore.dll via DLL redirection instead of replacing the System32 copy.
+			# Uses a .local redirection directory next to setup.exe so the Windows loader picks up
+			# the Win11 version without modifying system files. This is safe even on power loss.
+			$SourcesDir = Join-Path (Split-Path $SetupPath -Parent) "sources"
+			$WdsSrc     = Join-Path $SourcesDir "wdscore.dll"
+			$SetupDir   = Split-Path $SetupPath -Parent
+			$LocalDir   = Join-Path $SetupDir "setup.exe.local"
+			if (Test-Path $WdsSrc) {
+				$srcVer = (Get-Item $WdsSrc).VersionInfo.FileVersion
+				$dstVer = (Get-Item "$env:SystemRoot\System32\wdscore.dll" -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				Write-Log "wdscore.dll: sources=$srcVer, System32=$dstVer"
+				if ($srcVer -ne $dstVer) {
+					if (-not (Test-Path $LocalDir)) {
+						New-Item -Path $LocalDir -ItemType Directory -Force | Out-Null
+					}
+					Copy-Item $WdsSrc (Join-Path $LocalDir "wdscore.dll") -Force -ErrorAction Stop
+					Write-Log "Win11 wdscore.dll ($srcVer) staged via .local redirection" -Level "SUCCESS"
+				} else {
+					Write-Log "wdscore.dll already matches ISO version -- no redirection needed"
+				}
+			} else {
+				Write-Log "wdscore.dll not found at $WdsSrc -- redirection skipped" -Level "WARNING"
+			}
+
+			# Build setup arguments -- /auto Upgrade handles decisions non-interactively.
 			$SetupArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
 			if (-not $ShowProgress) {
 				$SetupArgs.Add("/quiet") | Out-Null
@@ -1262,17 +1338,55 @@ Function Update-WindowsTo11 {
 			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
 
 			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $SetupArgs -Wait -PassThru
+			$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
 
 			if ($SetupProcess.ExitCode -eq 0) {
 				Write-Log "Setup completed successfully" -Level "SUCCESS"
-				return $true
-			} else {
-				Write-Log "Setup exited with code: $($SetupProcess.ExitCode)" -Level "WARNING"
-				return $false
+				$Result.Success = $true
+				return $Result
 			}
+
+			Write-Log "Setup exited with code 0x$("{0:X8}" -f ([uint32]$SetupProcess.ExitCode)): $($ExitInfo.Message)" -Level "WARNING"
+
+			# Only retry with minimal arguments if the exit code is retryable
+			if (-not $ExitInfo.Retryable) {
+				Write-Log "Exit code is terminal -- skipping fallback retry." -Level "ERROR"
+				return $Result
+			}
+
+			# FIX: Retry with minimal validated argument set.
+			# Some builds reject unrecognized switches like /product, /Telemetry, /MigrateDrivers.
+			Write-Log "Retrying with minimal arguments..." -Level "WARNING"
+			$FallbackArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
+			if (-not $ShowProgress) {
+				$FallbackArgs.Add("/quiet") | Out-Null
+			}
+			$FallbackArgs.AddRange(@(
+				"/DynamicUpdate", "Disable",
+				"/ShowOOBE", "None",
+				"/Compat", "IgnoreWarning",
+				"/copylogs", "C:\IT",
+				"/EULA", "Accept"
+			))
+			Write-Log "Fallback setup arguments: $($FallbackArgs -join ' ')"
+			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $FallbackArgs -Wait -PassThru
+			$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
+
+			if ($SetupProcess.ExitCode -eq 0) {
+				Write-Log "Setup completed successfully (fallback arguments)" -Level "SUCCESS"
+				$Result.Success = $true
+			} else {
+				Write-Log "Setup failed with code 0x$("{0:X8}" -f ([uint32]$SetupProcess.ExitCode)): $($ExitInfo.Message)" -Level "ERROR"
+			}
+			return $Result
 		} catch {
 			Write-Log "Setup execution failed: $($_.Exception.Message)" -Level "ERROR"
-			return $false
+			return $Result
+		} finally {
+			# Clean up .local redirection directory if created
+			if ($LocalDir -and (Test-Path $LocalDir)) {
+				Remove-Item $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
+			}
 		}
 	}
 	#endregion
@@ -1288,19 +1402,18 @@ Function Update-WindowsTo11 {
 		return
 	}
 
-	# Start transcript
-	try { Start-Transcript -Path $LogPath -Force | Out-Null } catch {}
-
 	# Set up log file for structured logging
 	$LogFolder = Join-Path $ITFolder "Logs"
 	if (-not (Test-Path $LogFolder)) {
 		New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
 	}
-	$script:LogFile = Join-Path $LogFolder "Win11Setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+	if (-not $LogPath) {
+		$LogPath = Join-Path $LogFolder "Win11Setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+	}
+	$script:LogFile = $LogPath
 
 	Write-Log "Starting Update-WindowsTo11"
 	Write-Log "Log file: $($script:LogFile)"
-	Write-Log "Transcript: $LogPath"
 	#endregion
 
 	#region Version Check
@@ -1310,7 +1423,6 @@ Function Update-WindowsTo11 {
 
 	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 26100) {
 		Write-Log "Already running Windows 11 24H2+ (Build $buildNumber) -- no upgrade needed." -Level "SUCCESS"
-		try { Stop-Transcript | Out-Null } catch {}
 		return
 	}
 
@@ -1417,11 +1529,11 @@ Function Update-WindowsTo11 {
 
 	#region Main Upgrade Logic
 	$SetupSuccessful = $false
+	$BitLockerWasSuspended = $false
 	$IsoPath = $null
 	$TempFidoScript = $null
 	$ExistingISO = $null
 	$MountedIsoPath = $null
-	$script:BitLockerWasSuspended = $false
 
 	try {
 		# --- Attempt 1: Network share (skipped when -DownloadUrl is provided) ---
@@ -1438,7 +1550,9 @@ Function Update-WindowsTo11 {
 
 			if ($NetworkSetupPath -and -not $DownloadOnly) {
 				Write-Log "Using network installation" -Level "SUCCESS"
-				$SetupSuccessful = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
+				$SetupResult = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
+				$SetupSuccessful = $SetupResult.Success
+				if ($SetupResult.BitLockerSuspended) { $BitLockerWasSuspended = $true }
 			}
 		}
 
@@ -1539,7 +1653,13 @@ Function Update-WindowsTo11 {
 				Write-Log "Mounting ISO..."
 				$MountResult = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
 				$MountedIsoPath = $IsoPath
+				# Brief delay to allow volume registration after mount
+				Start-Sleep -Seconds 3
 				$DriveLetter = ($MountResult | Get-Volume).DriveLetter
+				# Fallback query in case piped Get-Volume returns null
+				if (-not $DriveLetter) {
+					$DriveLetter = (Get-DiskImage -ImagePath $IsoPath | Get-Volume).DriveLetter
+				}
 
 				if (-not $DriveLetter) {
 					throw "Failed to get drive letter for mounted ISO"
@@ -1548,7 +1668,9 @@ Function Update-WindowsTo11 {
 				Write-Log "ISO mounted to ${DriveLetter}:" -Level "SUCCESS"
 				$SetupPath = "${DriveLetter}:\setup.exe"
 
-				$SetupSuccessful = Start-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress
+				$SetupResult = Start-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress
+				$SetupSuccessful = $SetupResult.Success
+				if ($SetupResult.BitLockerSuspended) { $BitLockerWasSuspended = $true }
 
 				Write-Log "Dismounting ISO..."
 				try {
@@ -1572,7 +1694,7 @@ Function Update-WindowsTo11 {
 		}
 
 		# Restore BitLocker if it was suspended and the upgrade failed
-		if ($script:BitLockerWasSuspended -and -not $SetupSuccessful) {
+		if ($BitLockerWasSuspended -and -not $SetupSuccessful) {
 			try {
 				Resume-BitLocker -MountPoint "C:" -ErrorAction Stop
 				Write-Log "BitLocker re-enabled after failed upgrade" -Level "SUCCESS"
@@ -1610,8 +1732,6 @@ Function Update-WindowsTo11 {
 			Write-Log "Windows 11 upgrade process failed or completed with warnings." -Level "ERROR"
 			Write-Log "Check setup logs in C:\IT and log file: $($script:LogFile)"
 		}
-
-		try { Stop-Transcript | Out-Null } catch {}
 	}
 	#endregion
 }

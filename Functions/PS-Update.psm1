@@ -1294,28 +1294,37 @@ Function Update-WindowsTo11 {
 
 			Write-Log "Hardware bypass registry keys applied" -Level "SUCCESS"
 
-			# FIX: Pre-seed wdscore.dll via DLL redirection instead of replacing the System32 copy.
-			# Uses a .local redirection directory next to setup.exe so the Windows loader picks up
-			# the Win11 version without modifying system files. This is safe even on power loss.
+# Fix: copy wdscore.dll from the sources directory (sibling to setup.exe) into
+			# System32 so that CAutomationManager finds the correct Win11 version at init time.
+			# Uses Split-Path -Parent so this works for both mounted ISOs and UNC network paths.
+			$script:WdscoreSeeded     = $false
+			$script:WdscoreBackupPath = $null
 			$SourcesDir = Join-Path (Split-Path $SetupPath -Parent) "sources"
 			$WdsSrc     = Join-Path $SourcesDir "wdscore.dll"
-			$SetupDir   = Split-Path $SetupPath -Parent
-			$LocalDir   = Join-Path $SetupDir "setup.exe"
+			$WdsDst     = "$env:SystemRoot\System32\wdscore.dll"
+
 			if (Test-Path $WdsSrc) {
 				$srcVer = (Get-Item $WdsSrc).VersionInfo.FileVersion
-				$dstVer = (Get-Item "$env:SystemRoot\System32\wdscore.dll" -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				$dstVer = (Get-Item $WdsDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
 				Write-Log "wdscore.dll: sources=$srcVer, System32=$dstVer"
+
 				if ($srcVer -ne $dstVer) {
-					if (-not (Test-Path $LocalDir)) {
-						New-Item -Path $LocalDir -ItemType Directory -Force | Out-Null
+					# Backup the existing System32 copy so we can restore it if setup fails
+					if (Test-Path $WdsDst) {
+						$script:WdscoreBackupPath = "$env:SystemRoot\System32\wdscore.dll.win10bak"
+						Copy-Item $WdsDst $script:WdscoreBackupPath -Force -ErrorAction SilentlyContinue
 					}
-					Copy-Item $WdsSrc (Join-Path $LocalDir "wdscore.dll") -Force -ErrorAction Stop
-					Write-Log "Win11 wdscore.dll ($srcVer) staged via .local redirection" -Level "SUCCESS"
+					# Replace with Win11 version -- requires taking ownership of the system file
+					& takeown /f $WdsDst 2>&1 | Out-Null
+					& icacls $WdsDst /grant "administrators:F" 2>&1 | Out-Null
+					Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
+					$script:WdscoreSeeded = $true
+					Write-Log "Win11 wdscore.dll ($srcVer) seeded into System32" -Level "SUCCESS"
 				} else {
-					Write-Log "wdscore.dll already matches ISO version -- no redirection needed"
+					Write-Log "wdscore.dll already matches ISO version -- no seeding needed"
 				}
 			} else {
-				Write-Log "wdscore.dll not found at $WdsSrc -- redirection skipped" -Level "WARNING"
+				Write-Log "wdscore.dll not found at $WdsSrc -- seeding skipped" -Level "WARNING"
 			}
 
 			# Build setup arguments -- /auto Upgrade handles decisions non-interactively.
@@ -1957,3 +1966,4 @@ Function Update-WindowTitle ([String] $PassNumber) {
 # kJotCwNyVd0QatabtAYKSqca1WwT74+aVdjFp5POHzXC7OLI8Y5frmhxulcUalNP
 # 2mOr4s84h5Ee7Nxc1oYp2zLgJTatTtLE0Gb8+AKY
 # SIG # End signature block
+

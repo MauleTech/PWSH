@@ -516,16 +516,23 @@ Function Install-ScreenConnect {
 		Installs the ScreenConnect Remote Support Software
 	.Description
 		Installs ScreenConnect Remote Support Software from MauleTech BinCache
+	.Parameter Force
+		Reinstalls ScreenConnect even if the service is already present.
 	.Notes
 		Downloads and installs the ScreenConnect client from:
 		https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi
 	#>
 	###Require -RunAsAdministrator
 	[cmdletbinding()]
-	param()
-	
+	param(
+		[switch]$Force
+	)
+
 	# Check if ScreenConnect is already installed by looking for the service
-	If (-not (Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue)) {
+	If ($Force -or -not (Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue)) {
+		If ($Force -and (Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue)) {
+			Write-Host "Force flag specified. Reinstalling ScreenConnect." -ForegroundColor Yellow
+		}
 		Write-Host "Installing ScreenConnect Remote Support Software." -ForegroundColor Green
 		
 		# Direct URL to the ScreenConnect MSI

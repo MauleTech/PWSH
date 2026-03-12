@@ -517,45 +517,51 @@ Function Install-ScreenConnect {
 	.Description
 		Installs ScreenConnect Remote Support Software from MauleTech BinCache
 	.Parameter Force
-		Reinstalls ScreenConnect even if the service is already present.
-	.Notes
+		Installs ScreenConnect even if the service is already present.
+	.NOTES
 		Downloads and installs the ScreenConnect client from:
 		https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi
 	#>
-	###Require -RunAsAdministrator
 	[cmdletbinding()]
 	param(
 		[switch]$Force
 	)
 
+	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+
 	# Check if ScreenConnect is already installed by looking for the service
-	If ($Force -or -not (Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue)) {
-		If ($Force -and (Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue)) {
-			Write-Host "Force flag specified. Reinstalling ScreenConnect." -ForegroundColor Yellow
+	$ExistingService = Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue
+	If ($Force -or -not $ExistingService) {
+		If ($Force -and $ExistingService) {
+			Write-Host "Force flag specified. Installing ScreenConnect." -ForegroundColor Yellow
 		}
 		Write-Host "Installing ScreenConnect Remote Support Software." -ForegroundColor Green
-		
+
 		# Direct URL to the ScreenConnect MSI
 		$InstallURL = 'https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi'
 		$InstallHash = '4FB543702793D708227598B1FBA36443DB5B60607818C60B1791C2E286E4B64E'
 
-		# Download the installer using Get-FileDownload from MauleTech/PWSH
-		$ScreenConnectInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder "$ITFolder\ScreenConnect" -Checksum $InstallHash
-		$msiPath = $ScreenConnectInstaller[1]
-		
-		# Install the MSI silently
-		Write-Host "Installing ScreenConnect from: $msiPath" -ForegroundColor Cyan
-		$arguments = "/i `"$msiPath`" /quiet /norestart"
-		$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
-		
-		# Check installation result
-		if ($process.ExitCode -eq 0) {
-			Write-Output "Installation of ScreenConnect completed successfully."
-		} else {
-			Write-Output "Installation failed with exit code: $($process.ExitCode)"
+		Try {
+			# Download the installer using Get-FileDownload from MauleTech/PWSH
+			$ScreenConnectInstaller = Get-FileDownload -URL $InstallURL -SaveToFolder "$ITFolder\ScreenConnect" -Checksum $InstallHash
+			$msiPath = $ScreenConnectInstaller[1]
+
+			# Install the MSI silently
+			Write-Host "Installing ScreenConnect from: $msiPath" -ForegroundColor Cyan
+			$arguments = "/i `"$msiPath`" /quiet /norestart"
+			$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+
+			# Check installation result
+			if ($process.ExitCode -eq 0) {
+				Write-Host "Installation of ScreenConnect completed successfully." -ForegroundColor Green
+			} else {
+				Write-Host "Installation failed with exit code: $($process.ExitCode)" -ForegroundColor Red
+			}
+		} Catch {
+			Write-Host "Error during ScreenConnect installation: $_" -ForegroundColor Red
 		}
 	} Else {
-		Write-Output "ScreenConnect service is already installed."
+		Write-Host "ScreenConnect service is already installed." -ForegroundColor Green
 	}
 }
 

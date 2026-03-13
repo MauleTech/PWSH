@@ -61,17 +61,15 @@ function Get-MinGitLatestInfo {
         }
 
         # Extract tag from URL: .../releases/tag/v2.47.1.windows.2
-        if ($location -notmatch '/tag/(v\d+\.\d+\.\d+\.windows\.\d+)$') {
+        if ($location -notmatch '/tag/(v(\d+\.\d+\.\d+)\.windows\.(\d+))$') {
             throw "Unexpected tag format in redirect URL: $location"
         }
-        $tag = $Matches[1]   # e.g. v2.47.1.windows.2
+        $tag        = $Matches[1]   # e.g. v2.47.1.windows.2
+        $baseVer    = $Matches[2]   # e.g. 2.47.1
+        $winRelease = [int]$Matches[3]   # e.g. 2
 
-        # Strip 'v' prefix and '.windows.N' suffix for the zip filename
-        $zipVersion = $tag -replace '^v' -replace '\.windows\.\d+$'   # e.g. 2.47.1
-
-        if ($zipVersion -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Could not parse a valid version from tag: $tag"
-        }
+        # Git for Windows naming convention: .windows.1 → "2.47.1", .windows.N (N>1) → "2.47.1.N"
+        $zipVersion = if ($winRelease -gt 1) { "$baseVer.$winRelease" } else { $baseVer }
 
         return @{
             Tag         = $tag

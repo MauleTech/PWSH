@@ -66,6 +66,324 @@ Function Repair-Windows {
 	Write-Host "Run this function repeately until no errors show up. If this fails after 3 tries, upgrade or reinstall windows"
 }
 
+Function Repair-DomainTrust {
+<#
+	.SYNOPSIS
+		Attempts to repair a broken domain trust relationship without unjoining/rejoining.
+	.DESCRIPTION
+		Runs through a progressive series of fixes for the "no computer account for this
+		workstation trust relationship" error. Starts with the least invasive fixes and
+		works down the list. Reboot-required fixes are saved for last.
+		Assumes all MauleTech PWSH functions are already loaded via:
+			irm ps.mauletech.com | iex
+	.EXAMPLE
+		Repair-DomainTrust
+#>
+	[CmdletBinding()]
+	Param()
+
+	# Require elevation -- most operations need local admin
+	$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+		[Security.Principal.WindowsBuiltInRole]::Administrator)
+	If (-not $isAdmin) {
+		Write-Host "    [XX] This function must be run as Administrator." -ForegroundColor Red
+		Return
+	}
+
+	$localComputer = $env:COMPUTERNAME
+
+	#region Helpers
+	Function Test-DomainConnectivity {
+		Try {
+			$result = Test-ComputerSecureChannel -ErrorAction Stop
+			Return $result
+		} Catch {
+			Return $false
+		}
+	}
+
+	Function Write-Step {
+		Param([string]$Message)
+		Write-Host "`n[*] $Message" -ForegroundColor Cyan
+	}
+
+	Function Write-Pass {
+		Param([string]$Message)
+		Write-Host "    [OK] $Message" -ForegroundColor Green
+	}
+
+	Function Write-Fail {
+		Param([string]$Message)
+		Write-Host "    [!!] $Message" -ForegroundColor Yellow
+	}
+
+	Function Write-Fatal {
+		Param([string]$Message)
+		Write-Host "    [XX] $Message" -ForegroundColor Red
+	}
+	#endregion
+
+	#region Step 0 - Fix system time first (Kerberos is time-sensitive)
+	Write-Step "Step 0: Syncing system time via Update-NTPDateTime..."
+	Try {
+		Update-NTPDateTime
+		Write-Pass "Time sync complete."
+	} Catch {
+		Write-Fail "Update-NTPDateTime failed: $_"
+		Write-Verbose "Falling back to w32tm resync..."
+		$null = w32tm /resync /force 2>&1
+		If ($LASTEXITCODE -eq 0) {
+			Write-Pass "w32tm resync succeeded as fallback."
+		} Else {
+			Write-Fail "w32tm fallback also failed (exit code $LASTEXITCODE). Continuing anyway."
+		}
+	}
+	#endregion
+
+	#region Step 1 - Test if time sync alone fixed it
+	Write-Step "Step 1: Testing domain connectivity after time sync..."
+	If (Test-DomainConnectivity) {
+		Write-Pass "Domain trust is healthy after time sync. No further action needed."
+		Return
+	}
+	Write-Fail "Still broken. Continuing..."
+	#endregion
+
+	#region Step 2 - Gather environment info
+	Write-Step "Step 2: Detecting domain and available domain controllers..."
+	$detectedDomain = $null
+	Try {
+		$detectedDomain = (Get-CimInstance Win32_ComputerSystem).Domain
+		Write-Pass "Machine reports domain: $detectedDomain"
+	} Catch {
+		Write-Fatal "Could not detect domain from Win32_ComputerSystem: $_"
+	}
+
+	If (-not $detectedDomain -or $detectedDomain -eq 'WORKGROUP') {
+		Write-Fatal "Machine does not appear to be domain-joined (reports: $detectedDomain). Cannot continue."
+		Return
+	}
+
+	# Validate domain name format to prevent injection into native commands
+	If ($detectedDomain -notmatch '^[a-zA-Z0-9._-]+$') {
+		Write-Fatal "Detected domain name contains unexpected characters: $detectedDomain. Aborting."
+		Return
+	}
+
+	# Discover DCs
+	$dcs = @()
+	Try {
+		$dcs = @([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().DomainControllers |
+			Select-Object -ExpandProperty Name)
+		Write-Pass "Found $($dcs.Count) domain controller(s): $($dcs -join ', ')"
+	} Catch {
+		Write-Fail "Could not enumerate DCs via DirectoryServices. Trying nltest..."
+		$nltestOut = nltest /dclist:$detectedDomain 2>&1
+		If ($LASTEXITCODE -eq 0) {
+			$dcs = @($nltestOut | Where-Object { $_ -match '\\\\' } |
+				ForEach-Object { ($_ -split '\\\\')[1].Trim().Split()[0] } |
+				Where-Object { $_ -and $_ -match '^\w' })
+			Write-Pass "nltest found DC(s): $($dcs -join ', ')"
+		} Else {
+			Write-Fatal "Could not enumerate DCs via nltest either (exit code $LASTEXITCODE)."
+		}
+	}
+
+	$targetDC = $dcs | Select-Object -First 1
+	If (-not $targetDC) {
+		Write-Fatal "No domain controllers found. Cannot proceed."
+		Return
+	}
+	#endregion
+
+	#region Step 3 - Prompt for domain admin credentials
+	Write-Step "Step 3: Prompting for domain admin credentials..."
+	$cred = $null
+	Try {
+		$cred = Get-Credential -Message "Enter Domain Admin credentials for $detectedDomain"
+		If (-not $cred) { Throw "No credentials provided." }
+		Write-Pass "Credentials captured for: $($cred.UserName)"
+	} Catch {
+		Write-Fatal "Credential prompt failed or was cancelled: $_"
+		Return
+	}
+	#endregion
+
+	#region Step 4 - Try Test-ComputerSecureChannel -Repair (no reboot)
+	Write-Step "Step 4: Attempting Test-ComputerSecureChannel -Repair..."
+	Try {
+		$repaired = Test-ComputerSecureChannel -Repair -Credential $cred -ErrorAction Stop
+		If ($repaired) {
+			Write-Pass "Secure channel repaired successfully."
+			If (Test-DomainConnectivity) {
+				Write-Pass "Domain trust verified. Done! (No reboot needed)"
+				Return
+			} Else {
+				Write-Fail "Repair reported success but trust test still failing. Continuing..."
+			}
+		} Else {
+			Write-Fail "Test-ComputerSecureChannel -Repair returned false."
+		}
+	} Catch {
+		Write-Fail "Test-ComputerSecureChannel -Repair threw an error: $_"
+	}
+	#endregion
+
+	#region Step 5 - Reset-ComputerMachinePassword (no reboot)
+	If ($targetDC) {
+		Write-Step "Step 5: Attempting Reset-ComputerMachinePassword against $targetDC..."
+		Try {
+			Reset-ComputerMachinePassword -Server $targetDC -Credential $cred -ErrorAction Stop
+			Write-Pass "Machine password reset complete."
+			If (Test-DomainConnectivity) {
+				Write-Pass "Domain trust verified. Done! (No reboot needed)"
+				Return
+			} Else {
+				Write-Fail "Password reset done but trust test still failing. Continuing..."
+			}
+		} Catch {
+			Write-Fail "Reset-ComputerMachinePassword failed: $_"
+		}
+	}
+	#endregion
+
+	#region Step 6 - Remote into DC: check & toggle computer account (no reboot)
+	If ($targetDC) {
+		Write-Step "Step 6: Remoting into DC ($targetDC) to check computer account in AD..."
+		$dcSession = $null
+		Try {
+			$dcSession = New-PSSession -ComputerName $targetDC -Credential $cred -ErrorAction Stop
+			Write-Pass "PSSession to $targetDC established."
+
+			$acctStatus = Invoke-Command -Session $dcSession -ScriptBlock {
+				Param($cn)
+				Import-Module ActiveDirectory -ErrorAction Stop
+				$acct = Get-ADComputer $cn -Properties Enabled, PasswordLastSet, LockedOut -ErrorAction Stop
+				[pscustomobject]@{
+					Enabled           = $acct.Enabled
+					PasswordLastSet   = $acct.PasswordLastSet
+					LockedOut         = $acct.LockedOut
+					DistinguishedName = $acct.DistinguishedName
+				}
+			} -ArgumentList $localComputer
+
+			Write-Verbose "AD account status: Enabled=$($acctStatus.Enabled) | PasswordLastSet=$($acctStatus.PasswordLastSet) | LockedOut=$($acctStatus.LockedOut)"
+
+			# If account is disabled, enable it
+			If (-not $acctStatus.Enabled) {
+				Write-Fail "Computer account is DISABLED. Re-enabling..."
+				Invoke-Command -Session $dcSession -ScriptBlock {
+					Param($cn)
+					Enable-ADAccount -Identity $cn
+				} -ArgumentList $localComputer
+				Write-Pass "Computer account re-enabled."
+			}
+
+			# If account is locked, unlock it
+			If ($acctStatus.LockedOut) {
+				Write-Fail "Computer account is LOCKED OUT. Unlocking..."
+				Invoke-Command -Session $dcSession -ScriptBlock {
+					Param($cn)
+					Unlock-ADAccount -Identity $cn
+				} -ArgumentList $localComputer
+				Write-Pass "Computer account unlocked."
+			}
+
+			# Only cycle the account if trust is still broken after fixing state
+			If (-not (Test-DomainConnectivity)) {
+				Write-Step "Step 6b: Cycling AD computer account disable/enable to reset trust..."
+				Invoke-Command -Session $dcSession -ScriptBlock {
+					Param($cn)
+					Set-ADComputer -Identity $cn -Enabled $false
+					Start-Sleep -Seconds 2
+					Set-ADComputer -Identity $cn -Enabled $true
+				} -ArgumentList $localComputer
+				Write-Pass "Account disable/enable cycle complete."
+			}
+		} Catch {
+			Write-Fail "Remote DC operations failed: $_"
+		} Finally {
+			If ($dcSession) { Remove-PSSession $dcSession -ErrorAction SilentlyContinue }
+		}
+
+		# Give replication a moment then test
+		Start-Sleep -Seconds 3
+		If (Test-DomainConnectivity) {
+			Write-Pass "Domain trust verified after AD account operations. Done! (No reboot needed)"
+			Return
+		} Else {
+			Write-Fail "AD account operations complete but trust still failing. Continuing..."
+		}
+	} Else {
+		Write-Fail "No DC available for remote operations. Skipping Step 6."
+	}
+	#endregion
+
+	#region Step 7 - nltest /sc_reset (no reboot, more aggressive channel reset)
+	Write-Step "Step 7: Attempting nltest /sc_reset to force secure channel reset..."
+	$nltestResult = nltest /sc_reset:$detectedDomain 2>&1
+	Write-Verbose "nltest sc_reset completed with exit code: $LASTEXITCODE"
+	If ($nltestResult -match 'NERR_Success') {
+		Write-Pass "nltest sc_reset succeeded."
+	} Else {
+		Write-Fail "nltest sc_reset output did not indicate clear success: $nltestResult"
+	}
+	If (Test-DomainConnectivity) {
+		Write-Pass "Domain trust verified after nltest sc_reset. Done! (No reboot needed)"
+		Return
+	} Else {
+		Write-Fail "Still failing after nltest sc_reset. Continuing to reboot-required fixes..."
+	}
+	#endregion
+
+	#region Step 8 - Reboot-required: netdom resetpwd
+	Write-Host "`n--- Non-reboot fixes exhausted. Trying reboot-required fixes. ---" -ForegroundColor Magenta
+	Write-Step "Step 8: Running netdom resetpwd to reset machine password (requires reboot)..."
+	If ($targetDC) {
+		$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($cred.Password)
+		Try {
+			$plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+			$netdomResult = netdom resetpwd /server:$targetDC /userd:$($cred.UserName) /passwordd:$plain 2>&1
+			Write-Verbose "netdom resetpwd completed with exit code: $LASTEXITCODE"
+			If ($LASTEXITCODE -eq 0) {
+				Write-Pass "netdom resetpwd completed. A reboot will be required."
+			} Else {
+				Write-Fail "netdom resetpwd returned exit code $LASTEXITCODE."
+			}
+		} Catch {
+			Write-Fail "netdom resetpwd failed: $_"
+		} Finally {
+			[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+			Remove-Variable plain -ErrorAction SilentlyContinue
+		}
+	} Else {
+		Write-Fail "No DC available for netdom resetpwd. Skipping."
+	}
+	#endregion
+
+	# Clean up credentials
+	Remove-Variable cred -ErrorAction SilentlyContinue
+
+	#region Final summary
+	Write-Host "`n========================================" -ForegroundColor White
+	Write-Host " Repair-DomainTrust: All steps complete." -ForegroundColor White
+	Write-Host "========================================" -ForegroundColor White
+	If (Test-DomainConnectivity) {
+		Write-Pass "Domain trust is NOW HEALTHY. You may or may not need a reboot depending on which step resolved it."
+	} Else {
+		Write-Fatal "Domain trust could NOT be automatically repaired."
+		Write-Host @"
+
+Next manual steps to try:
+  1. Reboot the machine (if netdom resetpwd ran, this may resolve it)
+  2. If still broken after reboot, manually unjoin and rejoin the domain
+  3. Verify DNS is pointing at a DC (ipconfig /all, nslookup $detectedDomain)
+  4. Verify no duplicate computer accounts exist in AD for $localComputer
+"@ -ForegroundColor Yellow
+	}
+	#endregion
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

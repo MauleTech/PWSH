@@ -669,7 +669,7 @@ $FoldersToDeDuplicate | ForEach-Object {
 				Try {
 					Get-Item $SubItem -Force | ForEach-Object {
 						Write-Host "Searching $($_.FullName) for duplicate files"
-						Remove-DuplicateFiles -Path $_.FullName
+						Remove-DuplicateFiles -Path $_.FullName -Confirm:$false
 						Write-Host
 					}
 				} Catch {

@@ -163,26 +163,135 @@ function Remove-ClaudeCode {
 }
 
 Function Remove-DuplicateFiles {
+	<#
+	.SYNOPSIS
+		Finds and removes duplicate files in a specified folder.
+	.DESCRIPTION
+		Scans a folder for files with identical content (by hash). Keeps the file
+		with the shortest path and marks the rest for removal. By default, displays
+		a list of duplicates with a summary of how many files and how much space
+		would be freed, then prompts for confirmation before deleting.
+	.PARAMETER Path
+		The folder to scan for duplicates. Defaults to the current directory.
+	.PARAMETER Recurse
+		Scan subdirectories as well, deduplicating within each directory.
+	.EXAMPLE
+		Remove-DuplicateFiles -Path "C:\Users\John\Downloads"
+		# Lists duplicates, shows summary, prompts before deleting.
+	.EXAMPLE
+		Remove-DuplicateFiles -Path "C:\Data" -Recurse
+		# Scans all subdirectories under C:\Data.
+	.EXAMPLE
+		Remove-DuplicateFiles -Path "C:\Temp" -Confirm:$false
+		# Deletes duplicates immediately without prompting.
+	#>
+	[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 	param (
 		[string]$Path = $PWD.Path,
-		[switch]$Recurse = $False
+		[switch]$Recurse = $false
 	)
 	If (-not(Get-Command "Remove-PathForcefully" -ErrorAction SilentlyContinue)) { irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex }
-	Function Remove-DuplicateFilesInt {
-		$DuplicateFiles = @((Get-ChildItem -Path $Path -Force | Get-FileHash -ErrorAction SilentlyContinue | Group-Object -property hash | Where-Object { $_.count -gt 1 } | ForEach-Object { $_.group | Sort-Object { $_.Path.Length } | Select-Object -Skip 1 }).Path)
-		If ($DuplicateFiles) {
-			ForEach ($File in $DuplicateFiles) { Remove-PathForcefully -Path $file }
+
+	Function Remove-DuplicateFilesInFolder {
+		param (
+			[parameter(Mandatory = $true)]
+			[string]$FolderPath,
+			[System.Management.Automation.PSCmdlet]$Cmdlet
+		)
+
+		$Hashes = Get-ChildItem -Path $FolderPath -File -Force -ErrorAction SilentlyContinue |
+			Get-FileHash -ErrorAction SilentlyContinue
+		$DuplicateGroups = $Hashes |
+			Group-Object -Property Hash |
+			Where-Object { $_.Count -gt 1 }
+
+		If (-not $DuplicateGroups) {
+			Write-Host "No duplicate files found in $FolderPath"
+			return
 		}
-		Else {
-			Write-Host "No duplicate files found in $Path"
+
+		# Build list of files to remove (keep shortest path from each group)
+		$FilesToRemove = @()
+		ForEach ($Group in $DuplicateGroups) {
+			$Sorted = $Group.Group | Sort-Object { $_.Path.Length }
+			$Keeping = $Sorted | Select-Object -First 1
+			$Removing = $Sorted | Select-Object -Skip 1
+			ForEach ($Item in $Removing) {
+				$FileInfo = Get-Item -LiteralPath $Item.Path -Force -ErrorAction SilentlyContinue
+				If (-not $FileInfo) { continue }
+				$FilesToRemove += [PSCustomObject]@{
+					Path       = $Item.Path
+					Hash       = $Item.Hash
+					SizeBytes  = $FileInfo.Length
+					KeptFile   = $Keeping.Path
+				}
+			}
 		}
+
+		If ($FilesToRemove.Count -eq 0) {
+			Write-Host "No duplicate files found in $FolderPath"
+			return
+		}
+
+		# Display the list
+		Write-Host "`n========================================" -ForegroundColor Cyan
+		Write-Host "  Duplicate Files in: $FolderPath" -ForegroundColor Cyan
+		Write-Host "========================================" -ForegroundColor Cyan
+
+		ForEach ($File in $FilesToRemove) {
+			$SizeStr = "{0,10:N2} KB" -f ($File.SizeBytes / 1KB)
+			Write-Host "  REMOVE: " -ForegroundColor Red -NoNewline
+			Write-Host $SizeStr -ForegroundColor White -NoNewline
+			Write-Host "  $($File.Path)" -ForegroundColor Gray
+			Write-Host "    KEEP: " -ForegroundColor Green -NoNewline
+			Write-Host "$($File.KeptFile)" -ForegroundColor DarkGray
+		}
+
+		# Summary
+		$TotalFiles = $FilesToRemove.Count
+		$TotalBytes = ($FilesToRemove | Measure-Object -Property SizeBytes -Sum).Sum
+		$TotalMB = [math]::Round($TotalBytes / 1MB, 2)
+
+		Write-Host "`n----------------------------------------" -ForegroundColor DarkGray
+		Write-Host "  Files to remove: " -NoNewline
+		Write-Host "$TotalFiles" -ForegroundColor Yellow
+		Write-Host "  Space to free:   " -NoNewline
+		If ($TotalMB -ge 1) {
+			Write-Host "$TotalMB MB" -ForegroundColor Yellow
+		} Else {
+			Write-Host "$([math]::Round($TotalBytes / 1KB, 2)) KB" -ForegroundColor Yellow
+		}
+		Write-Host "----------------------------------------" -ForegroundColor DarkGray
+
+		# Confirmation via ShouldProcess (respects -Confirm:$false)
+		If (-not $Cmdlet.ShouldProcess("$TotalFiles duplicate file(s) in $FolderPath ($TotalMB MB)", "Remove")) {
+			return
+		}
+
+		# Delete
+		$DeletedCount = 0
+		$DeletedBytes = 0
+		ForEach ($File in $FilesToRemove) {
+			Try {
+				Remove-PathForcefully -Path $File.Path
+				$DeletedCount++
+				$DeletedBytes += $File.SizeBytes
+			} Catch {
+				Write-Warning "Failed to remove: $($File.Path) - $($_.Exception.Message)"
+			}
+		}
+
+		$FreedMB = [math]::Round($DeletedBytes / 1MB, 2)
+		Write-Host "`nRemoved $DeletedCount duplicate file(s), freed $FreedMB MB." -ForegroundColor Green
 	}
+
 	If ($Recurse) {
-		# Get all directories recursively and run Remove-DuplicateFiles for each directory
-		Get-ChildItem -Directory -Recurse | ForEach-Object { Remove-DuplicateFilesInt -Path $_.FullName }
-	}
- Else {
-		Remove-DuplicateFilesInt
+		$Directories = @($Path) + @((Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue).FullName)
+		ForEach ($Dir in $Directories) {
+			Remove-DuplicateFilesInFolder -FolderPath $Dir -Cmdlet $PSCmdlet
+		}
+	} Else {
+		Remove-DuplicateFilesInFolder -FolderPath $Path -Cmdlet $PSCmdlet
 	}
 }
 

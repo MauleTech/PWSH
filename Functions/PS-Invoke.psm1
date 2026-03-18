@@ -827,7 +827,7 @@ Function Invoke-IPv4NetworkScan {
 				# Deduplicate overlapping subnets (e.g. Ethernet and Wi-Fi on the same network)
 				$NetworkKey = "$($AddrSubnet.NetworkID)/$($Addr.PrefixLength)"
 				if ($SeenNetworks.ContainsKey($NetworkKey)) {
-					Write-Verbose -Message "Skipping $($Addr.InterfaceAlias) ($($Addr.IPAddress)) — same subnet as $($SeenNetworks[$NetworkKey])"
+					Write-Verbose -Message "Skipping $($Addr.InterfaceAlias) ($($Addr.IPAddress)) - same subnet as $($SeenNetworks[$NetworkKey])"
 					continue
 				}
 				$SeenNetworks[$NetworkKey] = $Addr.InterfaceAlias
@@ -889,7 +889,7 @@ Function Invoke-IPv4NetworkScan {
 		$AssignVendorToMAC = $false
 
 		# Check if it is possible to assign vendor to MAC --> download and import OUI list
-		# Security: OUI data is only used as string lookups in a hash table — never evaluated as code.
+		# Security: OUI data is only used as string lookups in a hash table - never evaluated as code.
 		if (-not $DisableMACResolving) {
 			$OUI_Sources = @(
 				@{ Uri = "https://standards-oui.ieee.org/oui/oui.txt"; Name = "IEEE" },
@@ -1170,7 +1170,7 @@ Function Invoke-IPv4NetworkScan {
 			Write-Warning "DetectHiddenDevices is enabled - devices that block ICMP will be probed using ARP, TCP, and NetBIOS. This may significantly increase scan time."
 
 			if (-not ([System.Management.Automation.PSTypeName]'Win32.Network').Type) {
-				Add-Type -TypeDefinition @'
+				$SendArpSource = @"
 using System;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -1192,7 +1192,8 @@ namespace Win32 {
         }
     }
 }
-'@ -ErrorAction SilentlyContinue
+"@
+				Add-Type -TypeDefinition $SendArpSource -ErrorAction SilentlyContinue
 			}
 		}
 

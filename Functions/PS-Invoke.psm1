@@ -457,48 +457,42 @@ Function Invoke-DNSRemediation {
 }
 
 Function Invoke-IPv4NetworkScan {
-	###############################################################################################################
-	# Language     :  PowerShell 4.0
-	# Filename     :  IPv4NetworkScan.ps1 
-	# Autor        :  BornToBeRoot (https://github.com/BornToBeRoot)
-	# Description  :  Powerful asynchronus IPv4 Network Scanner
-	# Repository   :  https://github.com/BornToBeRoot/PowerShell_IPv4NetworkScanner
-	###############################################################################################################
-
 	<#
 		.SYNOPSIS
-		Powerful asynchronus IPv4 Network Scanner
+		Asynchronous IPv4 Network Scanner with auto-detection and MAC/vendor resolution.
 
 		.DESCRIPTION
-		This powerful asynchronus IPv4 Network Scanner allows you to scan every IPv4-Range you want (172.16.1.47 to 172.16.2.5 would work). But there is also the possibility to scan an entire subnet based on an IPv4-Address withing the subnet and a the subnetmask/CIDR.
+		Scans IPv4 networks using parallel ICMP requests via runspace pools. When called
+		with no parameters, auto-detects active local network adapters and scans each subnet.
+		Supports explicit IP ranges, CIDR notation, and subnet masks.
 
-		The default result will contain the the IPv4-Address, Status (Up or Down) and the Hostname. Other values can be displayed via parameter.
+		By default, resolves DNS hostnames and MAC addresses with vendor lookup (OUI).
+		The OUI database is downloaded from IEEE with fallback to Wireshark and maclookup.app
+		mirrors. Results are sorted by IP address and displayed as a table.
 
-		.EXAMPLE
-		.\IPv4NetworkScan.ps1 -StartIPv4Address 192.168.178.0 -EndIPv4Address 192.168.178.20
-
-		IPv4Address   Status Hostname
-		-----------   ------ --------
-		192.168.178.1 Up     fritz.box
-
-		.EXAMPLE
-		.\IPv4NetworkScan.ps1 -IPv4Address 192.168.178.0 -Mask 255.255.255.0 -DisableDNSResolving
-
-		IPv4Address    Status
-		-----------    ------
-		192.168.178.1  Up
-		192.168.178.22 Up
+		Security: Downloaded OUI data is only used as string lookups in a hash table.
+		It is never passed to Invoke-Expression or evaluated as code, so a compromised
+		OUI source cannot inject executable content.
 
 		.EXAMPLE
-		.\IPv4NetworkScan.ps1 -IPv4Address 192.168.178.0 -CIDR 25 -EnableMACResolving
+		Invoke-IPv4NetworkScan
 
-		IPv4Address    Status Hostname           MAC               Vendor
-		-----------    ------ --------           ---               ------
-		192.168.178.1  Up     fritz.box          XX-XX-XX-XX-XX-XX AVM Audiovisuelles Marketing und Computersysteme GmbH
-		192.168.178.22 Up     XXXXX-PC.fritz.box XX-XX-XX-XX-XX-XX ASRock Incorporation
+		Auto-detects local networks and scans all active subnets with DNS and MAC resolution.
 
-		.LINK
-		https://github.com/BornToBeRoot/PowerShell_IPv4NetworkScanner/blob/master/README.md
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -StartIPv4Address 192.168.1.0 -EndIPv4Address 192.168.1.50
+
+		Scans a specific IP range.
+
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -IPv4Address 192.168.1.0 -CIDR 24 -DisableMACResolving
+
+		Scans a /24 subnet without MAC/vendor resolution.
+
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -Force
+
+		Auto-detects and scans without prompting, even if the network has more than 1000 IPs.
 	#>
 
 	[CmdletBinding(DefaultParameterSetName = 'Auto', SupportsShouldProcess = $true)]
@@ -569,8 +563,8 @@ Function Invoke-IPv4NetworkScan {
 
 		[Parameter(
 			Position = 5,
-			HelpMessage = 'Resolve MAC-Address for each IP (Default=Disabled)')]
-		[Switch]$EnableMACResolving,
+			HelpMessage = 'Disable MAC-Address and vendor resolution (Default=Enabled)')]
+		[Switch]$DisableMACResolving,
 
 		[Parameter(
 			Position = 6,
@@ -872,14 +866,15 @@ Function Invoke-IPv4NetworkScan {
 			$PropertiesToDisplay += "Hostname"
 		}
 
-		if ($EnableMACResolving) {
+		if (-not $DisableMACResolving) {
 			$PropertiesToDisplay += "MAC"
 		}
 
 		$AssignVendorToMAC = $false
 
 		# Check if it is possible to assign vendor to MAC --> download and import OUI list
-		if ($EnableMACResolving) {
+		# Security: OUI data is only used as string lookups in a hash table — never evaluated as code.
+		if (-not $DisableMACResolving) {
 			$OUI_Sources = @(
 				@{ Uri = "https://standards-oui.ieee.org/oui/oui.txt"; Name = "IEEE" },
 				@{ Uri = "https://www.wireshark.org/download/automated/data/manuf"; Name = "Wireshark" },
@@ -989,7 +984,7 @@ Function Invoke-IPv4NetworkScan {
 				$IPv4Address,
 				$Tries,
 				$DisableDNSResolving,
-				$EnableMACResolving,
+				$DisableMACResolving,
 				$ExtendedInformations,
 				$IncludeInactive
 			)
@@ -1033,7 +1028,7 @@ Function Invoke-IPv4NetworkScan {
 			# +++ Get MAC-Address +++
 			$MAC = [String]::Empty
 
-			if (($EnableMACResolving) -and (($Status -eq "Up") -or ($IncludeInactive))) {
+			if ((-not $DisableMACResolving) -and (($Status -eq "Up") -or ($IncludeInactive))) {
 				$Arp_Result = (arp -a).ToUpper().Trim()
 
 				foreach ($Line in $Arp_Result) {
@@ -1151,7 +1146,7 @@ Function Invoke-IPv4NetworkScan {
 					IPv4Address          = $IPv4Address
 					Tries                = $Tries
 					DisableDNSResolving  = $DisableDNSResolving
-					EnableMACResolving   = $EnableMACResolving
+					DisableMACResolving  = $DisableMACResolving
 					ExtendedInformations = $ExtendedInformations
 					IncludeInactive      = $IncludeInactive
 				}

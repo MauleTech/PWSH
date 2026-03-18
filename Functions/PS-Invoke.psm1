@@ -803,17 +803,29 @@ Function Invoke-IPv4NetworkScan {
 			# Auto-detect local networks
 			Write-Verbose -Message "Auto-detecting local networks..."
 
+			# Get active adapters and their IPs, filtering out disconnected and loopback
+			$ActiveAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
 			$LocalAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp, Manual -ErrorAction SilentlyContinue |
-				Where-Object { $_.IPAddress -ne '127.0.0.1' })
+				Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.InterfaceIndex -in $ActiveAdapters.ifIndex })
 
 			if ($LocalAddresses.Count -eq 0) {
-				Write-Error -Message "No local IPv4 network interfaces found for auto-detection. Specify an IP range manually." -Category ObjectNotFound -ErrorAction Stop
+				Write-Error -Message "No active IPv4 network interfaces found for auto-detection. Specify an IP range manually." -Category ObjectNotFound -ErrorAction Stop
 			}
 
 			$TotalIPs = 0
+			$SeenNetworks = @{}
 
 			foreach ($Addr in $LocalAddresses) {
 				$AddrSubnet = Get-IPv4Subnet -IPv4Address $Addr.IPAddress -CIDR $Addr.PrefixLength
+
+				# Deduplicate overlapping subnets (e.g. Ethernet and Wi-Fi on the same network)
+				$NetworkKey = "$($AddrSubnet.NetworkID)/$($Addr.PrefixLength)"
+				if ($SeenNetworks.ContainsKey($NetworkKey)) {
+					Write-Verbose -Message "Skipping $($Addr.InterfaceAlias) ($($Addr.IPAddress)) — same subnet as $($SeenNetworks[$NetworkKey])"
+					continue
+				}
+				$SeenNetworks[$NetworkKey] = $Addr.InterfaceAlias
+
 				$TotalIPs += ($AddrSubnet.IPs)
 				$NetworksToScan += [pscustomobject] @{
 					InterfaceAlias   = $Addr.InterfaceAlias

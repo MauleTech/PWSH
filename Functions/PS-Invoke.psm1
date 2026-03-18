@@ -1172,6 +1172,7 @@ Function Invoke-IPv4NetworkScan {
 
 			# Total jobs to calculate percent complete, because jobs are removed after they are processed
 			$Jobs_Total = $Jobs.Count
+			[System.Collections.ArrayList]$NetworkResults = @()
 
 			# Process results, while waiting for other jobs
 			Do {
@@ -1241,12 +1242,15 @@ Function Invoke-IPv4NetworkScan {
 						# Tag with custom type so the registered format view forces table output
 						$Result.PSObject.TypeNames.Insert(0, 'IPv4NetworkScan.Result')
 
-						# Emit result to pipeline
-						$Result
+						# Collect result for sorting
+						[void]$NetworkResults.Add($Result)
 					}
 				}
 
 			} While ($Jobs.Count -gt 0)
+
+			# Emit results sorted by IPv4 address
+			$NetworkResults | Sort-Object -Property { (Convert-IPv4Address -IPv4Address $_.IPv4Address).Int64 }
 		}
 
 		Write-Verbose -Message "Closing RunspacePool and free resources..."

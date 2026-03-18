@@ -871,6 +871,8 @@ Function Invoke-IPv4NetworkScan {
 			$OUI_Uri = "https://standards-oui.ieee.org/oui/oui.txt"
 			$LatestOUIs = $null
 			$MaxRetries = 3
+			$PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 			for ($RetryCount = 1; $RetryCount -le $MaxRetries; $RetryCount++) {
 				try {
 					$LatestOUIs = Invoke-RestMethod -Uri $OUI_Uri -ErrorAction Stop
@@ -886,6 +888,7 @@ Function Invoke-IPv4NetworkScan {
 					}
 				}
 			}
+			[Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
 
 			if ($null -ne $LatestOUIs) {
 				$OutputLines = [System.Collections.Generic.List[string]]::new()

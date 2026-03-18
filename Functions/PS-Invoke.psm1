@@ -868,41 +868,77 @@ Function Invoke-IPv4NetworkScan {
 
 		# Check if it is possible to assign vendor to MAC --> download and import OUI list
 		if ($EnableMACResolving) {
-			$OUI_Uri = "https://standards-oui.ieee.org/oui/oui.txt"
-			$LatestOUIs = $null
-			$MaxRetries = 3
+			$OUI_Sources = @(
+				@{ Uri = "https://standards-oui.ieee.org/oui/oui.txt"; Name = "IEEE" },
+				@{ Uri = "https://www.wireshark.org/download/automated/data/manuf"; Name = "Wireshark" },
+				@{ Uri = "https://maclookup.app/downloads/json-database/get-db"; Name = "maclookup.app" }
+			)
+			$OUILines = $null
 			$PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
-			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-			for ($RetryCount = 1; $RetryCount -le $MaxRetries; $RetryCount++) {
-				try {
-					$LatestOUIs = Invoke-RestMethod -Uri $OUI_Uri -ErrorAction Stop
+			try {
+				[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls13
+			}
+			catch {
+				[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+			}
+
+			foreach ($Source in $OUI_Sources) {
+				for ($RetryCount = 1; $RetryCount -le 2; $RetryCount++) {
+					try {
+						$RawData = Invoke-RestMethod -Uri $Source.Uri -ErrorAction Stop
+						$OUILines = [System.Collections.Generic.List[string]]::new()
+
+						switch ($Source.Name) {
+							"IEEE" {
+								# Lines: "2405F5     (base 16)		Vendor Name"
+								foreach ($Line in $RawData -split '[\r\n]') {
+									if ($Line -match "^[A-F0-9]{6}") {
+										$OUILines.Add(($Line -replace '\s+', ' ').Replace(' (base 16) ', '|').Trim())
+									}
+								}
+							}
+							"Wireshark" {
+								# Lines: "00:00:0C\tShortName\tFull Vendor Name"
+								foreach ($Line in $RawData -split '[\r\n]') {
+									if ($Line -match "^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\t") {
+										$Parts = $Line -split "`t"
+										$MAC = $Parts[0].Replace(":", "").ToUpper()
+										$Vendor = if ($Parts.Count -ge 3 -and $Parts[2]) { $Parts[2] } else { $Parts[1] }
+										$OUILines.Add("$MAC|$Vendor")
+									}
+								}
+							}
+							"maclookup.app" {
+								# JSON array of objects with macPrefix and vendorName
+								foreach ($Entry in $RawData) {
+									if ($Entry.macPrefix -and $Entry.vendorName) {
+										$MAC = $Entry.macPrefix.Replace(":", "").ToUpper()
+										$OUILines.Add("$MAC|$($Entry.vendorName)")
+									}
+								}
+							}
+						}
+
+						if ($OUILines.Count -gt 0) { break }
+					}
+					catch {
+						if ($RetryCount -lt 2) {
+							Write-Warning "OUI download from $($Source.Name) failed: $($_.Exception.Message). Retrying..."
+							Start-Sleep -Seconds 2
+						}
+					}
+				}
+				if ($OUILines -and $OUILines.Count -gt 0) {
+					Write-Verbose -Message "Downloaded OUI data from $($Source.Name) ($($OUILines.Count) entries)"
 					break
 				}
-				catch {
-					if ($RetryCount -lt $MaxRetries) {
-						Write-Warning "OUI download attempt $RetryCount failed: $($_.Exception.Message). Retrying in 2 seconds..."
-						Start-Sleep -Seconds 2
-					}
-					else {
-						Write-Warning "Failed to download OUI list after $MaxRetries attempts: $($_.Exception.Message)"
-					}
-				}
+				Write-Warning "Failed to download OUI data from $($Source.Name), trying next source..."
 			}
+
 			[Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
 
-			if ($null -ne $LatestOUIs) {
-				$OutputLines = [System.Collections.Generic.List[string]]::new()
-
-				foreach($Line in $LatestOUIs -split '[\r\n]')
-				{
-					if($Line -match "^[A-F0-9]{6}")
-					{
-						# Line looks like: 2405F5     (base 16)		Integrated Device Technology (Malaysia) Sdn. Bhd.
-						$OutputLines.Add(($Line -replace '\s+', ' ').Replace(' (base 16) ', '|').Trim())
-					}
-				}
-
-				Out-File -InputObject ($OutputLines -join "`n") -FilePath "$ITFolder\oui.txt"
+			if ($OUILines -and $OUILines.Count -gt 0) {
+				Out-File -InputObject ($OUILines -join "`n") -FilePath "$ITFolder\oui.txt"
 			}
 
 			if (Test-Path -Path $OUIListPath -PathType Leaf) {
@@ -1031,9 +1067,38 @@ Function Invoke-IPv4NetworkScan {
 		$RunspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $Threads, $Host)
 		$RunspacePool.Open()
 
-		# Pre-create reusable DefaultDisplayPropertySet for result formatting
-		$DefaultDisplaySet = [System.Management.Automation.PSPropertySet]::new('DefaultDisplayPropertySet', [string[]]$PropertiesToDisplay)
-		$PSStandardMembers = [System.Management.Automation.PSMemberInfo[]]@($DefaultDisplaySet)
+		# Register table format view so results always display as a table regardless of property count
+		$HeaderXml = ($PropertiesToDisplay | ForEach-Object { "<TableColumnHeader><Label>$_</Label></TableColumnHeader>" }) -join "`n                        "
+		$ColumnXml = ($PropertiesToDisplay | ForEach-Object { "<TableColumnItem><PropertyName>$_</PropertyName></TableColumnItem>" }) -join "`n                                "
+		$FormatXml = @"
+<?xml version="1.0" encoding="utf-8" ?>
+<Configuration>
+    <ViewDefinitions>
+        <View>
+            <Name>IPv4NetworkScan.Result</Name>
+            <ViewSelectedBy>
+                <TypeName>IPv4NetworkScan.Result</TypeName>
+            </ViewSelectedBy>
+            <TableControl>
+                <AutoSize/>
+                <TableHeaders>
+                    $HeaderXml
+                </TableHeaders>
+                <TableRowEntries>
+                    <TableRowEntry>
+                        <TableColumnItems>
+                            $ColumnXml
+                        </TableColumnItems>
+                    </TableRowEntry>
+                </TableRowEntries>
+            </TableControl>
+        </View>
+    </ViewDefinitions>
+</Configuration>
+"@
+		$FormatFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "IPv4NetworkScan.format.ps1xml")
+		$FormatXml | Out-File -FilePath $FormatFile -Encoding UTF8
+		Update-FormatData -PrependPath $FormatFile
 
 		# Scan each network
 		foreach ($NetworkToScan in $NetworksToScan) {
@@ -1173,9 +1238,8 @@ Function Invoke-IPv4NetworkScan {
 							$Result = $Job_Result | Select-Object -Property $PropertiesToDisplay
 						}
 
-						# Add custom type and DefaultDisplayPropertySet for table formatting
+						# Tag with custom type so the registered format view forces table output
 						$Result.PSObject.TypeNames.Insert(0, 'IPv4NetworkScan.Result')
-						$Result | Add-Member -MemberType MemberSet -Name PSStandardMembers -Value $PSStandardMembers
 
 						# Emit result to pipeline
 						$Result

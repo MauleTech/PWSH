@@ -493,6 +493,13 @@ Function Invoke-IPv4NetworkScan {
 		Invoke-IPv4NetworkScan -Force
 
 		Auto-detects and scans without prompting, even if the network has more than 1000 IPs.
+
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -DetectHiddenDevices
+
+		Auto-detects local networks. Devices blocking ICMP are probed with ARP,
+		TCP port scanning, and NetBIOS queries. A DetectionMethod column shows
+		how each device was ultimately detected.
 	#>
 
 	[CmdletBinding(DefaultParameterSetName = 'Auto', SupportsShouldProcess = $true)]
@@ -579,7 +586,12 @@ Function Invoke-IPv4NetworkScan {
 		[Parameter(
 			Position = 8,
 			HelpMessage = 'Bypass confirmation prompt when auto-detecting networks with more than 1000 IPs')]
-		[Switch]$Force
+		[Switch]$Force,
+
+		[Parameter(
+			Position = 9,
+			HelpMessage = 'Detect devices that block ICMP using ARP, TCP, and NetBIOS probes')]
+		[Switch]$DetectHiddenDevices
 	)
 
 	Begin {
@@ -862,6 +874,10 @@ Function Invoke-IPv4NetworkScan {
 		$PropertiesToDisplay = @()
 		$PropertiesToDisplay += "IPv4Address", "Status"
 
+		if ($DetectHiddenDevices) {
+			$PropertiesToDisplay += "DetectionMethod"
+		}
+
 		if ($DisableDNSResolving -eq $false) {
 			$PropertiesToDisplay += "Hostname"
 		}
@@ -986,13 +1002,15 @@ Function Invoke-IPv4NetworkScan {
 				$DisableDNSResolving,
 				$DisableMACResolving,
 				$ExtendedInformations,
-				$IncludeInactive
+				$IncludeInactive,
+				$DetectHiddenDevices
 			)
 
-			# +++ Send ICMP requests +++
+			# +++ Wave 1: Send ICMP requests +++
 			$Status = [String]::Empty
+			$DetectionMethod = [String]::Empty
 
-			for ($i = 0; $i -lt $Tries; i++) {
+			for ($i = 0; $i -lt $Tries; $i++) {
 				try {
 					$PingObj = New-Object System.Net.NetworkInformation.Ping
 
@@ -1003,7 +1021,8 @@ Function Invoke-IPv4NetworkScan {
 
 					if ($PingResult.Status -eq "Success") {
 						$Status = "Up"
-						break # Exit loop, if host is reachable
+						$DetectionMethod = "ICMP"
+						break
 					}
 					else {
 						$Status = "Down"
@@ -1011,7 +1030,83 @@ Function Invoke-IPv4NetworkScan {
 				}
 				catch {
 					$Status = "Down"
-					break # Exit loop, if there is an error
+					break
+				}
+			}
+
+			# +++ Hidden device detection waves (only when ICMP failed) +++
+			if ($DetectHiddenDevices -and $Status -eq "Down") {
+
+				# --- Wave 2: ARP probe via SendARP P/Invoke ---
+				try {
+					$arpMAC = [Win32.Network]::GetMAC($IPv4Address)
+					if ($arpMAC) {
+						$Status = "Up"
+						$DetectionMethod = "ARP"
+					}
+				}
+				catch { }
+
+				# --- Wave 3: TCP port probe on common ports ---
+				if ($Status -eq "Down") {
+					$CommonPorts = @(445, 80, 443, 3389, 22, 139, 8080)
+					foreach ($Port in $CommonPorts) {
+						try {
+							$tcp = New-Object System.Net.Sockets.TcpClient
+							$ar = $tcp.BeginConnect($IPv4Address, $Port, $null, $null)
+							$waited = $ar.AsyncWaitHandle.WaitOne(500, $false)
+							if ($waited -and $tcp.Connected) {
+								$Status = "Up"
+								$DetectionMethod = "TCP:$Port"
+								$tcp.Close()
+								break
+							}
+							$tcp.Close()
+						}
+						catch [System.Net.Sockets.SocketException] {
+							# Connection refused (RST) means the host IS alive
+							if ($_.Exception.SocketErrorCode -eq 'ConnectionRefused') {
+								$Status = "Up"
+								$DetectionMethod = "TCP:$Port"
+								break
+							}
+						}
+						catch { }
+						finally {
+							if ($tcp) { $tcp.Dispose() }
+						}
+					}
+				}
+
+				# --- Wave 4: NetBIOS name query (UDP 137) ---
+				if ($Status -eq "Down") {
+					try {
+						$udp = New-Object System.Net.Sockets.UdpClient
+						$udp.Client.ReceiveTimeout = 1000
+						# NBNS wildcard query packet
+						[byte[]]$nbQuery = @(
+							0x80, 0x94, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+							0x00, 0x00, 0x00, 0x00, 0x20, 0x43, 0x4B, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x00, 0x00, 0x21,
+							0x00, 0x01
+						)
+						$ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($IPv4Address), 137)
+						[void]$udp.Send($nbQuery, $nbQuery.Length, $ep)
+						$remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+						$response = $udp.Receive([ref]$remoteEp)
+						if ($response.Length -gt 0) {
+							$Status = "Up"
+							$DetectionMethod = "NetBIOS"
+						}
+						$udp.Close()
+					}
+					catch { }
+					finally {
+						if ($udp) { $udp.Dispose() }
+					}
 				}
 			}
 
@@ -1055,17 +1150,49 @@ Function Invoke-IPv4NetworkScan {
 			# +++ Result +++
 			if (($Status -eq "Up") -or ($IncludeInactive)) {
 				[pscustomobject] @{
-					IPv4Address  = $IPv4Address
-					Status       = $Status
-					Hostname     = $Hostname
-					MAC          = $MAC
-					BufferSize   = $BufferSize
-					ResponseTime = $ResponseTime
-					TTL          = $TTL
+					IPv4Address     = $IPv4Address
+					Status          = $Status
+					DetectionMethod = $DetectionMethod
+					Hostname        = $Hostname
+					MAC             = $MAC
+					BufferSize      = $BufferSize
+					ResponseTime    = $ResponseTime
+					TTL             = $TTL
 				}
 			}
 			else {
 				$null
+			}
+		}
+
+		# Compile SendARP P/Invoke for hidden device detection (loaded into AppDomain, visible to all runspaces)
+		if ($DetectHiddenDevices) {
+			Write-Warning "DetectHiddenDevices is enabled - devices that block ICMP will be probed using ARP, TCP, and NetBIOS. This may significantly increase scan time."
+
+			if (-not ([System.Management.Automation.PSTypeName]'Win32.Network').Type) {
+				Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Runtime.InteropServices;
+
+namespace Win32 {
+    public static class Network {
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        public static extern int SendARP(uint DestIP, uint SrcIP, byte[] macAddr, ref int macAddrLen);
+
+        public static string GetMAC(string ipAddress) {
+            try {
+                uint ip = BitConverter.ToUInt32(IPAddress.Parse(ipAddress).GetAddressBytes(), 0);
+                byte[] mac = new byte[6];
+                int macLen = mac.Length;
+                if (SendARP(ip, 0, mac, ref macLen) == 0)
+                    return BitConverter.ToString(mac, 0, macLen);
+            } catch { }
+            return null;
+        }
+    }
+}
+'@ -ErrorAction SilentlyContinue
 			}
 		}
 
@@ -1149,6 +1276,7 @@ Function Invoke-IPv4NetworkScan {
 					DisableMACResolving  = $DisableMACResolving
 					ExtendedInformations = $ExtendedInformations
 					IncludeInactive      = $IncludeInactive
+					DetectHiddenDevices  = $DetectHiddenDevices
 				}
 
 				# Catch when trying to divide through zero
@@ -1232,14 +1360,15 @@ Function Invoke-IPv4NetworkScan {
 							}
 
 							$Result = [pscustomobject] @{
-								IPv4Address  = $Job_Result.IPv4Address
-								Status       = $Job_Result.Status
-								Hostname     = $Job_Result.Hostname
-								MAC          = $Job_Result.MAC
-								Vendor       = $Vendor
-								BufferSize   = $Job_Result.BufferSize
-								ResponseTime = $Job_Result.ResponseTime
-								TTL          = $Job_Result.TTL
+								IPv4Address     = $Job_Result.IPv4Address
+								Status          = $Job_Result.Status
+								DetectionMethod = $Job_Result.DetectionMethod
+								Hostname        = $Job_Result.Hostname
+								MAC             = $Job_Result.MAC
+								Vendor          = $Vendor
+								BufferSize      = $Job_Result.BufferSize
+								ResponseTime    = $Job_Result.ResponseTime
+								TTL             = $Job_Result.TTL
 							} | Select-Object -Property $PropertiesToDisplay
 						}
 						else {

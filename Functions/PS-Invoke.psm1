@@ -457,48 +457,49 @@ Function Invoke-DNSRemediation {
 }
 
 Function Invoke-IPv4NetworkScan {
-	###############################################################################################################
-	# Language     :  PowerShell 4.0
-	# Filename     :  IPv4NetworkScan.ps1 
-	# Autor        :  BornToBeRoot (https://github.com/BornToBeRoot)
-	# Description  :  Powerful asynchronus IPv4 Network Scanner
-	# Repository   :  https://github.com/BornToBeRoot/PowerShell_IPv4NetworkScanner
-	###############################################################################################################
-
 	<#
 		.SYNOPSIS
-		Powerful asynchronus IPv4 Network Scanner
+		Asynchronous IPv4 Network Scanner with auto-detection and MAC/vendor resolution.
 
 		.DESCRIPTION
-		This powerful asynchronus IPv4 Network Scanner allows you to scan every IPv4-Range you want (172.16.1.47 to 172.16.2.5 would work). But there is also the possibility to scan an entire subnet based on an IPv4-Address withing the subnet and a the subnetmask/CIDR.
+		Scans IPv4 networks using parallel ICMP requests via runspace pools. When called
+		with no parameters, auto-detects active local network adapters and scans each subnet.
+		Supports explicit IP ranges, CIDR notation, and subnet masks.
 
-		The default result will contain the the IPv4-Address, Status (Up or Down) and the Hostname. Other values can be displayed via parameter.
+		By default, resolves DNS hostnames and MAC addresses with vendor lookup (OUI).
+		The OUI database is downloaded from IEEE with fallback to Wireshark and maclookup.app
+		mirrors. Results are sorted by IP address and displayed as a table.
 
-		.EXAMPLE
-		.\IPv4NetworkScan.ps1 -StartIPv4Address 192.168.178.0 -EndIPv4Address 192.168.178.20
-
-		IPv4Address   Status Hostname
-		-----------   ------ --------
-		192.168.178.1 Up     fritz.box
-
-		.EXAMPLE
-		.\IPv4NetworkScan.ps1 -IPv4Address 192.168.178.0 -Mask 255.255.255.0 -DisableDNSResolving
-
-		IPv4Address    Status
-		-----------    ------
-		192.168.178.1  Up
-		192.168.178.22 Up
+		Security: Downloaded OUI data is only used as string lookups in a hash table.
+		It is never passed to Invoke-Expression or evaluated as code, so a compromised
+		OUI source cannot inject executable content.
 
 		.EXAMPLE
-		.\IPv4NetworkScan.ps1 -IPv4Address 192.168.178.0 -CIDR 25 -EnableMACResolving
+		Invoke-IPv4NetworkScan
 
-		IPv4Address    Status Hostname           MAC               Vendor
-		-----------    ------ --------           ---               ------
-		192.168.178.1  Up     fritz.box          XX-XX-XX-XX-XX-XX AVM Audiovisuelles Marketing und Computersysteme GmbH
-		192.168.178.22 Up     XXXXX-PC.fritz.box XX-XX-XX-XX-XX-XX ASRock Incorporation
+		Auto-detects local networks and scans all active subnets with DNS and MAC resolution.
 
-		.LINK
-		https://github.com/BornToBeRoot/PowerShell_IPv4NetworkScanner/blob/master/README.md
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -StartIPv4Address 192.168.1.0 -EndIPv4Address 192.168.1.50
+
+		Scans a specific IP range.
+
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -IPv4Address 192.168.1.0 -CIDR 24 -DisableMACResolving
+
+		Scans a /24 subnet without MAC/vendor resolution.
+
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -Force
+
+		Auto-detects and scans without prompting, even if the network has more than 1000 IPs.
+
+		.EXAMPLE
+		Invoke-IPv4NetworkScan -DetectHiddenDevices
+
+		Auto-detects local networks. Devices blocking ICMP are probed with ARP,
+		TCP port scanning, and NetBIOS queries. A DetectionMethod column shows
+		how each device was ultimately detected.
 	#>
 
 	[CmdletBinding(DefaultParameterSetName = 'Auto', SupportsShouldProcess = $true)]
@@ -569,8 +570,8 @@ Function Invoke-IPv4NetworkScan {
 
 		[Parameter(
 			Position = 5,
-			HelpMessage = 'Resolve MAC-Address for each IP (Default=Disabled)')]
-		[Switch]$EnableMACResolving,
+			HelpMessage = 'Disable MAC-Address and vendor resolution (Default=Enabled)')]
+		[Switch]$DisableMACResolving,
 
 		[Parameter(
 			Position = 6,
@@ -585,7 +586,12 @@ Function Invoke-IPv4NetworkScan {
 		[Parameter(
 			Position = 8,
 			HelpMessage = 'Bypass confirmation prompt when auto-detecting networks with more than 1000 IPs')]
-		[Switch]$Force
+		[Switch]$Force,
+
+		[Parameter(
+			Position = 9,
+			HelpMessage = 'Detect devices that block ICMP using ARP, TCP, and NetBIOS probes')]
+		[Switch]$DetectHiddenDevices
 	)
 
 	Begin {
@@ -803,17 +809,29 @@ Function Invoke-IPv4NetworkScan {
 			# Auto-detect local networks
 			Write-Verbose -Message "Auto-detecting local networks..."
 
+			# Get active adapters and their IPs, filtering out disconnected and loopback
+			$ActiveAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
 			$LocalAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp, Manual -ErrorAction SilentlyContinue |
-				Where-Object { $_.IPAddress -ne '127.0.0.1' })
+				Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.InterfaceIndex -in $ActiveAdapters.ifIndex })
 
 			if ($LocalAddresses.Count -eq 0) {
-				Write-Error -Message "No local IPv4 network interfaces found for auto-detection. Specify an IP range manually." -Category ObjectNotFound -ErrorAction Stop
+				Write-Error -Message "No active IPv4 network interfaces found for auto-detection. Specify an IP range manually." -Category ObjectNotFound -ErrorAction Stop
 			}
 
 			$TotalIPs = 0
+			$SeenNetworks = @{}
 
 			foreach ($Addr in $LocalAddresses) {
 				$AddrSubnet = Get-IPv4Subnet -IPv4Address $Addr.IPAddress -CIDR $Addr.PrefixLength
+
+				# Deduplicate overlapping subnets (e.g. Ethernet and Wi-Fi on the same network)
+				$NetworkKey = "$($AddrSubnet.NetworkID)/$($Addr.PrefixLength)"
+				if ($SeenNetworks.ContainsKey($NetworkKey)) {
+					Write-Verbose -Message "Skipping $($Addr.InterfaceAlias) ($($Addr.IPAddress)) — same subnet as $($SeenNetworks[$NetworkKey])"
+					continue
+				}
+				$SeenNetworks[$NetworkKey] = $Addr.InterfaceAlias
+
 				$TotalIPs += ($AddrSubnet.IPs)
 				$NetworksToScan += [pscustomobject] @{
 					InterfaceAlias   = $Addr.InterfaceAlias
@@ -856,50 +874,94 @@ Function Invoke-IPv4NetworkScan {
 		$PropertiesToDisplay = @()
 		$PropertiesToDisplay += "IPv4Address", "Status"
 
+		if ($DetectHiddenDevices) {
+			$PropertiesToDisplay += "DetectionMethod"
+		}
+
 		if ($DisableDNSResolving -eq $false) {
 			$PropertiesToDisplay += "Hostname"
 		}
 
-		if ($EnableMACResolving) {
+		if (-not $DisableMACResolving) {
 			$PropertiesToDisplay += "MAC"
 		}
 
 		$AssignVendorToMAC = $false
 
 		# Check if it is possible to assign vendor to MAC --> download and import OUI list
-		if ($EnableMACResolving) {
-			$OUI_Uri = "https://standards-oui.ieee.org/oui/oui.txt"
-			$LatestOUIs = $null
-			$MaxRetries = 3
-			for ($RetryCount = 1; $RetryCount -le $MaxRetries; $RetryCount++) {
-				try {
-					$LatestOUIs = Invoke-RestMethod -Uri $OUI_Uri -ErrorAction Stop
-					break
-				}
-				catch {
-					if ($RetryCount -lt $MaxRetries) {
-						Write-Warning "OUI download attempt $RetryCount failed: $($_.Exception.Message). Retrying in 2 seconds..."
-						Start-Sleep -Seconds 2
-					}
-					else {
-						Write-Warning "Failed to download OUI list after $MaxRetries attempts: $($_.Exception.Message)"
-					}
-				}
+		# Security: OUI data is only used as string lookups in a hash table — never evaluated as code.
+		if (-not $DisableMACResolving) {
+			$OUI_Sources = @(
+				@{ Uri = "https://standards-oui.ieee.org/oui/oui.txt"; Name = "IEEE" },
+				@{ Uri = "https://www.wireshark.org/download/automated/data/manuf"; Name = "Wireshark" },
+				@{ Uri = "https://maclookup.app/downloads/json-database/get-db"; Name = "maclookup.app" }
+			)
+			$OUILines = $null
+			$PreviousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+			try {
+				[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls13
+			}
+			catch {
+				[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 			}
 
-			if ($null -ne $LatestOUIs) {
-				$OutputLines = [System.Collections.Generic.List[string]]::new()
+			foreach ($Source in $OUI_Sources) {
+				for ($RetryCount = 1; $RetryCount -le 2; $RetryCount++) {
+					try {
+						$RawData = Invoke-RestMethod -Uri $Source.Uri -ErrorAction Stop
+						$OUILines = [System.Collections.Generic.List[string]]::new()
 
-				foreach($Line in $LatestOUIs -split '[\r\n]')
-				{
-					if($Line -match "^[A-F0-9]{6}")
-					{
-						# Line looks like: 2405F5     (base 16)		Integrated Device Technology (Malaysia) Sdn. Bhd.
-						$OutputLines.Add(($Line -replace '\s+', ' ').Replace(' (base 16) ', '|').Trim())
+						switch ($Source.Name) {
+							"IEEE" {
+								# Lines: "2405F5     (base 16)		Vendor Name"
+								foreach ($Line in $RawData -split '[\r\n]') {
+									if ($Line -match "^[A-F0-9]{6}") {
+										$OUILines.Add(($Line -replace '\s+', ' ').Replace(' (base 16) ', '|').Trim())
+									}
+								}
+							}
+							"Wireshark" {
+								# Lines: "00:00:0C\tShortName\tFull Vendor Name"
+								foreach ($Line in $RawData -split '[\r\n]') {
+									if ($Line -match "^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\t") {
+										$Parts = $Line -split "`t"
+										$MAC = $Parts[0].Replace(":", "").ToUpper()
+										$Vendor = if ($Parts.Count -ge 3 -and $Parts[2]) { $Parts[2] } else { $Parts[1] }
+										$OUILines.Add("$MAC|$Vendor")
+									}
+								}
+							}
+							"maclookup.app" {
+								# JSON array of objects with macPrefix and vendorName
+								foreach ($Entry in $RawData) {
+									if ($Entry.macPrefix -and $Entry.vendorName) {
+										$MAC = $Entry.macPrefix.Replace(":", "").ToUpper()
+										$OUILines.Add("$MAC|$($Entry.vendorName)")
+									}
+								}
+							}
+						}
+
+						if ($OUILines.Count -gt 0) { break }
+					}
+					catch {
+						if ($RetryCount -lt 2) {
+							Write-Warning "OUI download from $($Source.Name) failed: $($_.Exception.Message). Retrying..."
+							Start-Sleep -Seconds 2
+						}
 					}
 				}
+				if ($OUILines -and $OUILines.Count -gt 0) {
+					Write-Verbose -Message "Downloaded OUI data from $($Source.Name) ($($OUILines.Count) entries)"
+					break
+				}
+				Write-Warning "Failed to download OUI data from $($Source.Name), trying next source..."
+			}
 
-				Out-File -InputObject ($OutputLines -join "`n") -FilePath "$ITFolder\oui.txt"
+			[Net.ServicePointManager]::SecurityProtocol = $PreviousSecurityProtocol
+
+			if ($OUILines -and $OUILines.Count -gt 0) {
+				Out-File -InputObject ($OUILines -join "`n") -FilePath "$ITFolder\oui.txt"
 			}
 
 			if (Test-Path -Path $OUIListPath -PathType Leaf) {
@@ -938,15 +1000,17 @@ Function Invoke-IPv4NetworkScan {
 				$IPv4Address,
 				$Tries,
 				$DisableDNSResolving,
-				$EnableMACResolving,
+				$DisableMACResolving,
 				$ExtendedInformations,
-				$IncludeInactive
+				$IncludeInactive,
+				$DetectHiddenDevices
 			)
 
-			# +++ Send ICMP requests +++
+			# +++ Wave 1: Send ICMP requests +++
 			$Status = [String]::Empty
+			$DetectionMethod = [String]::Empty
 
-			for ($i = 0; $i -lt $Tries; i++) {
+			for ($i = 0; $i -lt $Tries; $i++) {
 				try {
 					$PingObj = New-Object System.Net.NetworkInformation.Ping
 
@@ -957,7 +1021,8 @@ Function Invoke-IPv4NetworkScan {
 
 					if ($PingResult.Status -eq "Success") {
 						$Status = "Up"
-						break # Exit loop, if host is reachable
+						$DetectionMethod = "ICMP"
+						break
 					}
 					else {
 						$Status = "Down"
@@ -965,7 +1030,83 @@ Function Invoke-IPv4NetworkScan {
 				}
 				catch {
 					$Status = "Down"
-					break # Exit loop, if there is an error
+					break
+				}
+			}
+
+			# +++ Hidden device detection waves (only when ICMP failed) +++
+			if ($DetectHiddenDevices -and $Status -eq "Down") {
+
+				# --- Wave 2: ARP probe via SendARP P/Invoke ---
+				try {
+					$arpMAC = [Win32.Network]::GetMAC($IPv4Address)
+					if ($arpMAC) {
+						$Status = "Up"
+						$DetectionMethod = "ARP"
+					}
+				}
+				catch { }
+
+				# --- Wave 3: TCP port probe on common ports ---
+				if ($Status -eq "Down") {
+					$CommonPorts = @(445, 80, 443, 3389, 22, 139, 8080)
+					foreach ($Port in $CommonPorts) {
+						try {
+							$tcp = New-Object System.Net.Sockets.TcpClient
+							$ar = $tcp.BeginConnect($IPv4Address, $Port, $null, $null)
+							$waited = $ar.AsyncWaitHandle.WaitOne(500, $false)
+							if ($waited -and $tcp.Connected) {
+								$Status = "Up"
+								$DetectionMethod = "TCP:$Port"
+								$tcp.Close()
+								break
+							}
+							$tcp.Close()
+						}
+						catch [System.Net.Sockets.SocketException] {
+							# Connection refused (RST) means the host IS alive
+							if ($_.Exception.SocketErrorCode -eq 'ConnectionRefused') {
+								$Status = "Up"
+								$DetectionMethod = "TCP:$Port"
+								break
+							}
+						}
+						catch { }
+						finally {
+							if ($tcp) { $tcp.Dispose() }
+						}
+					}
+				}
+
+				# --- Wave 4: NetBIOS name query (UDP 137) ---
+				if ($Status -eq "Down") {
+					try {
+						$udp = New-Object System.Net.Sockets.UdpClient
+						$udp.Client.ReceiveTimeout = 1000
+						# NBNS wildcard query packet
+						[byte[]]$nbQuery = @(
+							0x80, 0x94, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+							0x00, 0x00, 0x00, 0x00, 0x20, 0x43, 0x4B, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+							0x41, 0x41, 0x41, 0x41, 0x41, 0x00, 0x00, 0x21,
+							0x00, 0x01
+						)
+						$ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($IPv4Address), 137)
+						[void]$udp.Send($nbQuery, $nbQuery.Length, $ep)
+						$remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+						$response = $udp.Receive([ref]$remoteEp)
+						if ($response.Length -gt 0) {
+							$Status = "Up"
+							$DetectionMethod = "NetBIOS"
+						}
+						$udp.Close()
+					}
+					catch { }
+					finally {
+						if ($udp) { $udp.Dispose() }
+					}
 				}
 			}
 
@@ -982,7 +1123,7 @@ Function Invoke-IPv4NetworkScan {
 			# +++ Get MAC-Address +++
 			$MAC = [String]::Empty
 
-			if (($EnableMACResolving) -and (($Status -eq "Up") -or ($IncludeInactive))) {
+			if ((-not $DisableMACResolving) -and (($Status -eq "Up") -or ($IncludeInactive))) {
 				$Arp_Result = (arp -a).ToUpper().Trim()
 
 				foreach ($Line in $Arp_Result) {
@@ -1009,17 +1150,49 @@ Function Invoke-IPv4NetworkScan {
 			# +++ Result +++
 			if (($Status -eq "Up") -or ($IncludeInactive)) {
 				[pscustomobject] @{
-					IPv4Address  = $IPv4Address
-					Status       = $Status
-					Hostname     = $Hostname
-					MAC          = $MAC
-					BufferSize   = $BufferSize
-					ResponseTime = $ResponseTime
-					TTL          = $TTL
+					IPv4Address     = $IPv4Address
+					Status          = $Status
+					DetectionMethod = $DetectionMethod
+					Hostname        = $Hostname
+					MAC             = $MAC
+					BufferSize      = $BufferSize
+					ResponseTime    = $ResponseTime
+					TTL             = $TTL
 				}
 			}
 			else {
 				$null
+			}
+		}
+
+		# Compile SendARP P/Invoke for hidden device detection (loaded into AppDomain, visible to all runspaces)
+		if ($DetectHiddenDevices) {
+			Write-Warning "DetectHiddenDevices is enabled - devices that block ICMP will be probed using ARP, TCP, and NetBIOS. This may significantly increase scan time."
+
+			if (-not ([System.Management.Automation.PSTypeName]'Win32.Network').Type) {
+				Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Runtime.InteropServices;
+
+namespace Win32 {
+    public static class Network {
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        public static extern int SendARP(uint DestIP, uint SrcIP, byte[] macAddr, ref int macAddrLen);
+
+        public static string GetMAC(string ipAddress) {
+            try {
+                uint ip = BitConverter.ToUInt32(IPAddress.Parse(ipAddress).GetAddressBytes(), 0);
+                byte[] mac = new byte[6];
+                int macLen = mac.Length;
+                if (SendARP(ip, 0, mac, ref macLen) == 0)
+                    return BitConverter.ToString(mac, 0, macLen);
+            } catch { }
+            return null;
+        }
+    }
+}
+'@ -ErrorAction SilentlyContinue
 			}
 		}
 
@@ -1028,9 +1201,38 @@ Function Invoke-IPv4NetworkScan {
 		$RunspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $Threads, $Host)
 		$RunspacePool.Open()
 
-		# Pre-create reusable DefaultDisplayPropertySet for result formatting
-		$DefaultDisplaySet = [System.Management.Automation.PSPropertySet]::new('DefaultDisplayPropertySet', [string[]]$PropertiesToDisplay)
-		$PSStandardMembers = [System.Management.Automation.PSMemberInfo[]]@($DefaultDisplaySet)
+		# Register table format view so results always display as a table regardless of property count
+		$HeaderXml = ($PropertiesToDisplay | ForEach-Object { "<TableColumnHeader><Label>$_</Label></TableColumnHeader>" }) -join "`n                        "
+		$ColumnXml = ($PropertiesToDisplay | ForEach-Object { "<TableColumnItem><PropertyName>$_</PropertyName></TableColumnItem>" }) -join "`n                                "
+		$FormatXml = @"
+<?xml version="1.0" encoding="utf-8" ?>
+<Configuration>
+    <ViewDefinitions>
+        <View>
+            <Name>IPv4NetworkScan.Result</Name>
+            <ViewSelectedBy>
+                <TypeName>IPv4NetworkScan.Result</TypeName>
+            </ViewSelectedBy>
+            <TableControl>
+                <AutoSize/>
+                <TableHeaders>
+                    $HeaderXml
+                </TableHeaders>
+                <TableRowEntries>
+                    <TableRowEntry>
+                        <TableColumnItems>
+                            $ColumnXml
+                        </TableColumnItems>
+                    </TableRowEntry>
+                </TableRowEntries>
+            </TableControl>
+        </View>
+    </ViewDefinitions>
+</Configuration>
+"@
+		$FormatFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "IPv4NetworkScan.format.ps1xml")
+		$FormatXml | Out-File -FilePath $FormatFile -Encoding UTF8
+		Update-FormatData -PrependPath $FormatFile
 
 		# Scan each network
 		foreach ($NetworkToScan in $NetworksToScan) {
@@ -1071,9 +1273,10 @@ Function Invoke-IPv4NetworkScan {
 					IPv4Address          = $IPv4Address
 					Tries                = $Tries
 					DisableDNSResolving  = $DisableDNSResolving
-					EnableMACResolving   = $EnableMACResolving
+					DisableMACResolving  = $DisableMACResolving
 					ExtendedInformations = $ExtendedInformations
 					IncludeInactive      = $IncludeInactive
+					DetectHiddenDevices  = $DetectHiddenDevices
 				}
 
 				# Catch when trying to divide through zero
@@ -1104,6 +1307,7 @@ Function Invoke-IPv4NetworkScan {
 
 			# Total jobs to calculate percent complete, because jobs are removed after they are processed
 			$Jobs_Total = $Jobs.Count
+			[System.Collections.ArrayList]$NetworkResults = @()
 
 			# Process results, while waiting for other jobs
 			Do {
@@ -1156,30 +1360,33 @@ Function Invoke-IPv4NetworkScan {
 							}
 
 							$Result = [pscustomobject] @{
-								IPv4Address  = $Job_Result.IPv4Address
-								Status       = $Job_Result.Status
-								Hostname     = $Job_Result.Hostname
-								MAC          = $Job_Result.MAC
-								Vendor       = $Vendor
-								BufferSize   = $Job_Result.BufferSize
-								ResponseTime = $Job_Result.ResponseTime
-								TTL          = $Job_Result.TTL
+								IPv4Address     = $Job_Result.IPv4Address
+								Status          = $Job_Result.Status
+								DetectionMethod = $Job_Result.DetectionMethod
+								Hostname        = $Job_Result.Hostname
+								MAC             = $Job_Result.MAC
+								Vendor          = $Vendor
+								BufferSize      = $Job_Result.BufferSize
+								ResponseTime    = $Job_Result.ResponseTime
+								TTL             = $Job_Result.TTL
 							} | Select-Object -Property $PropertiesToDisplay
 						}
 						else {
 							$Result = $Job_Result | Select-Object -Property $PropertiesToDisplay
 						}
 
-						# Add custom type and DefaultDisplayPropertySet for table formatting
+						# Tag with custom type so the registered format view forces table output
 						$Result.PSObject.TypeNames.Insert(0, 'IPv4NetworkScan.Result')
-						$Result | Add-Member -MemberType MemberSet -Name PSStandardMembers -Value $PSStandardMembers
 
-						# Emit result to pipeline
-						$Result
+						# Collect result for sorting
+						[void]$NetworkResults.Add($Result)
 					}
 				}
 
 			} While ($Jobs.Count -gt 0)
+
+			# Emit results sorted by IPv4 address
+			$NetworkResults | Sort-Object -Property { (Convert-IPv4Address -IPv4Address $_.IPv4Address).Int64 }
 		}
 
 		Write-Verbose -Message "Closing RunspacePool and free resources..."

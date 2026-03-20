@@ -33,35 +33,95 @@ Function Restart-ComputerSafely {
     $Volume = Get-BitLockerVolume -MountPoint C:
     
     if ($Volume.ProtectionStatus -eq 'On') {
-        Write-Host "BitLocker is enabled. Suspending for 5 reboots..."
-        
-        # Suspend BitLocker
-        Suspend-BitLocker -MountPoint C: -RebootCount 5
-        
+        Write-Host "BitLocker is enabled. Suspending for 1 reboot..."
+
+        # Suspend BitLocker for 1 reboot only - the scheduled task will re-suspend if updates need more reboots
+        Suspend-BitLocker -MountPoint C: -RebootCount 1
+
         # Log the suspension
         New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerSuspendedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
-        
-        # Create the resume BitLocker script
+
+        # Create the resume BitLocker script that checks for pending updates before resuming
         $ResumeScript = @'
-Start-Sleep -Seconds 30
+Start-Sleep -Seconds 60
+$LogPath = "$env:ProgramData\MauleTech\ResumeBitLocker.log"
+
+function Write-Log {
+    param([string]$Message)
+    $Entry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    Add-Content -Path $LogPath -Value $Entry
+}
+
+Write-Log "ResumeBitLocker task started"
+
+# Check if a reboot is still pending for Windows Update
+$PendingReboot = $false
+
+# Check Component-Based Servicing
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+    $PendingReboot = $true
+    Write-Log "Pending reboot detected: Component Based Servicing"
+}
+
+# Check Windows Update
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+    $PendingReboot = $true
+    Write-Log "Pending reboot detected: Windows Update"
+}
+
+# Check PendingFileRenameOperations
+$PFROValue = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+if ($PFROValue) {
+    $PendingReboot = $true
+    Write-Log "Pending reboot detected: PendingFileRenameOperations"
+}
+
 $Volume = Get-BitLockerVolume -MountPoint C:
-if ($Volume.ProtectionStatus -eq 'Off') {
-    Resume-BitLocker -MountPoint C:
-    New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
-    Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerResumedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
+
+if ($PendingReboot) {
+    Write-Log "System still has pending reboots. Re-suspending BitLocker for 1 more reboot."
+    if ($Volume.ProtectionStatus -eq 'On') {
+        Suspend-BitLocker -MountPoint C: -RebootCount 1
+        Write-Log "BitLocker re-suspended for 1 reboot."
+    } else {
+        Write-Log "BitLocker already suspended, no action needed."
+    }
+} else {
+    Write-Log "No pending reboots detected. Resuming BitLocker."
+    if ($Volume.ProtectionStatus -eq 'Off') {
+        Resume-BitLocker -MountPoint C:
+        New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerResumedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
+        Write-Log "BitLocker resumed successfully."
+    } else {
+        Write-Log "BitLocker already enabled, no action needed."
+    }
+    # Clean up: remove the scheduled task now that BitLocker is back on
+    Unregister-ScheduledTask -TaskName 'MauleTech-ResumeBitLocker' -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Log "Scheduled task removed. Cleanup complete."
 }
 '@
-        
+
         # Save the resume script
         $ScriptPath = "$env:ProgramData\MauleTech\ResumeBitLocker.ps1"
         New-Item -Path "$env:ProgramData\MauleTech" -ItemType Directory -Force | Out-Null
         $ResumeScript | Out-File -FilePath $ScriptPath -Encoding ASCII -Force
-        
-        # Set RunOnce to resume BitLocker after reboot
-        Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ResumeBitLocker' -Value "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $ScriptPath" -Force
-        
-        Write-Host "BitLocker suspended. Will resume automatically after reboot."
+
+        # Remove any existing RunOnce entry from previous versions
+        Remove-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ResumeBitLocker' -ErrorAction SilentlyContinue
+
+        # Create a scheduled task that runs at startup (before logon) to check and resume BitLocker
+        $TaskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`""
+        $TaskTrigger = New-ScheduledTaskTrigger -AtStartup
+        $TaskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+        $TaskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+        # Remove existing task if present, then register
+        Unregister-ScheduledTask -TaskName 'MauleTech-ResumeBitLocker' -Confirm:$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask -TaskName 'MauleTech-ResumeBitLocker' -Action $TaskAction -Trigger $TaskTrigger -Principal $TaskPrincipal -Settings $TaskSettings -Description 'Resumes BitLocker after safe restart once all pending reboots are complete' -Force
+
+        Write-Host "BitLocker suspended. Scheduled task created to resume after all reboots complete."
     } else {
         Write-Host "BitLocker is not enabled or already suspended."
     }

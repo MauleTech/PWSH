@@ -32,84 +32,129 @@ Function Restart-ComputerSafely {
     # Check if BitLocker is enabled
     $Volume = Get-BitLockerVolume -MountPoint C:
     
+    # Remove any stale RunOnce entry from previous versions of this function
+    Remove-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ResumeBitLocker' -ErrorAction SilentlyContinue
+
     if ($Volume.ProtectionStatus -eq 'On') {
         Write-Host "BitLocker is enabled. Suspending for 1 reboot..."
 
         # Suspend BitLocker for 1 reboot only - the scheduled task will re-suspend if updates need more reboots
-        Suspend-BitLocker -MountPoint C: -RebootCount 1
+        try {
+            Suspend-BitLocker -MountPoint C: -RebootCount 1 -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to suspend BitLocker: $_"
+            Write-Warning "Aborting restart to avoid BitLocker recovery prompt."
+            return
+        }
 
         # Log the suspension
         New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerSuspendedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
 
+        # Resolve log path now so the scheduled task doesn't depend on $ITFolder at runtime
+        if ($ITFolder) {
+            $LogFolder = "$ITFolder\Logs"
+        } else {
+            $LogFolder = "$env:SystemDrive\IT\Logs"
+        }
+        $ScriptPath = "$env:ProgramData\MauleTech\ResumeBitLocker.ps1"
+
         # Create the resume BitLocker script that checks for pending updates before resuming
-        $ResumeScript = @'
+        $ResumeScript = @"
 Start-Sleep -Seconds 60
-$LogPath = "$env:ProgramData\MauleTech\ResumeBitLocker.log"
+`$LogPath = "$LogFolder\ResumeBitLocker.log"
+`$ScriptPath = "$ScriptPath"
+`$MaxResuspensions = 10
+
+New-Item -Path (Split-Path `$LogPath) -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
 
 function Write-Log {
-    param([string]$Message)
-    $Entry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
-    Add-Content -Path $LogPath -Value $Entry
+    param([string]`$Message)
+    `$Entry = "`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - `$Message"
+    Add-Content -Path `$LogPath -Value `$Entry
 }
+
+try {
 
 Write-Log "ResumeBitLocker task started"
 
+# Track re-suspension count in the registry to prevent infinite loops
+`$RegPath = 'HKLM:\SOFTWARE\MauleTech'
+`$CountValue = (Get-ItemProperty -Path `$RegPath -Name 'BitLockerResuspendCount' -ErrorAction SilentlyContinue).BitLockerResuspendCount
+if (-not `$CountValue) { `$CountValue = 0 }
+
 # Check if a reboot is still pending for Windows Update
-$PendingReboot = $false
+`$PendingReboot = `$false
 
 # Check Component-Based Servicing
 if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
-    $PendingReboot = $true
+    `$PendingReboot = `$true
     Write-Log "Pending reboot detected: Component Based Servicing"
 }
 
 # Check Windows Update
-if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
-    $PendingReboot = $true
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Windows Update\Auto Update\RebootRequired') {
+    `$PendingReboot = `$true
     Write-Log "Pending reboot detected: Windows Update"
 }
 
-# Check PendingFileRenameOperations
-$PFROValue = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-if ($PFROValue) {
-    $PendingReboot = $true
-    Write-Log "Pending reboot detected: PendingFileRenameOperations"
+# Check Windows Update Orchestrator (modern Windows 10/11)
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\RebootRequired') {
+    `$PendingReboot = `$true
+    Write-Log "Pending reboot detected: Windows Update Orchestrator"
 }
 
-$Volume = Get-BitLockerVolume -MountPoint C:
+`$Volume = Get-BitLockerVolume -MountPoint C: -ErrorAction Stop
 
-if ($PendingReboot) {
-    Write-Log "System still has pending reboots. Re-suspending BitLocker for 1 more reboot."
-    if ($Volume.ProtectionStatus -eq 'On') {
-        Suspend-BitLocker -MountPoint C: -RebootCount 1
+if (`$PendingReboot -and `$CountValue -lt `$MaxResuspensions) {
+    Write-Log "System still has pending reboots (resuspension `$CountValue of `$MaxResuspensions). Re-suspending BitLocker for 1 more reboot."
+    if (`$Volume.ProtectionStatus -eq 'On') {
+        Suspend-BitLocker -MountPoint C: -RebootCount 1 -ErrorAction Stop
         Write-Log "BitLocker re-suspended for 1 reboot."
     } else {
         Write-Log "BitLocker already suspended, no action needed."
     }
+    Set-ItemProperty -Path `$RegPath -Name 'BitLockerResuspendCount' -Value (`$CountValue + 1) -Force
 } else {
-    Write-Log "No pending reboots detected. Resuming BitLocker."
-    if ($Volume.ProtectionStatus -eq 'Off') {
-        Resume-BitLocker -MountPoint C:
+    if (`$CountValue -ge `$MaxResuspensions) {
+        Write-Log "WARNING: Max re-suspension count (`$MaxResuspensions) reached. Resuming BitLocker regardless of pending reboots."
+    }
+    Write-Log "Resuming BitLocker."
+    if (`$Volume.ProtectionStatus -eq 'Off') {
+        Resume-BitLocker -MountPoint C: -ErrorAction Stop
         New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerResumedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
         Write-Log "BitLocker resumed successfully."
     } else {
         Write-Log "BitLocker already enabled, no action needed."
     }
-    # Clean up: remove the scheduled task now that BitLocker is back on
-    Unregister-ScheduledTask -TaskName 'MauleTech-ResumeBitLocker' -Confirm:$false -ErrorAction SilentlyContinue
-    Write-Log "Scheduled task removed. Cleanup complete."
+    # Clean up: remove the scheduled task, script file, and counter
+    Unregister-ScheduledTask -TaskName 'MauleTech-ResumeBitLocker' -Confirm:`$false -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path `$RegPath -Name 'BitLockerResuspendCount' -ErrorAction SilentlyContinue
+    Remove-Item -Path `$ScriptPath -Force -ErrorAction SilentlyContinue
+    Write-Log "Scheduled task and script removed. Cleanup complete."
 }
-'@
+
+} catch {
+    Write-Log "ERROR: `$_"
+    Write-Log "BitLocker state may require manual attention."
+}
+"@
 
         # Save the resume script
-        $ScriptPath = "$env:ProgramData\MauleTech\ResumeBitLocker.ps1"
         New-Item -Path "$env:ProgramData\MauleTech" -ItemType Directory -Force | Out-Null
-        $ResumeScript | Out-File -FilePath $ScriptPath -Encoding ASCII -Force
+        $ResumeScript | Out-File -FilePath $ScriptPath -Encoding UTF8 -Force
 
-        # Remove any existing RunOnce entry from previous versions
-        Remove-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ResumeBitLocker' -ErrorAction SilentlyContinue
+        # Lock down the script directory so only Administrators and SYSTEM can write
+        $Acl = Get-Acl "$env:ProgramData\MauleTech"
+        $Acl.SetAccessRuleProtection($true, $false)
+        $AdminRule = New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $SystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $ReadRule = New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Users', 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $Acl.AddAccessRule($AdminRule)
+        $Acl.AddAccessRule($SystemRule)
+        $Acl.AddAccessRule($ReadRule)
+        Set-Acl "$env:ProgramData\MauleTech" $Acl
 
         # Create a scheduled task that runs at startup (before logon) to check and resume BitLocker
         $TaskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`""

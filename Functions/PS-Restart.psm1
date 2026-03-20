@@ -53,8 +53,9 @@ Function Restart-ComputerSafely {
             return
         }
 
+        try {
         # Log the suspension and reset the re-suspension counter for this new cycle
-        New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force | Out-Null
+        New-Item -Path 'HKLM:\SOFTWARE\MauleTech' -Force -ErrorAction Stop | Out-Null
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerSuspendedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerResuspendCount' -Value 0 -Force
 
@@ -78,7 +79,7 @@ New-Item -Path (Split-Path `$LogPath) -ItemType Directory -Force -ErrorAction Si
 function Write-Log {
     param([string]`$Message)
     `$Entry = "`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - `$Message"
-    Add-Content -Path `$LogPath -Value `$Entry
+    Add-Content -Path `$LogPath -Value `$Entry -ErrorAction SilentlyContinue
 }
 
 Write-Log "ResumeBitLocker task started. Waiting 60 seconds for services to stabilize..."
@@ -164,6 +165,9 @@ if (`$PendingReboot -and `$CountValue -lt `$MaxResuspensions) {
         New-Item -Path $ScriptDir -ItemType Directory -Force | Out-Null
         $Acl = Get-Acl $ScriptDir
         $Acl.SetAccessRuleProtection($true, $false)
+        # Purge any existing explicit ACEs so stale permissive rules don't survive
+        foreach ($Rule in @($Acl.Access)) { $Acl.RemoveAccessRule($Rule) | Out-Null }
+        $Acl.SetOwner([System.Security.Principal.NTAccount]'BUILTIN\Administrators')
         $AdminRule = New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
         $SystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
         $ReadRule = New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Users', 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
@@ -181,16 +185,22 @@ if (`$PendingReboot -and `$CountValue -lt `$MaxResuspensions) {
         $TaskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
         $TaskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 
-        try {
-            Register-ScheduledTask -TaskName 'MauleTech-ResumeBitLocker' -Action $TaskAction -Trigger $TaskTrigger -Principal $TaskPrincipal -Settings $TaskSettings -Description 'Resumes BitLocker after safe restart once all pending reboots are complete' -Force -ErrorAction Stop | Out-Null
-        } catch {
-            Write-Warning "Failed to register scheduled task: $_"
-            Write-Warning "Rolling back BitLocker suspension and aborting restart."
-            Resume-BitLocker -MountPoint C: -ErrorAction SilentlyContinue
-            return
-        }
+        Register-ScheduledTask -TaskName 'MauleTech-ResumeBitLocker' -Action $TaskAction -Trigger $TaskTrigger -Principal $TaskPrincipal -Settings $TaskSettings -Description 'Resumes BitLocker after safe restart once all pending reboots are complete' -Force -ErrorAction Stop | Out-Null
 
         Write-Host "BitLocker suspended. Scheduled task created to resume after all reboots complete."
+
+        } catch {
+            # Any failure after Suspend-BitLocker (registry, ACL, script write, task registration) — roll back
+            Write-Warning "Failed to set up BitLocker resume task: $_"
+            Write-Warning "Rolling back BitLocker suspension and aborting restart."
+            try {
+                Resume-BitLocker -MountPoint C: -ErrorAction Stop
+            } catch {
+                Write-Warning "CRITICAL: Failed to roll back BitLocker suspension: $_"
+                Write-Warning "BitLocker is suspended with no resume task. Run 'Resume-BitLocker -MountPoint C:' manually."
+            }
+            return
+        }
     } elseif ($Volume) {
         Write-Host "BitLocker is not enabled or already suspended."
     }
@@ -198,11 +208,11 @@ if (`$PendingReboot -and `$CountValue -lt `$MaxResuspensions) {
     # Send notification to users if there's a delay
     if ($Delay -gt 0) {
         $Message = "SYSTEM RESTART: This computer will restart in $Delay seconds. Please save your work immediately."
-        msg * $Message 2>$null
-        if ($LASTEXITCODE -eq 0) {
+        if (Get-Command msg -ErrorAction SilentlyContinue) {
+            msg * $Message 2>$null
             Write-Host "User notification sent."
         } else {
-            Write-Host "Could not send user notification (msg.exe returned $LASTEXITCODE or is unavailable)."
+            Write-Host "msg.exe not available on this system. User notification skipped."
         }
 
         Write-Host "Restarting in $Delay seconds..."

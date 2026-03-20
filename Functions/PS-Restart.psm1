@@ -59,13 +59,14 @@ Function Restart-ComputerSafely {
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerSuspendedDate' -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force -ErrorAction Stop
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\MauleTech' -Name 'BitLockerResuspendCount' -Value 0 -Force -ErrorAction Stop
 
-        # Resolve log path now so the scheduled task doesn't depend on $ITFolder at runtime
+        # Resolve paths now so the scheduled task doesn't depend on $ITFolder at runtime
         if ($ITFolder) {
-            $LogFolder = "$ITFolder\Logs"
+            $ResolvedITFolder = $ITFolder
         } else {
-            $LogFolder = "$env:SystemDrive\IT\Logs"
+            $ResolvedITFolder = "$env:SystemDrive\IT"
         }
-        $ScriptPath = "$env:ProgramData\MauleTech\ResumeBitLocker.ps1"
+        $LogFolder = "$ResolvedITFolder\Logs"
+        $ScriptPath = "$ResolvedITFolder\Scripts\ResumeBitLocker.ps1"
 
         # Create the resume BitLocker script that checks for pending updates before resuming
         $ResumeScript = @"
@@ -160,36 +161,8 @@ if (`$PendingReboot -and `$CountValue -lt `$MaxResuspensions) {
 }
 "@
 
-        # Prepare the script directory with locked-down ACLs BEFORE writing the script
-        $ScriptDir = "$env:ProgramData\MauleTech"
-        New-Item -Path $ScriptDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        $Acl = Get-Acl $ScriptDir -ErrorAction Stop
-        $Acl.SetAccessRuleProtection($true, $false)
-        # Purge all existing ACEs so stale permissive rules don't survive
-        # PurgeAccessRules removes all explicit ACEs for each identity cleanly
-        foreach ($Identity in @($Acl.Access | Select-Object -ExpandProperty IdentityReference -Unique)) {
-            $Acl.PurgeAccessRules($Identity)
-        }
-        # Ensure ownership is trusted (Administrators or SYSTEM) to prevent DACL rewrite attacks
-        # Compare by SID to avoid localization issues with display names
-        $OwnerSid = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-        # S-1-5-32-544 = BUILTIN\Administrators, S-1-5-18 = NT AUTHORITY\SYSTEM
-        if ($OwnerSid -notin @('S-1-5-32-544', 'S-1-5-18')) {
-            $Acl.SetOwner([System.Security.Principal.SecurityIdentifier]'S-1-5-32-544')
-        }
-        # Use well-known SIDs instead of localized display names for non-English Windows compatibility
-        $AdminSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')   # BUILTIN\Administrators
-        $SystemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')       # NT AUTHORITY\SYSTEM
-        $UsersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')    # BUILTIN\Users
-        $AdminRule = New-Object System.Security.AccessControl.FileSystemAccessRule($AdminSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $SystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule($SystemSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $ReadRule = New-Object System.Security.AccessControl.FileSystemAccessRule($UsersSid, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $Acl.AddAccessRule($AdminRule)
-        $Acl.AddAccessRule($SystemRule)
-        $Acl.AddAccessRule($ReadRule)
-        Set-Acl $ScriptDir $Acl -ErrorAction Stop
-
-        # Now write the script (it inherits the locked-down ACL from the directory)
+        # Write the resume script to $ITFolder\Scripts (inherits IT folder permissions)
+        New-Item -Path (Split-Path $ScriptPath) -ItemType Directory -Force -ErrorAction Stop | Out-Null
         $ResumeScript | Out-File -FilePath $ScriptPath -Encoding UTF8 -Force -ErrorAction Stop
 
         # Create a scheduled task that runs at startup (before logon) to check and resume BitLocker

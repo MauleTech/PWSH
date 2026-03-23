@@ -294,6 +294,157 @@ Function Start-ServerMaintenance {
 	}
 }
 
+Function Start-PSTaskManager {
+<#
+	.SYNOPSIS
+		Installs and launches pstop, a terminal-based task manager for Windows.
+	.DESCRIPTION
+		Checks if pstop is already installed and runs it. If not installed, attempts
+		installation via winget, Start-PSWinGet (for SYSTEM context), Chocolatey, or
+		direct download from GitHub releases as a fallback.
+
+		WARNING: This function downloads and runs third-party software (pstop by psmux).
+		Only run this if you trust the source. Use -Force to skip the disclaimer prompt.
+	.PARAMETER Force
+		Bypasses the disclaimer prompt and proceeds with install/run automatically.
+	.LINK
+		https://github.com/psmux/pstop
+	.EXAMPLE
+		Start-PSTaskManager
+		Prompts for confirmation, then installs (if needed) and launches pstop.
+	.EXAMPLE
+		Start-PSTaskManager -Force
+		Skips the disclaimer and installs/runs pstop immediately.
+#>
+	param (
+		[Switch] $Force
+	)
+
+	# --- Disclaimer ---
+	If (-not $Force) {
+		Write-Host ""
+		Write-Host "  DISCLAIMER: pstop is third-party software not maintained by MauleTech." -ForegroundColor Yellow
+		Write-Host "  Source: https://github.com/psmux/pstop" -ForegroundColor Yellow
+		Write-Host "  Only proceed if you trust this software and its source." -ForegroundColor Yellow
+		Write-Host ""
+		$Confirm = Read-Host "  Type 'yes' to continue, or press Enter to cancel"
+		If ($Confirm -ne 'yes') {
+			Write-Host "Cancelled." -ForegroundColor Gray
+			Return
+		}
+	}
+
+	# --- Check if already installed ---
+	$PstopCmd = Get-Command pstop -ErrorAction SilentlyContinue
+	If ($PstopCmd) {
+		Write-Host "[OK] pstop found at $($PstopCmd.Source). Launching..." -ForegroundColor Green
+		& pstop
+		Return
+	}
+
+	# Check for pstop in $ITFolder\Downloads (manual/zip installs)
+	If ($ITFolder -and (Test-Path "$ITFolder\Downloads\pstop\pstop.exe")) {
+		Write-Host "[OK] pstop found in ITFolder. Launching..." -ForegroundColor Green
+		& "$ITFolder\Downloads\pstop\pstop.exe"
+		Return
+	}
+
+	Write-Host "pstop not found. Attempting installation..." -ForegroundColor Cyan
+
+	# Reused launch logic — avoids duplicating the PATH-vs-ITFolder decision
+	$LaunchPstop = {
+		$Cmd = Get-Command pstop -ErrorAction SilentlyContinue
+		If ($Cmd) {
+			Write-Host "[OK] Launching pstop..." -ForegroundColor Green
+			& pstop
+		} ElseIf ($ITFolder -and (Test-Path "$ITFolder\Downloads\pstop\pstop.exe")) {
+			Write-Host "[OK] Launching pstop from ITFolder..." -ForegroundColor Green
+			& "$ITFolder\Downloads\pstop\pstop.exe"
+		} Else {
+			Write-Warning "Installation reported success but pstop.exe could not be located. Check your PATH or $ITFolder\Downloads\pstop."
+		}
+	}
+
+	$Installed    = $false
+	$IsSystem     = $(whoami) -eq "nt authority\system"
+	$WingetAvail  = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+
+	If (-not $IsSystem -and $WingetAvail) {
+		Write-Host "[1/4] Trying winget..." -ForegroundColor Cyan
+		Try {
+			winget install --id marlocarlo.pstop -e -h --accept-package-agreements --accept-source-agreements
+			If (Get-Command pstop -ErrorAction SilentlyContinue) { $Installed = $true }
+		} Catch {
+			Write-Warning "winget install failed: $_"
+		}
+	}
+
+	If (-not $Installed -and ($IsSystem -or -not $WingetAvail)) {
+		Write-Host "[2/4] Running as SYSTEM or winget unavailable. Trying Start-PSWinGet..." -ForegroundColor Cyan
+		Try {
+			Start-PSWinGet -Command 'Install-WinGetPackage "marlocarlo.pstop"'
+			If (Get-Command pstop -ErrorAction SilentlyContinue) { $Installed = $true }
+			If ($ITFolder -and (Test-Path "$ITFolder\Downloads\pstop\pstop.exe")) { $Installed = $true }
+		} Catch {
+			Write-Warning "Start-PSWinGet failed: $_"
+		}
+	}
+
+	If (-not $Installed) {
+		Write-Host "[3/4] Trying Chocolatey..." -ForegroundColor Cyan
+		Try {
+			If (-not (Get-Command choco -ErrorAction SilentlyContinue)) { Install-Choco }
+			choco install pstop -y
+			If (Get-Command pstop -ErrorAction SilentlyContinue) { $Installed = $true }
+		} Catch {
+			Write-Warning "Chocolatey install failed: $_"
+		}
+	}
+
+	If (-not $Installed) {
+		Write-Host "[4/4] Falling back to direct GitHub download..." -ForegroundColor Cyan
+		Try {
+			$Release  = Invoke-RestMethod -Uri "https://api.github.com/repos/psmux/pstop/releases/latest" -UseBasicParsing
+			$ZipAsset = $Release.assets | Where-Object { $_.name -like "*windows*x86_64*.zip" -or $_.name -like "*win*.zip" } | Select-Object -First 1
+			If (-not $ZipAsset) {
+				$ZipAsset = $Release.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
+			}
+
+			If (-not $ZipAsset) {
+				Write-Error "Could not find a zip asset in the latest pstop release. Please install manually: https://github.com/psmux/pstop/releases"
+				Return
+			}
+
+			$DestFolder = "$ITFolder\Downloads\pstop"
+			$ZipPath    = "$DestFolder\pstop.zip"
+
+			New-Item -ItemType Directory -Force -Path $DestFolder | Out-Null
+
+			Write-Host "  Downloading $($ZipAsset.name) from GitHub..." -ForegroundColor Gray
+			Invoke-WebRequest -Uri $ZipAsset.browser_download_url -OutFile $ZipPath -UseBasicParsing
+
+			Expand-Archive -Path $ZipPath -DestinationPath $DestFolder -Force
+			Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
+
+			$PstopExe = Get-ChildItem -Path $DestFolder -Recurse -Filter "pstop.exe" | Select-Object -First 1
+			If ($PstopExe) {
+				If ($PstopExe.DirectoryName -ne $DestFolder) {
+					Move-Item -Path $PstopExe.FullName -Destination "$DestFolder\pstop.exe" -Force
+				}
+				$Installed = $true
+			} Else {
+				Write-Error "pstop.exe not found after extraction. Check $DestFolder manually."
+				Return
+			}
+		} Catch {
+			Write-Error "Direct download failed: $_"
+			Return
+		}
+	}
+
+	If ($Installed) { & $LaunchPstop }
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

@@ -351,10 +351,25 @@ Function Start-PSTaskManager {
 
 	Write-Host "pstop not found. Attempting installation..." -ForegroundColor Cyan
 
-	$Installed = $false
+	# Reused launch logic — avoids duplicating the PATH-vs-ITFolder decision
+	$LaunchPstop = {
+		$Cmd = Get-Command pstop -ErrorAction SilentlyContinue
+		If ($Cmd) {
+			Write-Host "[OK] Launching pstop..." -ForegroundColor Green
+			& pstop
+		} ElseIf ($ITFolder -and (Test-Path "$ITFolder\Downloads\pstop\pstop.exe")) {
+			Write-Host "[OK] Launching pstop from ITFolder..." -ForegroundColor Green
+			& "$ITFolder\Downloads\pstop\pstop.exe"
+		} Else {
+			Write-Warning "Installation reported success but pstop.exe could not be located. Check your PATH or $ITFolder\Downloads\pstop."
+		}
+	}
 
-	# --- Method 1: winget (interactive user session) ---
-	If (-not $Installed -and $(whoami) -ne "nt authority\system" -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+	$Installed    = $false
+	$IsSystem     = $(whoami) -eq "nt authority\system"
+	$WingetAvail  = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+
+	If (-not $IsSystem -and $WingetAvail) {
 		Write-Host "[1/4] Trying winget..." -ForegroundColor Cyan
 		Try {
 			winget install --id marlocarlo.pstop -e -h --accept-package-agreements --accept-source-agreements
@@ -364,19 +379,17 @@ Function Start-PSTaskManager {
 		}
 	}
 
-	# --- Method 2: Start-PSWinGet (SYSTEM context or winget unavailable) ---
-	If (-not $Installed -and ($(whoami) -eq "nt authority\system" -or -not (Get-Command winget -ErrorAction SilentlyContinue))) {
+	If (-not $Installed -and ($IsSystem -or -not $WingetAvail)) {
 		Write-Host "[2/4] Running as SYSTEM or winget unavailable. Trying Start-PSWinGet..." -ForegroundColor Cyan
 		Try {
 			Start-PSWinGet -Command 'Install-WinGetPackage "marlocarlo.pstop"'
 			If (Get-Command pstop -ErrorAction SilentlyContinue) { $Installed = $true }
-			If (Test-Path "$ITFolder\Downloads\pstop\pstop.exe") { $Installed = $true }
+			If ($ITFolder -and (Test-Path "$ITFolder\Downloads\pstop\pstop.exe")) { $Installed = $true }
 		} Catch {
 			Write-Warning "Start-PSWinGet failed: $_"
 		}
 	}
 
-	# --- Method 3: Chocolatey ---
 	If (-not $Installed) {
 		Write-Host "[3/4] Trying Chocolatey..." -ForegroundColor Cyan
 		Try {
@@ -388,40 +401,33 @@ Function Start-PSTaskManager {
 		}
 	}
 
-	# --- Method 4: Direct GitHub release download ---
 	If (-not $Installed) {
 		Write-Host "[4/4] Falling back to direct GitHub download..." -ForegroundColor Cyan
 		Try {
-			$ReleasesUrl = "https://api.github.com/repos/psmux/pstop/releases/latest"
-			$Release = Invoke-RestMethod -Uri $ReleasesUrl -UseBasicParsing
-			$ZipAsset = $Release.assets | Where-Object { $_.name -like "*windows*x86_64*.zip" -or $_.name -like "*win*.zip" } | Select-Object -First 1
-
-			If (-not $ZipAsset) {
-				# Fallback: grab the first zip
-				$ZipAsset = $Release.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
-			}
+			$Release  = Invoke-RestMethod -Uri "https://api.github.com/repos/psmux/pstop/releases/latest" -UseBasicParsing
+			$ZipAsset = @(
+				$Release.assets | Where-Object { $_.name -like "*windows*x86_64*.zip" -or $_.name -like "*win*.zip" }
+				$Release.assets | Where-Object { $_.name -like "*.zip" }
+			) | Select-Object -First 1
 
 			If (-not $ZipAsset) {
 				Write-Error "Could not find a zip asset in the latest pstop release. Please install manually: https://github.com/psmux/pstop/releases"
 				Return
 			}
 
-			$DownloadUrl = $ZipAsset.browser_download_url
-			$DestFolder  = "$ITFolder\Downloads\pstop"
-			$ZipPath     = "$DestFolder\pstop.zip"
+			$DestFolder = "$ITFolder\Downloads\pstop"
+			$ZipPath    = "$DestFolder\pstop.zip"
 
-			If (-not (Test-Path $DestFolder)) { New-Item -ItemType Directory -Force -Path $DestFolder | Out-Null }
+			New-Item -ItemType Directory -Force -Path $DestFolder | Out-Null
 
 			Write-Host "  Downloading $($ZipAsset.name) from GitHub..." -ForegroundColor Gray
-			Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
+			Invoke-WebRequest -Uri $ZipAsset.browser_download_url -OutFile $ZipPath -UseBasicParsing
 
 			Expand-Archive -Path $ZipPath -DestinationPath $DestFolder -Force
 			Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
 
-			# Find the exe (may be nested in a subdirectory)
 			$PstopExe = Get-ChildItem -Path $DestFolder -Recurse -Filter "pstop.exe" | Select-Object -First 1
 			If ($PstopExe) {
-				# Move to root of DestFolder for consistency
 				If ($PstopExe.DirectoryName -ne $DestFolder) {
 					Move-Item -Path $PstopExe.FullName -Destination "$DestFolder\pstop.exe" -Force
 				}
@@ -436,19 +442,7 @@ Function Start-PSTaskManager {
 		}
 	}
 
-	# --- Launch ---
-	If ($Installed) {
-		$PstopCmd = Get-Command pstop -ErrorAction SilentlyContinue
-		If ($PstopCmd) {
-			Write-Host "[OK] Launching pstop..." -ForegroundColor Green
-			& pstop
-		} ElseIf (Test-Path "$ITFolder\Downloads\pstop\pstop.exe") {
-			Write-Host "[OK] Launching pstop from ITFolder..." -ForegroundColor Green
-			& "$ITFolder\Downloads\pstop\pstop.exe"
-		} Else {
-			Write-Warning "Installation reported success but pstop.exe could not be located. Check your PATH or $ITFolder\Downloads\pstop."
-		}
-	}
+	If ($Installed) { & $LaunchPstop }
 }
 
 # SIG # Begin signature block

@@ -405,10 +405,10 @@ Function Start-PSTaskManager {
 		Write-Host "[4/4] Falling back to direct GitHub download..." -ForegroundColor Cyan
 		Try {
 			$Release  = Invoke-RestMethod -Uri "https://api.github.com/repos/psmux/pstop/releases/latest" -UseBasicParsing
-			$ZipAsset = @(
-				$Release.assets | Where-Object { $_.name -like "*windows*x86_64*.zip" -or $_.name -like "*win*.zip" }
-				$Release.assets | Where-Object { $_.name -like "*.zip" }
-			) | Select-Object -First 1
+			$ZipAsset = $Release.assets | Where-Object { $_.name -like "*windows*x86_64*.zip" -or $_.name -like "*win*.zip" } | Select-Object -First 1
+			If (-not $ZipAsset) {
+				$ZipAsset = $Release.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
+			}
 
 			If (-not $ZipAsset) {
 				Write-Error "Could not find a zip asset in the latest pstop release. Please install manually: https://github.com/psmux/pstop/releases"

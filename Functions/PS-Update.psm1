@@ -1133,8 +1133,34 @@ Function Update-WindowsTo11 {
 	the Fido URL-generation step is skipped entirely and this URL is used instead.
 	Useful when auto-generation via Fido fails.
 
+	.PARAMETER ScheduleAt
+	Schedule the upgrade to run at a future date/time instead of immediately.
+	Accepts any valid [datetime] value. Creates a one-time Windows Scheduled Task
+	that runs as SYSTEM with highest privileges, surviving logoffs and reboots.
+	All other parameters (Force, ShowProgress, etc.) are forwarded to the scheduled run.
+
+	Examples:
+	  -ScheduleAt "11:00 PM"           # Tonight (or tomorrow if past 11pm)
+	  -ScheduleAt "3/28/2026 8:00 PM"  # Specific date and time
+
+	.PARAMETER ScheduledTaskName
+	Name for the scheduled task. Defaults to "MauleTech-UpdateWindowsTo11".
+	Use to customize the task name or avoid conflicts with existing tasks.
+
 	.PARAMETER NetworkPaths
 	Array of UNC paths to check for setup.exe in priority order.
+
+	.EXAMPLE
+	Update-WindowsTo11 -ScheduleAt "11:00 PM"
+	Schedule the upgrade for tonight at 11 PM (or tomorrow if 11 PM has passed).
+
+	.EXAMPLE
+	Update-WindowsTo11 -ScheduleAt "3/28/2026 8:00 PM" -ShowProgress
+	Schedule the upgrade for a specific date with visible progress UI.
+
+	.EXAMPLE
+	Update-WindowsTo11 -ScheduleAt "2:00 AM" -ScheduledTaskName "Win11-Upgrade-PC42"
+	Schedule with a custom task name for easier identification.
 
 	.NOTES
 	Requires: PowerShell as Administrator, Internet access or WSUS/network share.
@@ -1148,6 +1174,8 @@ Function Update-WindowsTo11 {
 		[switch]$DownloadOnly,
 		[switch]$ShowProgress,
 		[string]$DownloadUrl,
+		[datetime]$ScheduleAt,
+		[string]$ScheduledTaskName = "MauleTech-UpdateWindowsTo11",
 		[string[]]$NetworkPaths = @(
 			"\\zeus\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
 			"\\dc0\Win11_24H2$\setup.exe",
@@ -1570,6 +1598,70 @@ Function Update-WindowsTo11 {
 
 	if ($Force) {
 		Write-Log "Force specified -- skipping version check. Current: $osCaption (Build $buildNumber)" -Level "WARNING"
+	}
+	#endregion
+
+	#region Scheduled Execution
+	if ($PSBoundParameters.ContainsKey('ScheduleAt')) {
+		# Capture current time once to avoid TOCTOU issues at midnight
+		$now = Get-Date
+
+		# If only a time was given and it's already past, assume tomorrow
+		if ($ScheduleAt -le $now) {
+			if ($ScheduleAt.Date -eq $now.Date) {
+				$ScheduleAt = $ScheduleAt.AddDays(1)
+				Write-Log "Specified time already passed today -- scheduling for tomorrow: $($ScheduleAt.ToString('g'))" -Level "WARNING"
+			} else {
+				Write-Log "ScheduleAt value '$($ScheduleAt.ToString('g'))' is in the past." -Level "ERROR"
+				return
+			}
+		}
+
+		# Build forwarded parameters from $PSBoundParameters (escape single quotes for safety)
+		$ExcludeParams = @('ScheduleAt', 'ScheduledTaskName')
+		$ForwardedParams = @()
+		foreach ($key in $PSBoundParameters.Keys) {
+			if ($key -in $ExcludeParams) { continue }
+			$val = $PSBoundParameters[$key]
+			if ($val -is [bool]) {
+				if ($val) { $ForwardedParams += "-$key" }
+			} elseif ($val -is [array]) {
+				$escaped = ($val | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
+				$ForwardedParams += "-$key @($escaped)"
+			} else {
+				$escaped = "$val" -replace "'", "''"
+				$ForwardedParams += "-$key '$escaped'"
+			}
+		}
+		$ParamString = $ForwardedParams -join ' '
+
+		$TaskCommand = "irm ps.mauletech.com | iex; Update-WindowsTo11 $ParamString"
+
+		# Check for existing task with the same name
+		$existingTask = Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue
+		if ($existingTask) {
+			Write-Log "Scheduled task '$ScheduledTaskName' already exists -- replacing it." -Level "WARNING"
+			Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false -ErrorAction Stop
+		}
+
+		# Use -EncodedCommand to avoid all quoting/injection issues in the scheduled task
+		$encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($TaskCommand))
+		$Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
+		$Trigger = New-ScheduledTaskTrigger -Once -At $ScheduleAt
+		# 6-hour execution time limit as a safety cap; no trigger EndBoundary so the task starts even if delayed
+		$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+		$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+		try {
+			Register-ScheduledTask -TaskName $ScheduledTaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -ErrorAction Stop | Out-Null
+			Write-Log "Windows 11 upgrade scheduled for $($ScheduleAt.ToString('f'))" -Level "SUCCESS"
+			Write-Log "Task name: $ScheduledTaskName -- visible in Task Scheduler"
+			Write-Log "To cancel: Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false"
+			return
+		} catch {
+			Write-Log "Failed to create scheduled task: $($_.Exception.Message)" -Level "ERROR"
+			return
+		}
 	}
 	#endregion
 

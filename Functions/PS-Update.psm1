@@ -1586,6 +1586,21 @@ Function Update-WindowsTo11 {
 	Write-Log "Log file: $($script:LogFile)"
 	#endregion
 
+	#region Version Check
+	$os = Get-CimInstance Win32_OperatingSystem
+	$buildNumber = [int]$os.BuildNumber
+	$osCaption = $os.Caption
+
+	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 26100) {
+		Write-Log "Already running Windows 11 24H2+ (Build $buildNumber) -- no upgrade needed." -Level "SUCCESS"
+		return
+	}
+
+	if ($Force) {
+		Write-Log "Force specified -- skipping version check. Current: $osCaption (Build $buildNumber)" -Level "WARNING"
+	}
+	#endregion
+
 	#region Scheduled Execution
 	if ($PSBoundParameters.ContainsKey('ScheduleAt')) {
 		# If only a time was given and it's already past, assume tomorrow
@@ -1599,29 +1614,37 @@ Function Update-WindowsTo11 {
 			}
 		}
 
-		# Build the PowerShell command that the task will execute
+		# Build forwarded parameters from $PSBoundParameters (escape single quotes for safety)
+		$ExcludeParams = @('ScheduleAt', 'ScheduledTaskName')
 		$ForwardedParams = @()
-		if ($Force)        { $ForwardedParams += '-Force' }
-		if ($DownloadOnly) { $ForwardedParams += '-DownloadOnly' }
-		if ($ShowProgress) { $ForwardedParams += '-ShowProgress' }
-		if ($DownloadUrl)  { $ForwardedParams += "-DownloadUrl '$DownloadUrl'" }
-		if ($LogPath)      { $ForwardedParams += "-LogPath '$LogPath'" }
+		foreach ($key in $PSBoundParameters.Keys) {
+			if ($key -in $ExcludeParams) { continue }
+			$val = $PSBoundParameters[$key]
+			if ($val -is [switch] -or $val -is [bool]) {
+				if ($val) { $ForwardedParams += "-$key" }
+			} elseif ($val -is [array]) {
+				$escaped = ($val | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
+				$ForwardedParams += "-$key @($escaped)"
+			} else {
+				$escaped = "$val" -replace "'", "''"
+				$ForwardedParams += "-$key '$escaped'"
+			}
+		}
 		$ParamString = $ForwardedParams -join ' '
 
-		$TaskCommand = "Set-ExecutionPolicy Bypass -Scope Process -Force; irm ps.mauletech.com | iex; Update-WindowsTo11 $ParamString"
+		$TaskCommand = "irm ps.mauletech.com | iex; Update-WindowsTo11 $ParamString"
 
 		# Check for existing task with the same name
 		$existingTask = Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue
 		if ($existingTask) {
 			Write-Log "Scheduled task '$ScheduledTaskName' already exists -- replacing it." -Level "WARNING"
-			Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false -ErrorAction SilentlyContinue
+			Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false -ErrorAction Stop
 		}
 
-		# Create the scheduled task
+		# Create the scheduled task -- no EndBoundary so long-running upgrades are not killed
 		$Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$TaskCommand`""
 		$Trigger = New-ScheduledTaskTrigger -Once -At $ScheduleAt
-		$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DeleteExpiredTaskAfter (New-TimeSpan -Hours 1)
-		$Trigger.EndBoundary = $ScheduleAt.AddHours(2).ToString('s')
+		$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 6)
 		$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 		try {
@@ -1634,21 +1657,6 @@ Function Update-WindowsTo11 {
 			Write-Log "Failed to create scheduled task: $($_.Exception.Message)" -Level "ERROR"
 			return
 		}
-	}
-	#endregion
-
-	#region Version Check
-	$os = Get-CimInstance Win32_OperatingSystem
-	$buildNumber = [int]$os.BuildNumber
-	$osCaption = $os.Caption
-
-	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 26100) {
-		Write-Log "Already running Windows 11 24H2+ (Build $buildNumber) -- no upgrade needed." -Level "SUCCESS"
-		return
-	}
-
-	if ($Force) {
-		Write-Log "Force specified -- skipping version check. Current: $osCaption (Build $buildNumber)" -Level "WARNING"
 	}
 	#endregion
 

@@ -1603,9 +1603,12 @@ Function Update-WindowsTo11 {
 
 	#region Scheduled Execution
 	if ($PSBoundParameters.ContainsKey('ScheduleAt')) {
+		# Capture current time once to avoid TOCTOU issues at midnight
+		$now = Get-Date
+
 		# If only a time was given and it's already past, assume tomorrow
-		if ($ScheduleAt -le (Get-Date)) {
-			if ($ScheduleAt.Date -eq (Get-Date).Date) {
+		if ($ScheduleAt -le $now) {
+			if ($ScheduleAt.Date -eq $now.Date) {
 				$ScheduleAt = $ScheduleAt.AddDays(1)
 				Write-Log "Specified time already passed today -- scheduling for tomorrow: $($ScheduleAt.ToString('g'))" -Level "WARNING"
 			} else {
@@ -1620,7 +1623,7 @@ Function Update-WindowsTo11 {
 		foreach ($key in $PSBoundParameters.Keys) {
 			if ($key -in $ExcludeParams) { continue }
 			$val = $PSBoundParameters[$key]
-			if ($val -is [switch] -or $val -is [bool]) {
+			if ($val -is [bool]) {
 				if ($val) { $ForwardedParams += "-$key" }
 			} elseif ($val -is [array]) {
 				$escaped = ($val | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
@@ -1641,9 +1644,11 @@ Function Update-WindowsTo11 {
 			Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false -ErrorAction Stop
 		}
 
-		# Create the scheduled task -- no EndBoundary so long-running upgrades are not killed
-		$Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$TaskCommand`""
+		# Use -EncodedCommand to avoid all quoting/injection issues in the scheduled task
+		$encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($TaskCommand))
+		$Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
 		$Trigger = New-ScheduledTaskTrigger -Once -At $ScheduleAt
+		# 6-hour execution time limit as a safety cap; no trigger EndBoundary so the task starts even if delayed
 		$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 6)
 		$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 

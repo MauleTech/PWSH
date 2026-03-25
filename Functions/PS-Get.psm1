@@ -317,21 +317,24 @@ function Get-ADLockedAccount {
 		}
 	}
 
-	$adParams = @{
-		Filter     = { LockedOut -eq $true }
-		Properties = @(
-			'DisplayName', 'GivenName', 'Surname', 'EmailAddress',
-			'Department', 'Title', 'Enabled', 'LockedOut',
-			'lockoutTime', 'BadLogonCount', 'LastBadPasswordAttempt',
-			'PasswordLastSet', 'DistinguishedName'
-		)
-	}
-	if ($dc) { $adParams['Server'] = $dc }
+	$searchParams = @{ LockedOut = $true; UsersOnly = $true }
+	if ($dc) { $searchParams['Server'] = $dc }
+
+	$propList = @(
+		'DisplayName', 'GivenName', 'Surname', 'EmailAddress',
+		'Department', 'Title', 'Enabled', 'LockedOut',
+		'lockoutTime', 'BadLogonCount', 'LastBadPasswordAttempt',
+		'PasswordLastSet'
+	)
 
 	Write-Verbose "Querying $(if ($dc) { $dc } else { 'default DC' }) for locked accounts..."
 
 	try {
-		$lockedUsers = Get-ADUser @adParams
+		$lockedUsers = Search-ADAccount @searchParams | ForEach-Object {
+			$getParams = @{ Identity = $_.DistinguishedName; Properties = $propList }
+			if ($dc) { $getParams['Server'] = $dc }
+			Get-ADUser @getParams
+		}
 	} catch {
 		Write-Error "Failed to query Active Directory: $_"
 		return

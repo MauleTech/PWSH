@@ -216,6 +216,204 @@ function Get-ADUsersPasswordExpiring {
 	}
 }
 
+function Get-ADLockedAccount {
+	<#
+	.SYNOPSIS
+		Finds locked-out Active Directory accounts and displays details about lock state, bad password attempts, and timing.
+	.DESCRIPTION
+		Queries Active Directory for locked-out user accounts and returns details including when the account
+		was locked, how many bad password attempts occurred, the last bad password time, and user metadata
+		(department, title, email). Optionally unlocks matched accounts and verifies the unlock succeeded.
+
+		By default queries the PDC Emulator for the most accurate and up-to-date lockout information.
+		Supports filtering by SamAccountName, email address, or display name with wildcard support.
+	.PARAMETER Identity
+		Filter by SamAccountName. Supports wildcards (e.g. "john*", "*smith*"). Defaults to "*" (all locked accounts).
+	.PARAMETER EmailAddress
+		Filter by email address. Supports wildcards (e.g. "*@contoso.com").
+	.PARAMETER DisplayName
+		Filter by display name. Supports wildcards (e.g. "John*").
+	.PARAMETER Unlock
+		Unlock each matched account, then re-query to verify the account is no longer locked.
+		Supports -WhatIf and -Confirm for safe bulk operations.
+	.PARAMETER IncludeDisabled
+		Include disabled accounts in results. By default only enabled accounts are returned.
+	.PARAMETER Server
+		Target a specific domain controller. Defaults to the PDC Emulator for accurate lockout data.
+	.EXAMPLE
+		Get-ADLockedAccount
+		Returns all currently locked-out enabled accounts.
+	.EXAMPLE
+		Get-ADLockedAccount -Identity "jdoe"
+		Returns lockout details for the account with SamAccountName "jdoe".
+	.EXAMPLE
+		Get-ADLockedAccount -Identity "john*"
+		Returns all locked accounts whose username starts with "john".
+	.EXAMPLE
+		Get-ADLockedAccount -EmailAddress "*@contoso.com"
+		Returns all locked accounts with a contoso.com email address.
+	.EXAMPLE
+		Get-ADLockedAccount -DisplayName "John*" -Unlock
+		Finds all locked accounts with a display name starting with "John" and unlocks them, then verifies.
+	.EXAMPLE
+		Get-ADLockedAccount -Identity "jdoe" -Unlock -WhatIf
+		Shows what would happen without actually unlocking the account.
+	.EXAMPLE
+		Get-ADLockedAccount -IncludeDisabled
+		Returns all locked accounts including disabled ones.
+	.OUTPUTS
+		PSCustomObject with properties:
+		- SamAccountName: Login name
+		- DisplayName: Full display name
+		- EmailAddress: Email address
+		- Department: Department
+		- Title: Job title
+		- Enabled: Whether the account is enabled
+		- LockedOut: Current lock state
+		- LockoutTime: When the account was locked (null if not locked or no data)
+		- BadLogonCount: Number of consecutive bad password attempts
+		- LastBadPasswordAttempt: Timestamp of the most recent bad password attempt
+		- PasswordLastSet: When the password was last changed
+	.NOTES
+		Requires the ActiveDirectory PowerShell module (RSAT or on a domain controller).
+		The -Unlock operation requires sufficient AD permissions (Account Operators or higher).
+	#>
+	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+	param(
+		[Parameter(HelpMessage = "SamAccountName to search for. Supports wildcards.")]
+		[string]$Identity = '*',
+
+		[Parameter(HelpMessage = "Email address to filter by. Supports wildcards.")]
+		[string]$EmailAddress,
+
+		[Parameter(HelpMessage = "Display name to filter by. Supports wildcards.")]
+		[string]$DisplayName,
+
+		[Parameter(HelpMessage = "Unlock matched accounts and verify the unlock succeeded.")]
+		[switch]$Unlock,
+
+		[Parameter(HelpMessage = "Include disabled accounts (default: enabled accounts only).")]
+		[switch]$IncludeDisabled,
+
+		[Parameter(HelpMessage = "Target domain controller. Defaults to PDC Emulator.")]
+		[string]$Server
+	)
+
+	# Verify Active Directory module is available
+	if (-not (Get-Command ActiveDirectory\Get-ADUser -ErrorAction SilentlyContinue)) {
+		Write-Error "This function requires the ActiveDirectory PowerShell module. Please run on a domain controller or install RSAT."
+		return
+	}
+
+	# Default to PDC Emulator for most accurate lockout information
+	$dc = if ($Server) {
+		$Server
+	} else {
+		try {
+			(Get-ADDomain -ErrorAction Stop).PDCEmulator
+		} catch {
+			Write-Warning "Could not determine PDC Emulator: $_. Querying default DC."
+			$null
+		}
+	}
+
+	$adParams = @{
+		Filter     = { LockedOut -eq $true }
+		Properties = @(
+			'DisplayName', 'GivenName', 'Surname', 'EmailAddress',
+			'Department', 'Title', 'Enabled', 'LockedOut',
+			'lockoutTime', 'BadLogonCount', 'LastBadPasswordAttempt',
+			'PasswordLastSet', 'DistinguishedName'
+		)
+	}
+	if ($dc) { $adParams['Server'] = $dc }
+
+	Write-Verbose "Querying $(if ($dc) { $dc } else { 'default DC' }) for locked accounts..."
+
+	try {
+		$lockedUsers = Get-ADUser @adParams
+	} catch {
+		Write-Error "Failed to query Active Directory: $_"
+		return
+	}
+
+	# Apply client-side filters for wildcard support across all three search fields
+	$filtered = $lockedUsers | Where-Object {
+		$matchIdentity    = $_.SamAccountName -like $Identity
+		$matchEmail       = -not $EmailAddress  -or ($_.EmailAddress -like $EmailAddress)
+		$matchDisplayName = -not $DisplayName   -or ($_.DisplayName  -like $DisplayName)
+		$matchEnabled     = $IncludeDisabled    -or $_.Enabled
+
+		$matchIdentity -and $matchEmail -and $matchDisplayName -and $matchEnabled
+	}
+
+	if (-not $filtered) {
+		Write-Warning "No locked accounts found matching the specified criteria."
+		return
+	}
+
+	# Build output objects
+	$results = $filtered | ForEach-Object {
+		$lockoutTime = if ($_.lockoutTime -and $_.lockoutTime -ne 0) {
+			[datetime]::FromFileTime($_.lockoutTime)
+		} else {
+			$null
+		}
+
+		[PSCustomObject]@{
+			SamAccountName         = $_.SamAccountName
+			DisplayName            = $_.DisplayName
+			EmailAddress           = $_.EmailAddress
+			Department             = $_.Department
+			Title                  = $_.Title
+			Enabled                = $_.Enabled
+			LockedOut              = $_.LockedOut
+			LockoutTime            = $lockoutTime
+			BadLogonCount          = $_.BadLogonCount
+			LastBadPasswordAttempt = $_.LastBadPasswordAttempt
+			PasswordLastSet        = $_.PasswordLastSet
+		}
+	}
+
+	if (-not $Unlock) {
+		$results
+		return
+	}
+
+	# Unlock flow — emit post-unlock state so pipeline reflects actual lock state after operation
+	foreach ($user in $results) {
+		$sam = $user.SamAccountName
+
+		if ($PSCmdlet.ShouldProcess($sam, "Unlock AD account")) {
+			try {
+				$unlockParams = @{ Identity = $sam }
+				if ($dc) { $unlockParams['Server'] = $dc }
+				Unlock-ADAccount @unlockParams -ErrorAction Stop
+
+				# Re-query to get post-unlock state and emit updated object
+				$verifyParams = @{ Identity = $sam; Properties = @('LockedOut', 'lockoutTime') }
+				if ($dc) { $verifyParams['Server'] = $dc }
+				$verify = Get-ADUser @verifyParams -ErrorAction Stop
+
+				$user.LockedOut = $verify.LockedOut
+				$user.LockoutTime = if ($verify.lockoutTime -and $verify.lockoutTime -ne 0) {
+					[datetime]::FromFileTime($verify.lockoutTime)
+				} else { $null }
+
+				if (-not $verify.LockedOut) {
+					Write-Verbose "$sam successfully unlocked."
+				} else {
+					Write-Warning "$sam still appears locked after unlock attempt."
+				}
+			} catch {
+				Write-Error "Failed to unlock $sam: $_"
+			}
+		}
+		# Emit object (pre-unlock on WhatIf/error, post-unlock on success)
+		$user
+	}
+}
+
 function Get-BitLockerKey {
 	[CmdletBinding()]
 	param(

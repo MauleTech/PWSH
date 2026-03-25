@@ -406,7 +406,7 @@ function Get-ADLockedAccount {
 					Write-Warning "$sam still appears locked after unlock attempt."
 				}
 			} catch {
-				Write-Error "Failed to unlock $sam: $_"
+				Write-Error "Failed to unlock ${sam}: $_"
 			}
 		}
 		# Emit object (pre-unlock on WhatIf/error, post-unlock on success)

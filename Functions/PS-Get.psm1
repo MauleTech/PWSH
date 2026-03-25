@@ -301,7 +301,7 @@ function Get-ADLockedAccount {
 
 	# Verify Active Directory module is available
 	if (-not (Get-Command ActiveDirectory\Get-ADUser -ErrorAction SilentlyContinue)) {
-		Write-Host "`n [!] This command must be run on a system with Active Directory Powershell Modules (i.e. a domain controller)`n"
+		Write-Error "This function requires the ActiveDirectory PowerShell module. Please run on a domain controller or install RSAT."
 		return
 	}
 
@@ -348,7 +348,7 @@ function Get-ADLockedAccount {
 	}
 
 	if (-not $filtered) {
-		Write-Host "`n [!] No locked accounts found matching the specified criteria.`n" -ForegroundColor Yellow
+		Write-Warning "No locked accounts found matching the specified criteria."
 		return
 	}
 
@@ -376,21 +376,13 @@ function Get-ADLockedAccount {
 	}
 
 	if (-not $Unlock) {
-		# Display only — Format-List for single result, Format-Table for multiple
-		if (($results | Measure-Object).Count -eq 1) {
-			$results | Format-List
-		} else {
-			$results | Format-Table -AutoSize
-		}
+		$results
 		return
 	}
 
-	# Unlock flow
+	# Unlock flow — emit post-unlock state so pipeline reflects actual lock state after operation
 	foreach ($user in $results) {
 		$sam = $user.SamAccountName
-
-		Write-Host "`n--- $sam ---" -ForegroundColor Cyan
-		$user | Format-List
 
 		if ($PSCmdlet.ShouldProcess($sam, "Unlock AD account")) {
 			try {
@@ -398,22 +390,28 @@ function Get-ADLockedAccount {
 				if ($dc) { $unlockParams['Server'] = $dc }
 				Unlock-ADAccount @unlockParams -ErrorAction Stop
 
-				# Re-query to verify
-				$verifyParams = @{ Identity = $sam; Properties = 'LockedOut' }
+				# Re-query to get post-unlock state and emit updated object
+				$verifyParams = @{ Identity = $sam; Properties = @('LockedOut', 'lockoutTime') }
 				if ($dc) { $verifyParams['Server'] = $dc }
 				$verify = Get-ADUser @verifyParams -ErrorAction Stop
 
+				$user.LockedOut = $verify.LockedOut
+				$user.LockoutTime = if ($verify.lockoutTime -and $verify.lockoutTime -ne 0) {
+					[datetime]::FromFileTime($verify.lockoutTime)
+				} else { $null }
+
 				if (-not $verify.LockedOut) {
-					Write-Host " [OK] $sam has been successfully unlocked." -ForegroundColor Green
+					Write-Verbose "$sam successfully unlocked."
 				} else {
-					Write-Host " [!] $sam appears to still be locked after unlock attempt." -ForegroundColor Red
+					Write-Warning "$sam still appears locked after unlock attempt."
 				}
 			} catch {
-				Write-Host " [!] Failed to unlock ${sam}: $_" -ForegroundColor Red
+				Write-Error "Failed to unlock $sam: $_"
 			}
 		}
+		# Emit object (pre-unlock on WhatIf/error, post-unlock on success)
+		$user
 	}
-	Write-Host ""
 }
 
 function Get-BitLockerKey {

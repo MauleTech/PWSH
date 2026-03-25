@@ -98,6 +98,7 @@ Enable-SSL #Enables SSL Permanently
 
 [Get]
 -----
+  Get-ADLockedAccount
   Get-DecryptedConfig
   Get-ADStaleComputers
   Get-ADStaleUsers

@@ -155,7 +155,7 @@ Function Update-DellPackages {
 					winget source update
 					winget install --id Dell.CommandUpdate -e -h --accept-package-agreements --accept-source-agreements --source winget
 				} Else {
-					Choco upgrade DellCommandUpdate --exact -y --force -i --ignorechecksums
+					Choco upgrade DellCommandUpdate --exact -y --force --forcedependencies -i --ignorechecksums
 				}
 			}
 

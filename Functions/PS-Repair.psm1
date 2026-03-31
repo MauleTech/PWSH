@@ -492,6 +492,10 @@ Function Repair-RemoteWMI {
             }
         }
 
+        # Pre-convert scriptblocks to strings once for remote invocation
+        $stopDependentsStr  = $stopDependentsBlock.ToString()
+        $startDependentsStr = $startDependentsBlock.ToString()
+
         # Helper: test WMI via DCOM CIM session including uptime query
         function Test-WMIConnectivity {
             param(
@@ -555,7 +559,6 @@ Function Repair-RemoteWMI {
                 return 'SkippedByUser'
             }
 
-            # --- Stop phase ---
             if ($svc.Status -eq 'Running') {
                 Write-Verbose "Stopping PRTGProbeService (timeout: ${timeoutSec}s)..."
                 try {
@@ -591,7 +594,6 @@ Function Repair-RemoteWMI {
                 }
             }
 
-            # --- Start phase ---
             Write-Verbose "Starting PRTGProbeService..."
             try {
                 Start-Service -Name $serviceName -ErrorAction Stop
@@ -611,7 +613,6 @@ Function Repair-RemoteWMI {
             }
         }
 
-        # Track which computers were repaired for probe restart decision
         $repairedComputers = [System.Collections.Generic.List[string]]::new()
     }
 
@@ -635,7 +636,6 @@ Function Repair-RemoteWMI {
                 Status          = 'Unknown'
             }
 
-            # --- Step 0: Pre-flight DCOM port check ---
             if (-not $SkipPortCheck) {
                 Write-Verbose "[$computer] Step 0 - Testing TCP 135 (DCOM/RPC endpoint mapper)"
                 try {
@@ -656,7 +656,6 @@ Function Repair-RemoteWMI {
                 }
             }
 
-            # --- Establish remote session ---
             try {
                 Write-Verbose "[$computer] Establishing PSRemoting session"
                 $session = New-PSSession -ComputerName $computer @sessionParams
@@ -668,10 +667,11 @@ Function Repair-RemoteWMI {
             }
 
             try {
-                # --- Step 1a: Restart WMI service and dependencies ---
-                Write-Verbose "[$computer] Step 1a - Restarting WMI service and dependencies"
-                $restartResult = Invoke-Command -Session $session -ScriptBlock {
+                Write-Verbose "[$computer] Step 1 - Restarting WMI service, dependencies, and cleaning up wmiprvse"
+                $step1 = Invoke-Command -Session $session -ScriptBlock {
                     param($stopBlock, $startBlock)
+                    $svcResult = 'Skipped'
+                    $cleanResult = 'Skipped'
                     try {
                         $deps = & $([ScriptBlock]::Create($stopBlock))
                         Restart-Service -Name Winmgmt -Force -ErrorAction Stop
@@ -679,34 +679,29 @@ Function Repair-RemoteWMI {
                         if ($deps) {
                             & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps
                         }
-                        return 'Success'
+                        $svcResult = 'Success'
                     } catch {
-                        return "Failed: $_"
+                        $svcResult = "Failed: $_"
                     }
-                } -ArgumentList $stopDependentsBlock.ToString(), $startDependentsBlock.ToString()
-                $result.ServiceRestart = $restartResult
-                Write-Verbose "[$computer] Service restart: $restartResult"
-
-                # --- Step 1b: Kill orphaned wmiprvse.exe processes ---
-                Write-Verbose "[$computer] Step 1b - Killing orphaned WMI provider hosts"
-                $cleanupResult = Invoke-Command -Session $session -ScriptBlock {
                     try {
                         $procs = Get-Process -Name wmiprvse -ErrorAction SilentlyContinue
                         if ($procs) {
                             $count = $procs.Count
                             $procs | Stop-Process -Force -ErrorAction SilentlyContinue
                             Start-Sleep -Seconds 2
-                            return "Killed $count orphaned wmiprvse.exe process(es)"
+                            $cleanResult = "Killed $count orphaned wmiprvse.exe process(es)"
+                        } else {
+                            $cleanResult = 'NoneFound'
                         }
-                        return 'NoneFound'
                     } catch {
-                        return "Failed: $_"
+                        $cleanResult = "Failed: $_"
                     }
-                }
-                $result.WmiprvseCleanup = $cleanupResult
-                Write-Verbose "[$computer] wmiprvse cleanup: $cleanupResult"
+                    return @{ ServiceRestart = $svcResult; WmiprvseCleanup = $cleanResult }
+                } -ArgumentList $stopDependentsStr, $startDependentsStr
+                $result.ServiceRestart = $step1.ServiceRestart
+                $result.WmiprvseCleanup = $step1.WmiprvseCleanup
+                Write-Verbose "[$computer] Service restart: $($step1.ServiceRestart), wmiprvse cleanup: $($step1.WmiprvseCleanup)"
 
-                # --- Step 2: Early WMI test ---
                 Write-Verbose "[$computer] Step 2 - Early WMI connectivity test"
                 $earlyTest = Test-WMIConnectivity -Target $computer -Cred $Credential
                 $earlyTestPassed = $earlyTest.Pass
@@ -726,11 +721,13 @@ Function Repair-RemoteWMI {
                         Write-Verbose "[$computer] WMI still failing after restart, continuing with deeper repairs"
                     }
 
-                    # --- Step 3a: Re-register WMI provider DLLs ---
-                    Write-Verbose "[$computer] Step 3a - Re-registering WMI provider DLLs"
-                    $reregResult = Invoke-Command -Session $session -ScriptBlock {
+                    Write-Verbose "[$computer] Step 3 - Re-registering WMI provider DLLs and recompiling MOFs"
+                    $step3 = Invoke-Command -Session $session -ScriptBlock {
+                        $sysDir = "$env:SystemRoot\System32\wbem"
+                        $dllResult = 'Skipped'
+                        $mofResult = 'Skipped'
+
                         try {
-                            $sysDir = "$env:SystemRoot\System32\wbem"
                             $dlls = @(
                                 'scrcons.dll', 'unsecapp.dll', 'wmiprvsd.dll',
                                 'wmiprvse.dll', 'wmisvc.dll', 'wbemcomn.dll',
@@ -749,21 +746,15 @@ Function Repair-RemoteWMI {
                                 }
                             }
                             if ($errors.Count -gt 0) {
-                                return "PartialSuccess ($($errors -join ', '))"
+                                $dllResult = "PartialSuccess ($($errors -join ', '))"
+                            } else {
+                                $dllResult = 'Success'
                             }
-                            return 'Success'
                         } catch {
-                            return "Failed: $_"
+                            $dllResult = "Failed: $_"
                         }
-                    }
-                    $result.DLLReregister = $reregResult
-                    Write-Verbose "[$computer] DLL re-register: $reregResult"
 
-                    # --- Step 3b: Recompile core Windows MOF files only ---
-                    Write-Verbose "[$computer] Step 3b - Recompiling core Windows MOF files"
-                    $mofResult = Invoke-Command -Session $session -ScriptBlock {
                         try {
-                            $sysDir = "$env:SystemRoot\System32\wbem"
                             $coreMofs = @(
                                 'cimwin32.mof', 'cimwin32.mfl',
                                 'win32_encryptablevolume.mof',
@@ -791,15 +782,17 @@ Function Repair-RemoteWMI {
                                     }
                                 }
                             }
-                            return "Compiled: $compiled, Failed: $failed"
+                            $mofResult = "Compiled: $compiled, Failed: $failed"
                         } catch {
-                            return "Failed: $_"
+                            $mofResult = "Failed: $_"
                         }
-                    }
-                    $result.MOFRecompile = $mofResult
-                    Write-Verbose "[$computer] MOF recompile: $mofResult"
 
-                    # --- Step 4: Reset DCOM permissions on root\cimv2 ---
+                        return @{ DLLReregister = $dllResult; MOFRecompile = $mofResult }
+                    }
+                    $result.DLLReregister = $step3.DLLReregister
+                    $result.MOFRecompile = $step3.MOFRecompile
+                    Write-Verbose "[$computer] DLL re-register: $($step3.DLLReregister), MOF recompile: $($step3.MOFRecompile)"
+
                     Write-Verbose "[$computer] Step 4 - Resetting DCOM/WMI namespace permissions"
                     $dcomResult = Invoke-Command -Session $session -ScriptBlock {
                         try {
@@ -822,60 +815,54 @@ Function Repair-RemoteWMI {
                     $result.DCOMPermissions = $dcomResult
                     Write-Verbose "[$computer] DCOM permissions reset: $dcomResult"
 
-                    # --- Step 5: Check WMI repository consistency ---
-                    Write-Verbose "[$computer] Step 5 - Checking WMI repository consistency"
-                    $consistencyResult = Invoke-Command -Session $session -ScriptBlock {
+                    Write-Verbose "[$computer] Step 5 - Checking WMI repository consistency (salvage if needed)"
+                    $step5 = Invoke-Command -Session $session -ScriptBlock {
+                        param($stopBlock, $startBlock)
+                        $consistency = 'Skipped'
+                        $salvage = 'Skipped'
                         try {
                             $output = & winmgmt /verifyrepository 2>&1
                             $outputStr = ($output | Out-String).Trim()
                             if ($outputStr -match 'is consistent' -and $outputStr -notmatch 'not consistent') {
-                                return 'Consistent'
+                                $consistency = 'Consistent'
                             } else {
-                                return "Inconsistent: $outputStr"
+                                $consistency = "Inconsistent: $outputStr"
+                                # Salvage: stop Winmgmt, repair, restart
+                                $deps = $null
+                                try {
+                                    $deps = & $([ScriptBlock]::Create($stopBlock))
+                                    Stop-Service -Name Winmgmt -Force -ErrorAction Stop
+                                    & winmgmt /salvagerepository 2>&1 | Out-Null
+                                    Start-Service -Name Winmgmt -ErrorAction Stop
+                                    Start-Sleep -Seconds 3
+                                    if ($deps) {
+                                        & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps
+                                    }
+                                    $verify = & winmgmt /verifyrepository 2>&1
+                                    $verifyStr = ($verify | Out-String).Trim()
+                                    if ($verifyStr -match 'is consistent' -and $verifyStr -notmatch 'not consistent') {
+                                        $salvage = 'SalvagedSuccessfully'
+                                    } else {
+                                        $salvage = "SalvageFailed: $verifyStr"
+                                    }
+                                } catch {
+                                    # Ensure Winmgmt is restarted even if salvage fails
+                                    try { Start-Service -Name Winmgmt -ErrorAction SilentlyContinue } catch {}
+                                    if ($deps) {
+                                        try { & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps } catch {}
+                                    }
+                                    $salvage = "Failed: $_"
+                                }
                             }
                         } catch {
-                            return "Failed: $_"
+                            $consistency = "Failed: $_"
                         }
-                    }
-                    $result.RepoConsistency = $consistencyResult
-                    Write-Verbose "[$computer] Repository check: $consistencyResult"
+                        return @{ RepoConsistency = $consistency; RepoSalvage = $salvage }
+                    } -ArgumentList $stopDependentsStr, $startDependentsStr
+                    $result.RepoConsistency = $step5.RepoConsistency
+                    $result.RepoSalvage = $step5.RepoSalvage
+                    Write-Verbose "[$computer] Repository: $($step5.RepoConsistency), Salvage: $($step5.RepoSalvage)"
 
-                    # --- Step 5b: Salvage repository if inconsistent ---
-                    if ($consistencyResult -notmatch '^Consistent') {
-                        Write-Verbose "[$computer] Step 5b - Salvaging WMI repository (non-destructive)"
-                        $salvageResult = Invoke-Command -Session $session -ScriptBlock {
-                            param($stopBlock, $startBlock)
-                            $deps = $null
-                            try {
-                                $deps = & $([ScriptBlock]::Create($stopBlock))
-                                Stop-Service -Name Winmgmt -Force -ErrorAction Stop
-                                & winmgmt /salvagerepository 2>&1 | Out-Null
-                                Start-Service -Name Winmgmt -ErrorAction Stop
-                                Start-Sleep -Seconds 3
-                                if ($deps) {
-                                    & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps
-                                }
-                                $verify = & winmgmt /verifyrepository 2>&1
-                                $verifyStr = ($verify | Out-String).Trim()
-                                if ($verifyStr -match 'is consistent' -and $verifyStr -notmatch 'not consistent') {
-                                    return 'SalvagedSuccessfully'
-                                } else {
-                                    return "SalvageFailed: $verifyStr"
-                                }
-                            } catch {
-                                # Ensure Winmgmt is restarted even if salvage fails
-                                try { Start-Service -Name Winmgmt -ErrorAction SilentlyContinue } catch {}
-                                if ($deps) {
-                                    try { & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps } catch {}
-                                }
-                                return "Failed: $_"
-                            }
-                        } -ArgumentList $stopDependentsBlock.ToString(), $startDependentsBlock.ToString()
-                        $result.RepoSalvage = $salvageResult
-                        Write-Verbose "[$computer] Repository salvage: $salvageResult"
-                    }
-
-                    # --- Step 6: Final WMI test including uptime query ---
                     Write-Verbose "[$computer] Step 6 - Final WMI connectivity test (DCOM + uptime)"
                     $finalTest = Test-WMIConnectivity -Target $computer -Cred $Credential
                     $result.FinalTest = $finalTest.Detail
@@ -894,7 +881,6 @@ Function Repair-RemoteWMI {
                 }
             }
 
-            # --- Output result ---
             if ($result.Status -eq 'Repaired') {
                 $repairedComputers.Add($computer)
                 Write-Verbose "[$computer] WMI repair completed successfully. Rescan the PRTG sensor to confirm."
@@ -907,7 +893,6 @@ Function Repair-RemoteWMI {
     }
 
     end {
-        # --- Probe restart logic ---
         if ($repairedComputers.Count -eq 0) {
             return
         }

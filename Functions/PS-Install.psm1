@@ -1627,6 +1627,108 @@ Function Install-WinRepairToolbox {
 	Write-Host "The command to launch Windows Repair Toolbox has been put in your clipboard."
 }
 
+Function Install-Croc {
+    <#
+    .SYNOPSIS
+        Installs croc file transfer utility using the first available package manager.
+    .DESCRIPTION
+        Tries installation methods in order: winget, Start-PSWinget, chocolatey, scoop.
+        Returns the path to the croc executable on success, or throws on failure.
+    .EXAMPLE
+        Install-Croc
+        Installs croc and returns the path to the executable.
+    .NOTES
+        Some fallback methods require the MauleTech PWSH loader:
+        irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
+    #>
+    [CmdletBinding()]
+    param()
+
+    $existing = Find-CrocExe
+    if ($existing) {
+        Write-Host "croc is already installed at: $existing" -ForegroundColor Green
+        return $existing
+    }
+
+    # --- Method 1: winget ---
+    $isSystem = ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name -match 'SYSTEM$')
+    if (-not $isSystem -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "Attempting install via winget..." -ForegroundColor Cyan
+        try {
+            $null = winget install schollz.croc --accept-package-agreements --accept-source-agreements 2>&1
+            $found = Find-CrocExe
+            if ($found) {
+                Write-Host "croc installed via winget at: $found" -ForegroundColor Green
+                return $found
+            }
+        } catch {
+            Write-Warning "winget install failed: $_"
+        }
+    }
+
+    # --- Method 2: Start-PSWinget (works as SYSTEM or when winget isn't in PATH) ---
+    if (Get-Command Start-PSWinget -ErrorAction SilentlyContinue) {
+        Write-Host "Attempting install via Start-PSWinget..." -ForegroundColor Cyan
+        try {
+            $null = Start-PSWinget -Command 'Install-WinGetPackage "schollz.croc"' 2>&1
+            $found = Find-CrocExe
+            if ($found) {
+                Write-Host "croc installed via Start-PSWinget at: $found" -ForegroundColor Green
+                return $found
+            }
+        } catch {
+            Write-Warning "Start-PSWinget install failed: $_"
+        }
+    }
+
+    # --- Method 3: Chocolatey ---
+    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        if (Get-Command Install-Choco -ErrorAction SilentlyContinue) {
+            Write-Host "Installing Chocolatey via Install-Choco..." -ForegroundColor Cyan
+            try { $null = Install-Choco 2>&1 } catch { Write-Warning "Install-Choco failed: $_" }
+        }
+    }
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        Write-Host "Attempting install via Chocolatey..." -ForegroundColor Cyan
+        try {
+            $null = choco install croc -y 2>&1
+            $found = Find-CrocExe
+            if ($found) {
+                Write-Host "croc installed via Chocolatey at: $found" -ForegroundColor Green
+                return $found
+            }
+        } catch {
+            Write-Warning "Chocolatey install failed: $_"
+        }
+    }
+
+    # --- Method 4: Scoop ---
+    if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+        Write-Host "Installing Scoop..." -ForegroundColor Cyan
+        try {
+            Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+            $null = Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression 2>&1
+        } catch {
+            Write-Warning "Scoop installation failed: $_"
+        }
+    }
+    if (Get-Command scoop -ErrorAction SilentlyContinue) {
+        Write-Host "Attempting install via Scoop..." -ForegroundColor Cyan
+        try {
+            $null = scoop install croc 2>&1
+            $found = Find-CrocExe
+            if ($found) {
+                Write-Host "croc installed via Scoop at: $found" -ForegroundColor Green
+                return $found
+            }
+        } catch {
+            Write-Warning "Scoop install failed: $_"
+        }
+    }
+
+    throw "Failed to install croc via any available method. Please install manually from https://github.com/schollz/croc/releases"
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

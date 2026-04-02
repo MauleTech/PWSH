@@ -74,6 +74,81 @@ Function Send-WakeOnLan {
 
 }
 
+Function Send-Item {
+    <#
+    .SYNOPSIS
+        Sends a file, folder, or text to another computer via croc and outputs the receive command.
+    .DESCRIPTION
+        Wraps 'croc send' to transfer files/folders/text. Generates a code upfront, copies the
+        full receive command (including MauleTech loader) to clipboard, then starts the transfer.
+    .PARAMETER Path
+        Path to the file or folder to send.
+    .PARAMETER Text
+        Text string to send instead of a file.
+    .PARAMETER Code
+        Optional custom code phrase. If omitted, one is generated automatically.
+    .EXAMPLE
+        Send-Item -Path .\MyFile.zip
+    .EXAMPLE
+        Send-Item -Path C:\Projects\MyFolder -Code "secret-phrase"
+    .EXAMPLE
+        Send-Item -Text "Hello from the other side"
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'File')]
+    param(
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'File')]
+        [string]$Path,
+
+        [Parameter(Mandatory, ParameterSetName = 'Text')]
+        [string]$Text,
+
+        [Parameter()]
+        [string]$Code
+    )
+
+    $crocExe = Get-CrocPath
+
+    # Pre-generate code so the receive command is ready before the blocking croc process starts
+    if (-not $Code) {
+        $Code = New-CrocCode
+    }
+
+    $receiveLines = @(
+        '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13 #Enables SSL Temporarily',
+        'irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex',
+        "Receive-Item -Code `"$Code`""
+    )
+    Set-Clipboard -Value ($receiveLines -join "`r`n")
+
+    if ($PSCmdlet.ParameterSetName -eq 'Text') {
+        $displayLabel = "TEXT: $Text"
+    } else {
+        $resolvedPath = Resolve-Path -Path $Path -ErrorAction Stop
+        $displayLabel = $resolvedPath.Path
+    }
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " SENDING: $displayLabel" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Paste this on the receiving computer (copied to clipboard):" -ForegroundColor Yellow
+    Write-Host ""
+    $receiveLines | ForEach-Object { Write-Host $_ -ForegroundColor Green }
+    Write-Host ""
+    Write-Host "(Copied to clipboard)" -ForegroundColor DarkGray
+    Write-Host "--------------------------------------------" -ForegroundColor Cyan
+
+    # --disable-clipboard prevents croc from overwriting the receive command we put on the clipboard
+    if ($PSCmdlet.ParameterSetName -eq 'Text') {
+        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, '--text', $Text)
+    } else {
+        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.Path)
+    }
+
+    & $crocExe @crocArgs
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

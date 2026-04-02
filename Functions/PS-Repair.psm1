@@ -384,6 +384,540 @@ Next manual steps to try:
 	#endregion
 }
 
+Function Repair-RemoteWMI {
+    <#
+    .SYNOPSIS
+        Attempts to repair WMI connectivity on a remote host without rebooting.
+
+    .DESCRIPTION
+        Targets the PRTG PE015 error ("Cannot initiate WMI connections to host").
+        Runs a progressive series of repair steps on the remote machine:
+          0. Pre-flight check for DCOM port connectivity (TCP 135)
+          1. Restart the WMI (Winmgmt) service and dependent services,
+             kill orphaned WMI provider host processes
+          2. Test WMI -- if Step 1 fixed it, skip heavier repairs (unless -Force)
+          3. Re-register WMI provider DLLs and recompile core Windows MOFs
+          4. Reset DCOM permissions on the WMI namespace
+          5. Verify WMI repository consistency and salvage if corrupt
+          6. Final WMI connectivity validation via DCOM CIM session,
+             including a PRTG-style uptime (LastBootUpTime) query
+
+        If all WMI tests pass but PRTG is still reporting PE015, the issue is
+        likely a hung connection on the PRTG probe. When running locally on the
+        probe server, the function will prompt to restart the PRTGProbeService.
+
+        Requires Stop-StuckService from the MauleTech PWSH library when using
+        -RestartProbe (load via: irm ps.mauletech.com | iex).
+
+    .PARAMETER ComputerName
+        One or more remote hostnames or IPs to repair.
+
+    .PARAMETER Credential
+        Optional PSCredential for authentication to the remote host.
+
+    .PARAMETER SkipPortCheck
+        Skip the TCP 135 pre-flight check (useful if ICMP/Test-NetConnection
+        is blocked but WMI traffic is actually allowed).
+
+    .PARAMETER Force
+        Run all repair steps even if early WMI tests pass. Use this when
+        the sensor is intermittently failing.
+
+    .PARAMETER RestartProbe
+        After successful WMI repair, restart the local PRTG probe service
+        to clear any hung connections. Only works when running on the probe
+        server. Prompts for confirmation before restarting.
+
+    .EXAMPLE
+        Repair-RemoteWMI -ComputerName RD7 -Verbose
+
+    .EXAMPLE
+        Repair-RemoteWMI -ComputerName RD7 -Force -RestartProbe -Verbose
+
+    .EXAMPLE
+        Repair-RemoteWMI -ComputerName RD7, RD8 -Credential (Get-Credential)
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [string[]]$ComputerName,
+
+        [Parameter()]
+        [PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$SkipPortCheck,
+
+        [Parameter()]
+        [switch]$Force,
+
+        [Parameter()]
+        [switch]$RestartProbe
+    )
+
+    begin {
+        $sessionParams = @{
+            ErrorAction = 'Stop'
+        }
+        if ($Credential) {
+            $sessionParams['Credential'] = $Credential
+        }
+
+        # Validate Stop-StuckService is available if -RestartProbe was requested
+        if ($RestartProbe -and -not (Get-Command -Name Stop-StuckService -ErrorAction SilentlyContinue)) {
+            Write-Warning 'Stop-StuckService not found. Load MauleTech functions first: irm ps.mauletech.com | iex'
+            Write-Warning '-RestartProbe will fall back to Stop-Service only (no stuck-service kill).'
+        }
+
+        # Helper: stop WMI dependent services, return their names for restart
+        $stopDependentsBlock = {
+            $deps = Get-Service -Name Winmgmt -DependentServices -ErrorAction SilentlyContinue |
+                Where-Object { $_.Status -eq 'Running' } |
+                Select-Object -ExpandProperty Name
+            if ($deps) {
+                foreach ($svc in $deps) {
+                    Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return $deps
+        }
+
+        # Helper: restart dependent services by name
+        $startDependentsBlock = {
+            param([string[]]$ServiceNames)
+            if ($ServiceNames) {
+                foreach ($svc in $ServiceNames) {
+                    Start-Service -Name $svc -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        # Pre-convert scriptblocks to strings once for remote invocation
+        $stopDependentsStr  = $stopDependentsBlock.ToString()
+        $startDependentsStr = $startDependentsBlock.ToString()
+
+        # Helper: test WMI via DCOM CIM session including uptime query
+        function Test-WMIConnectivity {
+            param(
+                [string]$Target,
+                [PSCredential]$Cred
+            )
+            $cimSession = $null
+            try {
+                $cimParams = @{
+                    ComputerName = $Target
+                    ErrorAction  = 'Stop'
+                }
+                if ($Cred) {
+                    $cimParams['Credential'] = $Cred
+                }
+                $dcomOption = New-CimSessionOption -Protocol Dcom
+                $cimSession = New-CimSession @cimParams -SessionOption $dcomOption
+                $os = Get-CimInstance -CimSession $cimSession -ClassName Win32_OperatingSystem -ErrorAction Stop
+
+                if (-not $os) {
+                    return @{ Pass = $false; Detail = 'NoResultsReturned'; Uptime = $null }
+                }
+
+                # Compute uptime the same way PRTG's WMI System Uptime sensor does
+                $lastBoot = $os.LastBootUpTime
+                if ($lastBoot) {
+                    $uptime = (Get-Date) - $lastBoot
+                    $uptimeStr = '{0}d {1}h {2}m' -f $uptime.Days, $uptime.Hours, $uptime.Minutes
+                } else {
+                    $uptimeStr = 'LastBootUpTime was null'
+                }
+
+                return @{ Pass = $true; Detail = 'Success'; Uptime = $uptimeStr }
+            } catch {
+                return @{ Pass = $false; Detail = "Failed: $_"; Uptime = $null }
+            } finally {
+                if ($cimSession) {
+                    Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        # Helper: restart PRTG probe service with 60s timeout
+        # Uses Stop-StuckService from MauleTech PWSH library if the service gets stuck
+        function Restart-LocalProbeService {
+            [CmdletBinding(SupportsShouldProcess)]
+            param()
+
+            $serviceName = 'PRTGProbeService'
+            $timeoutSec = 60
+
+            $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if (-not $svc) {
+                Write-Warning "PRTGProbeService not found on this machine. If the probe runs on a different server, restart it there manually."
+                return 'NotFound'
+            }
+
+            Write-Verbose "PRTGProbeService found locally (Status: $($svc.Status))"
+
+            if (-not $PSCmdlet.ShouldProcess($serviceName, 'Restart PRTG Probe Service')) {
+                return 'SkippedByUser'
+            }
+
+            if ($svc.Status -eq 'Running') {
+                Write-Verbose "Stopping PRTGProbeService (timeout: ${timeoutSec}s)..."
+                try {
+                    $svc.Stop()
+                } catch {
+                    Write-Verbose "Stop() call threw: $_"
+                }
+
+                try {
+                    $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($timeoutSec))
+                    Write-Verbose "PRTGProbeService stopped gracefully"
+                } catch {
+                    Write-Warning "PRTGProbeService did not stop within ${timeoutSec}s -- attempting Stop-StuckService..."
+
+                    if (Get-Command -Name Stop-StuckService -ErrorAction SilentlyContinue) {
+                        try {
+                            Stop-StuckService -Name $serviceName
+                            Start-Sleep -Seconds 3
+                            $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+                            if ($svc.Status -ne 'Stopped') {
+                                Write-Warning "Stop-StuckService ran but service status is: $($svc.Status)"
+                                return 'StuckKillFailed'
+                            }
+                            Write-Verbose "Stop-StuckService successfully killed the stuck probe process"
+                        } catch {
+                            Write-Warning "Stop-StuckService failed: $_"
+                            return 'StuckKillFailed'
+                        }
+                    } else {
+                        Write-Warning "Stop-StuckService not available. Load MauleTech functions (irm ps.mauletech.com | iex) and retry, or manually kill the probe process."
+                        return 'StuckNoKill'
+                    }
+                }
+            }
+
+            Write-Verbose "Starting PRTGProbeService..."
+            try {
+                Start-Service -Name $serviceName -ErrorAction Stop
+            } catch {
+                Write-Warning "Start-Service failed: $_"
+                return 'StartFailed'
+            }
+
+            try {
+                $svc = Get-Service -Name $serviceName
+                $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds($timeoutSec))
+                Write-Verbose "PRTGProbeService restarted successfully"
+                return 'Restarted'
+            } catch {
+                Write-Warning "PRTGProbeService did not reach Running state within ${timeoutSec}s: $_"
+                return 'StartTimeout'
+            }
+        }
+
+        $repairedComputers = [System.Collections.Generic.List[string]]::new()
+    }
+
+    process {
+        foreach ($computer in $ComputerName) {
+            Write-Verbose "[$computer] Starting WMI repair sequence$(if ($Force) { ' (Force mode)' })"
+
+            $result = [PSCustomObject]@{
+                ComputerName    = $computer
+                PortCheck       = 'Skipped'
+                ServiceRestart  = 'Skipped'
+                WmiprvseCleanup = 'Skipped'
+                EarlyTest       = 'Skipped'
+                DLLReregister   = 'Skipped'
+                MOFRecompile    = 'Skipped'
+                DCOMPermissions = 'Skipped'
+                RepoConsistency = 'Skipped'
+                RepoSalvage     = 'Skipped'
+                FinalTest       = 'Skipped'
+                Uptime          = $null
+                Status          = 'Unknown'
+            }
+
+            if (-not $SkipPortCheck) {
+                Write-Verbose "[$computer] Step 0 - Testing TCP 135 (DCOM/RPC endpoint mapper)"
+                try {
+                    $portTest = Test-NetConnection -ComputerName $computer -Port 135 -WarningAction SilentlyContinue
+                    if ($portTest.TcpTestSucceeded) {
+                        $result.PortCheck = 'Open'
+                        Write-Verbose "[$computer] TCP 135 is open"
+                    } else {
+                        $result.PortCheck = 'Blocked'
+                        $result.Status = 'PortBlocked'
+                        Write-Warning "[$computer] TCP 135 is blocked. This is likely a firewall issue, not a WMI service issue. Verify DCOM/WMI firewall rules."
+                        $result
+                        continue
+                    }
+                } catch {
+                    $result.PortCheck = "TestFailed: $_"
+                    Write-Verbose "[$computer] Port check failed, continuing with repair anyway"
+                }
+            }
+
+            try {
+                Write-Verbose "[$computer] Establishing PSRemoting session"
+                $session = New-PSSession -ComputerName $computer @sessionParams
+            } catch {
+                Write-Warning "[$computer] Failed to establish PSRemoting session: $_"
+                $result.Status = 'RemotingFailed'
+                $result
+                continue
+            }
+
+            try {
+                Write-Verbose "[$computer] Step 1 - Restarting WMI service, dependencies, and cleaning up wmiprvse"
+                $step1 = Invoke-Command -Session $session -ScriptBlock {
+                    param($stopBlock, $startBlock)
+                    $svcResult = 'Skipped'
+                    $cleanResult = 'Skipped'
+                    try {
+                        $deps = & $([ScriptBlock]::Create($stopBlock))
+                        Restart-Service -Name Winmgmt -Force -ErrorAction Stop
+                        Start-Sleep -Seconds 3
+                        if ($deps) {
+                            & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps
+                        }
+                        $svcResult = 'Success'
+                    } catch {
+                        $svcResult = "Failed: $_"
+                    }
+                    try {
+                        $procs = Get-Process -Name wmiprvse -ErrorAction SilentlyContinue
+                        if ($procs) {
+                            $count = $procs.Count
+                            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Seconds 2
+                            $cleanResult = "Killed $count orphaned wmiprvse.exe process(es)"
+                        } else {
+                            $cleanResult = 'NoneFound'
+                        }
+                    } catch {
+                        $cleanResult = "Failed: $_"
+                    }
+                    return @{ ServiceRestart = $svcResult; WmiprvseCleanup = $cleanResult }
+                } -ArgumentList $stopDependentsStr, $startDependentsStr
+                $result.ServiceRestart = $step1.ServiceRestart
+                $result.WmiprvseCleanup = $step1.WmiprvseCleanup
+                Write-Verbose "[$computer] Service restart: $($step1.ServiceRestart), wmiprvse cleanup: $($step1.WmiprvseCleanup)"
+
+                Write-Verbose "[$computer] Step 2 - Early WMI connectivity test"
+                $earlyTest = Test-WMIConnectivity -Target $computer -Cred $Credential
+                $earlyTestPassed = $earlyTest.Pass
+
+                if ($earlyTestPassed -and -not $Force) {
+                    $result.EarlyTest = $earlyTest.Detail
+                    $result.Uptime = $earlyTest.Uptime
+                    $result.FinalTest = $earlyTest.Detail
+                    $result.Status = 'Repaired'
+                    Write-Verbose "[$computer] WMI responded after service restart (uptime: $($earlyTest.Uptime)) -- skipping heavier repairs"
+                } else {
+                    if ($earlyTestPassed) {
+                        $result.EarlyTest = "$($earlyTest.Detail) (continuing due to -Force)"
+                        Write-Verbose "[$computer] WMI responded but -Force specified -- running all repairs"
+                    } else {
+                        $result.EarlyTest = $earlyTest.Detail
+                        Write-Verbose "[$computer] WMI still failing after restart, continuing with deeper repairs"
+                    }
+
+                    Write-Verbose "[$computer] Step 3 - Re-registering WMI provider DLLs and recompiling MOFs"
+                    $step3 = Invoke-Command -Session $session -ScriptBlock {
+                        $sysDir = "$env:SystemRoot\System32\wbem"
+                        $dllResult = 'Skipped'
+                        $mofResult = 'Skipped'
+
+                        try {
+                            $dlls = @(
+                                'scrcons.dll', 'unsecapp.dll', 'wmiprvsd.dll',
+                                'wmiprvse.dll', 'wmisvc.dll', 'wbemcomn.dll',
+                                'wbemprox.dll', 'wbemcore.dll', 'wbemsvc.dll',
+                                'fastprox.dll', 'mofd.dll', 'cimwin32.dll',
+                                'wmiutils.dll', 'repdrvfs.dll', 'wmipiprt.dll'
+                            )
+                            $errors = @()
+                            foreach ($dll in $dlls) {
+                                $dllPath = Join-Path $sysDir $dll
+                                if (Test-Path $dllPath) {
+                                    & regsvr32.exe /s $dllPath 2>&1 | Out-Null
+                                    if ($LASTEXITCODE -ne 0) {
+                                        $errors += "$dll (exit $LASTEXITCODE)"
+                                    }
+                                }
+                            }
+                            if ($errors.Count -gt 0) {
+                                $dllResult = "PartialSuccess ($($errors -join ', '))"
+                            } else {
+                                $dllResult = 'Success'
+                            }
+                        } catch {
+                            $dllResult = "Failed: $_"
+                        }
+
+                        try {
+                            $coreMofs = @(
+                                'cimwin32.mof', 'cimwin32.mfl',
+                                'win32_encryptablevolume.mof',
+                                'rsop.mof', 'rsop.mfl',
+                                'wmi.mof', 'wmi.mfl',
+                                'wmitimep.mof',
+                                'regevent.mof',
+                                'ntevt.mof', 'ntevt.mfl',
+                                'secrcw32.mof', 'secrcw32.mfl',
+                                'dsprov.mof', 'dsprov.mfl',
+                                'scrcons.mof',
+                                'tscfgwmi.mof', 'tscfgwmi.mfl',
+                                'rdpdr.mof'
+                            )
+                            $compiled = 0
+                            $failed = 0
+                            foreach ($mofName in $coreMofs) {
+                                $mofPath = Join-Path $sysDir $mofName
+                                if (Test-Path $mofPath) {
+                                    & mofcomp.exe $mofPath 2>&1 | Out-Null
+                                    if ($LASTEXITCODE -eq 0) {
+                                        $compiled++
+                                    } else {
+                                        $failed++
+                                    }
+                                }
+                            }
+                            $mofResult = "Compiled: $compiled, Failed: $failed"
+                        } catch {
+                            $mofResult = "Failed: $_"
+                        }
+
+                        return @{ DLLReregister = $dllResult; MOFRecompile = $mofResult }
+                    }
+                    $result.DLLReregister = $step3.DLLReregister
+                    $result.MOFRecompile = $step3.MOFRecompile
+                    Write-Verbose "[$computer] DLL re-register: $($step3.DLLReregister), MOF recompile: $($step3.MOFRecompile)"
+
+                    Write-Verbose "[$computer] Step 4 - Resetting DCOM/WMI namespace permissions"
+                    $dcomResult = Invoke-Command -Session $session -ScriptBlock {
+                        try {
+                            $namespace = [wmiclass]'root\cimv2:__SystemSecurity'
+                            $sd = $namespace.GetSD()
+                            if ($sd.ReturnValue -eq 0) {
+                                $setResult = $namespace.SetSD($sd.SD)
+                                if ($setResult.ReturnValue -eq 0) {
+                                    return 'Success'
+                                } else {
+                                    return "SetSD returned $($setResult.ReturnValue)"
+                                }
+                            } else {
+                                return "GetSD returned $($sd.ReturnValue)"
+                            }
+                        } catch {
+                            return "Failed: $_"
+                        }
+                    }
+                    $result.DCOMPermissions = $dcomResult
+                    Write-Verbose "[$computer] DCOM permissions reset: $dcomResult"
+
+                    Write-Verbose "[$computer] Step 5 - Checking WMI repository consistency (salvage if needed)"
+                    $step5 = Invoke-Command -Session $session -ScriptBlock {
+                        param($stopBlock, $startBlock)
+                        $consistency = 'Skipped'
+                        $salvage = 'Skipped'
+                        try {
+                            $output = & winmgmt /verifyrepository 2>&1
+                            $outputStr = ($output | Out-String).Trim()
+                            if ($outputStr -match 'is consistent' -and $outputStr -notmatch 'not consistent') {
+                                $consistency = 'Consistent'
+                            } else {
+                                $consistency = "Inconsistent: $outputStr"
+                                # Salvage: stop Winmgmt, repair, restart
+                                $deps = $null
+                                try {
+                                    $deps = & $([ScriptBlock]::Create($stopBlock))
+                                    Stop-Service -Name Winmgmt -Force -ErrorAction Stop
+                                    & winmgmt /salvagerepository 2>&1 | Out-Null
+                                    Start-Service -Name Winmgmt -ErrorAction Stop
+                                    Start-Sleep -Seconds 3
+                                    if ($deps) {
+                                        & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps
+                                    }
+                                    $verify = & winmgmt /verifyrepository 2>&1
+                                    $verifyStr = ($verify | Out-String).Trim()
+                                    if ($verifyStr -match 'is consistent' -and $verifyStr -notmatch 'not consistent') {
+                                        $salvage = 'SalvagedSuccessfully'
+                                    } else {
+                                        $salvage = "SalvageFailed: $verifyStr"
+                                    }
+                                } catch {
+                                    # Ensure Winmgmt is restarted even if salvage fails
+                                    try { Start-Service -Name Winmgmt -ErrorAction SilentlyContinue } catch {}
+                                    if ($deps) {
+                                        try { & $([ScriptBlock]::Create($startBlock)) -ServiceNames $deps } catch {}
+                                    }
+                                    $salvage = "Failed: $_"
+                                }
+                            }
+                        } catch {
+                            $consistency = "Failed: $_"
+                        }
+                        return @{ RepoConsistency = $consistency; RepoSalvage = $salvage }
+                    } -ArgumentList $stopDependentsStr, $startDependentsStr
+                    $result.RepoConsistency = $step5.RepoConsistency
+                    $result.RepoSalvage = $step5.RepoSalvage
+                    Write-Verbose "[$computer] Repository: $($step5.RepoConsistency), Salvage: $($step5.RepoSalvage)"
+
+                    Write-Verbose "[$computer] Step 6 - Final WMI connectivity test (DCOM + uptime)"
+                    $finalTest = Test-WMIConnectivity -Target $computer -Cred $Credential
+                    $result.FinalTest = $finalTest.Detail
+                    $result.Uptime = $finalTest.Uptime
+                    if ($finalTest.Pass) {
+                        $result.Status = 'Repaired'
+                    } else {
+                        $result.Status = 'VerificationFailed'
+                    }
+                    Write-Verbose "[$computer] Final WMI test: $($finalTest.Detail), Uptime: $($finalTest.Uptime)"
+                }
+
+            } finally {
+                if ($session) {
+                    Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+                }
+            }
+
+            if ($result.Status -eq 'Repaired') {
+                $repairedComputers.Add($computer)
+                Write-Verbose "[$computer] WMI repair completed successfully. Rescan the PRTG sensor to confirm."
+            } else {
+                Write-Warning "[$computer] WMI repair completed but verification failed. A reboot may still be needed."
+            }
+
+            $result
+        }
+    }
+
+    end {
+        if ($repairedComputers.Count -eq 0) {
+            return
+        }
+
+        if ($RestartProbe) {
+            Write-Host ''
+            Write-Host "WMI is working on: $($repairedComputers -join ', ')" -ForegroundColor Green
+            Write-Host 'If PRTG sensors are still showing PE015, the probe likely has a hung connection.' -ForegroundColor Yellow
+            Write-Host ''
+
+            $probeResult = Restart-LocalProbeService
+            Write-Host "Probe restart result: $probeResult" -ForegroundColor Cyan
+        } else {
+            # Check if probe is local and suggest -RestartProbe if so
+            $localProbe = Get-Service -Name PRTGProbeService -ErrorAction SilentlyContinue
+            if ($localProbe) {
+                Write-Host ''
+                Write-Host "WMI is working on: $($repairedComputers -join ', ')" -ForegroundColor Green
+                Write-Host 'TIP: If the PRTG sensor still shows PE015, the probe may have a hung connection.' -ForegroundColor Yellow
+                Write-Host 'Run again with -RestartProbe to restart the local PRTGProbeService.' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

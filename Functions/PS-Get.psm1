@@ -2771,6 +2771,69 @@ Function Get-VSSWriter {
 	END { } #END
 }
 
+Function Find-CrocExe {
+    <#
+    .SYNOPSIS
+        Searches PATH and known WinGet install locations for croc.exe.
+    .DESCRIPTION
+        Refreshes the PATH environment variable, then checks for croc via
+        Get-Command and known WinGet package installation directories.
+        Returns the full path to croc.exe if found, or $null.
+    .EXAMPLE
+        Find-CrocExe
+        Returns "C:\Users\user\AppData\Local\...\croc.exe" or $null
+    #>
+    [CmdletBinding()]
+    param()
+
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $cmd = Get-Command croc -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $knownPaths = @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\schollz.croc_Microsoft.Winget.Source_8wekyb3d8bbwe\croc.exe",
+        "C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\WinGet\Packages\schollz.croc_Microsoft.Winget.Source_8wekyb3d8bbwe\croc.exe"
+    )
+    foreach ($p in $knownPaths) { if (Test-Path $p) { return $p } }
+
+    # Targeted search: only look inside schollz.croc_* directories, not a full recursive scan
+    foreach ($root in @("$env:LOCALAPPDATA\Microsoft\WinGet\Packages", "C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\WinGet\Packages")) {
+        if (Test-Path $root) {
+            $match = Get-ChildItem -Path $root -Filter 'schollz.croc_*' -Directory -ErrorAction SilentlyContinue |
+                     ForEach-Object { Join-Path $_.FullName 'croc.exe' } |
+                     Where-Object { Test-Path $_ } |
+                     Select-Object -First 1
+            if ($match) { return $match }
+        }
+    }
+    return $null
+}
+
+Function Get-CrocPath {
+    <#
+    .SYNOPSIS
+        Returns the path to the croc executable, installing it if needed.
+    .DESCRIPTION
+        Searches for croc.exe using Find-CrocExe. If not found, calls
+        Install-Croc to install it automatically. Throws if the executable
+        cannot be found or installed.
+    .EXAMPLE
+        Get-CrocPath
+        Returns "C:\Users\user\AppData\Local\...\croc.exe"
+    #>
+    [CmdletBinding()]
+    param()
+
+    $path = Find-CrocExe
+    if ($path) { return $path }
+
+    $path = Install-Croc
+    if (-not $path -or -not (Test-Path $path)) {
+        throw "croc installation completed but executable not found. Try running Install-Croc manually."
+    }
+    return $path
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

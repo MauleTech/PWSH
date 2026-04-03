@@ -755,6 +755,9 @@ Function Update-NTPDateTime {
 	#endregion
 
 	#region Sync -- NTP Diagnostics
+	$ntpQuery = $null
+	$SyncThresholdMs = 2000
+
 	if (-not $SkipDiagnostics) {
 		$ConfiguredSource = $null
 		try {
@@ -767,23 +770,44 @@ Function Update-NTPDateTime {
 		# Detect domain membership and VM status
 		$computerSystem = $null
 		try { $computerSystem = Get-WmiObject Win32_ComputerSystem -ErrorAction Stop } catch {}
-		$isDomainJoined = $false
-		$domainName     = $null
-		if ($computerSystem -and $computerSystem.PartOfDomain) {
-			$isDomainJoined = $true
-			$domainName     = $computerSystem.Domain
-		}
+		$isDomainJoined = $computerSystem -and $computerSystem.PartOfDomain
+		$domainName     = if ($isDomainJoined) { $computerSystem.Domain } else { $null }
+		$vmicRunning    = (Get-Service 'vmictimesync' -ErrorAction SilentlyContinue).Status -eq 'Running'
 
-		# Detect Hyper-V time sync integration service
-		$vmicRunning = $false
-		try {
-			$vmicSvc = Get-Service 'vmictimesync' -ErrorAction Stop
-			if ($vmicSvc.Status -eq 'Running') { $vmicRunning = $true }
-		} catch {}
+		# Cache PDC and NTP results so each is queried at most once
+		$pdcHost = $null
+		if ($isDomainJoined) {
+			try {
+				$pdcHost = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).PdcRoleOwner.Name
+			} catch {}
+		}
+		$ntpQuery  = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
+		$pdcResult = if ($pdcHost) { Get-NTPOffset -Server $pdcHost -TimeoutMs 5000 } else { $null }
+
+		# Helper: compare two NTP results and write output
+		function Write-NTPComparison {
+			param($ResultA, $NameA, $ResultB, $NameB, [string]$DriftWarning)
+			if ($ResultA.Success -and $ResultB.Success) {
+				$discrepancyMs  = [Math]::Abs(($ResultA.NTPTimeUtc - $ResultB.NTPTimeUtc).TotalMilliseconds)
+				$discrepancySec = [Math]::Round($discrepancyMs / 1000, 2)
+				if ($discrepancyMs -gt $SyncThresholdMs) {
+					Write-Host "WARNING: '$NameA' is $discrepancySec seconds out of sync with '$NameB'." -ForegroundColor Yellow
+					if ($DriftWarning) { Write-Host $DriftWarning -ForegroundColor Yellow }
+				} else {
+					Write-Host "'$NameA' is in sync with '$NameB' (discrepancy: ${discrepancySec}s)." -ForegroundColor Green
+				}
+			} else {
+				if (-not $ResultA.Success) {
+					Write-Host "Could not query '$NameA': $($ResultA.Error)" -ForegroundColor Yellow
+				}
+				if (-not $ResultB.Success) {
+					Write-Host "Could not query '$NameB': $($ResultB.Error)" -ForegroundColor Yellow
+				}
+			}
+		}
 
 		Write-Host "`n=== NTP Sync Diagnostics ===" -ForegroundColor Cyan
 
-		# Show environment context
 		if ($isDomainJoined) {
 			Write-Host "Machine is domain-joined: $domainName" -ForegroundColor Cyan
 		}
@@ -796,76 +820,32 @@ Function Update-NTPDateTime {
 			if ($isDomainJoined) {
 				Write-Host "This machine is domain-joined but W32Time is not responding." -ForegroundColor Yellow
 				Write-Host "It should be syncing time from a domain controller." -ForegroundColor Yellow
-
-				# Try to discover the PDC emulator and compare
-				$pdcHost = $null
-				try {
-					$pdcHost = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).PdcRoleOwner.Name
-				} catch {}
 				if ($pdcHost) {
 					Write-Host "PDC emulator: $pdcHost" -ForegroundColor Cyan
-					Write-Host "Querying PDC as NTP source for comparison..." -ForegroundColor Cyan
-					$pdcResult = Get-NTPOffset -Server $pdcHost -TimeoutMs 5000
-					$ntpResult = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
-					if ($pdcResult.Success -and $ntpResult.Success) {
-						$discrepancyMs  = [Math]::Abs(($pdcResult.NTPTimeUtc - $ntpResult.NTPTimeUtc).TotalMilliseconds)
-						$discrepancySec = [Math]::Round($discrepancyMs / 1000, 2)
-						if ($discrepancyMs -gt 2000) {
-							Write-Host "WARNING: PDC '$pdcHost' is $discrepancySec seconds out of sync with '$NTPServer'." -ForegroundColor Yellow
-							Write-Host "The domain controller itself appears to have drifted." -ForegroundColor Yellow
-						} else {
-							Write-Host "PDC '$pdcHost' is in sync with '$NTPServer' (discrepancy: ${discrepancySec}s)." -ForegroundColor Green
-						}
-					} else {
-						if (-not $pdcResult.Success) {
-							Write-Host "Could not query PDC '$pdcHost' via NTP: $($pdcResult.Error)" -ForegroundColor Yellow
-						}
-						if (-not $ntpResult.Success) {
-							Write-Host "Could not query NTP server '$NTPServer': $($ntpResult.Error)" -ForegroundColor Yellow
-						}
-					}
+					Write-NTPComparison $pdcResult $pdcHost $ntpQuery $NTPServer `
+						'The domain controller itself appears to have drifted.'
 				}
 			}
 		} elseif ($ConfiguredSource -eq 'VM IC Time Synchronization Provider') {
 			Write-Host "Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
 			Write-Host "This machine is syncing time from its Hyper-V host." -ForegroundColor Cyan
 
-			# Compare current system time against the NTP server to detect host drift
 			Write-Host "Comparing system time against '$NTPServer' to check for host drift..." -ForegroundColor Cyan
-			$ntpResult = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
-			if ($ntpResult.Success) {
-				$driftMs  = [Math]::Abs($ntpResult.OffsetMs)
+			if ($ntpQuery.Success) {
+				$driftMs  = [Math]::Abs($ntpQuery.OffsetMs)
 				$driftSec = [Math]::Round($driftMs / 1000, 2)
-				if ($driftMs -gt 2000) {
+				if ($driftMs -gt $SyncThresholdMs) {
 					Write-Host "WARNING: System clock is $driftSec seconds offset from '$NTPServer'." -ForegroundColor Yellow
 					Write-Host "The Hyper-V host may be providing inaccurate time." -ForegroundColor Yellow
 				} else {
 					Write-Host "System clock is in sync with '$NTPServer' (offset: ${driftSec}s)." -ForegroundColor Green
 				}
 			} else {
-				Write-Host "Could not query NTP server '$NTPServer': $($ntpResult.Error)" -ForegroundColor Yellow
+				Write-Host "Could not query NTP server '$NTPServer': $($ntpQuery.Error)" -ForegroundColor Yellow
 			}
 
-			# If also domain-joined, check DC time too
-			if ($isDomainJoined) {
-				$pdcHost = $null
-				try {
-					$pdcHost = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).PdcRoleOwner.Name
-				} catch {}
-				if ($pdcHost -and $ntpResult.Success) {
-					$pdcResult = Get-NTPOffset -Server $pdcHost -TimeoutMs 5000
-					if ($pdcResult.Success) {
-						$dcDriftMs  = [Math]::Abs(($pdcResult.NTPTimeUtc - $ntpResult.NTPTimeUtc).TotalMilliseconds)
-						$dcDriftSec = [Math]::Round($dcDriftMs / 1000, 2)
-						if ($dcDriftMs -gt 2000) {
-							Write-Host "WARNING: Domain PDC '$pdcHost' is $dcDriftSec seconds out of sync with '$NTPServer'." -ForegroundColor Yellow
-						} else {
-							Write-Host "Domain PDC '$pdcHost' is in sync with '$NTPServer' (discrepancy: ${dcDriftSec}s)." -ForegroundColor Green
-						}
-					} else {
-						Write-Host "Could not query PDC '$pdcHost' via NTP: $($pdcResult.Error)" -ForegroundColor Yellow
-					}
-				}
+			if ($pdcHost -and $pdcResult -and $ntpQuery.Success) {
+				Write-NTPComparison $pdcResult $pdcHost $ntpQuery $NTPServer
 			}
 		} elseif ($ConfiguredSource -match '^(Local CMOS Clock|Free-running System Clock)$') {
 			Write-Host "Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
@@ -874,31 +854,14 @@ Function Update-NTPDateTime {
 				Write-Host "WARNING: This machine is domain-joined ($domainName) but is NOT syncing time from a domain controller." -ForegroundColor Yellow
 				Write-Host "The Windows Time service may not be configured correctly." -ForegroundColor Yellow
 
-				# Discover PDC and compare against NTP
-				$pdcHost = $null
-				try {
-					$pdcHost = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).PdcRoleOwner.Name
-				} catch {}
 				if ($pdcHost) {
 					Write-Host "PDC emulator: $pdcHost" -ForegroundColor Cyan
-					$pdcResult = Get-NTPOffset -Server $pdcHost -TimeoutMs 5000
-					$ntpResult = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
-					if ($pdcResult.Success -and $ntpResult.Success) {
-						$discrepancyMs  = [Math]::Abs(($pdcResult.NTPTimeUtc - $ntpResult.NTPTimeUtc).TotalMilliseconds)
-						$discrepancySec = [Math]::Round($discrepancyMs / 1000, 2)
-						if ($discrepancyMs -gt 2000) {
-							Write-Host "WARNING: PDC '$pdcHost' is $discrepancySec seconds out of sync with '$NTPServer'." -ForegroundColor Yellow
-							Write-Host "The domain controller itself appears to have drifted." -ForegroundColor Yellow
-						} else {
-							Write-Host "PDC '$pdcHost' is in sync with '$NTPServer' (discrepancy: ${discrepancySec}s)." -ForegroundColor Green
+					Write-NTPComparison $pdcResult $pdcHost $ntpQuery $NTPServer `
+						'The domain controller itself appears to have drifted.'
+					if ($pdcResult.Success -and $ntpQuery.Success) {
+						$discrepancyMs = [Math]::Abs(($pdcResult.NTPTimeUtc - $ntpQuery.NTPTimeUtc).TotalMilliseconds)
+						if ($discrepancyMs -le $SyncThresholdMs) {
 							Write-Host "The issue is that this machine is not configured to sync from the DC." -ForegroundColor Yellow
-						}
-					} else {
-						if (-not $pdcResult.Success) {
-							Write-Host "Could not query PDC '$pdcHost' via NTP: $($pdcResult.Error)" -ForegroundColor Yellow
-						}
-						if (-not $ntpResult.Success) {
-							Write-Host "Could not query NTP server '$NTPServer': $($ntpResult.Error)" -ForegroundColor Yellow
 						}
 					}
 				} else {
@@ -917,28 +880,9 @@ Function Update-NTPDateTime {
 			Write-Host "Configured Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
 			Write-Host "Specified NTP server:           $NTPServer" -ForegroundColor Cyan
 
-			# Query both sources and compare
 			$sourceResult = Get-NTPOffset -Server $ConfiguredSource -TimeoutMs 5000
-			$ntpResult    = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
-
-			if ($sourceResult.Success -and $ntpResult.Success) {
-				$discrepancyMs = [Math]::Abs(($sourceResult.NTPTimeUtc - $ntpResult.NTPTimeUtc).TotalMilliseconds)
-				$discrepancySec = [Math]::Round($discrepancyMs / 1000, 2)
-
-				if ($discrepancyMs -gt 2000) {
-					Write-Host "WARNING: '$ConfiguredSource' is $discrepancySec seconds out of sync with '$NTPServer'." -ForegroundColor Yellow
-					Write-Host "This may indicate your time source (e.g., a domain controller) has drifted." -ForegroundColor Yellow
-				} else {
-					Write-Host "Time sources are in sync (discrepancy: ${discrepancySec}s)." -ForegroundColor Green
-				}
-			} else {
-				if (-not $sourceResult.Success) {
-					Write-Host "Could not query configured source '$ConfiguredSource': $($sourceResult.Error)" -ForegroundColor Yellow
-				}
-				if (-not $ntpResult.Success) {
-					Write-Host "Could not query NTP server '$NTPServer': $($ntpResult.Error)" -ForegroundColor Yellow
-				}
-			}
+			Write-NTPComparison $sourceResult $ConfiguredSource $ntpQuery $NTPServer `
+				'This may indicate your time source (e.g., a domain controller) has drifted.'
 		}
 		Write-Host ""
 	}
@@ -948,7 +892,10 @@ Function Update-NTPDateTime {
 	Write-Host "Current system date/time is:"
 	Write-Host (Get-Date).DateTime
 
-	$ntpQuery = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
+	# Reuse the NTP query from diagnostics if available, otherwise query now
+	if (-not $ntpQuery) {
+		$ntpQuery = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
+	}
 	if (-not $ntpQuery.Success) {
 		Write-Host "Failed to query NTP server '$NTPServer': $($ntpQuery.Error)" -ForegroundColor Red
 		return

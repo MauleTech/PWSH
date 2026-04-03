@@ -1146,6 +1146,13 @@ Function Repair-NTPConfiguration {
         Write-Host "`n  Registering w32time..." -ForegroundColor Cyan
         & w32tm /register 2>&1 | ForEach-Object { Write-Host "    $_" }
 
+        # Explicitly configure domain hierarchy sync after registration.
+        # w32tm /register restores installation defaults but does not reliably
+        # set syncfromflags on all Windows versions -- configure it explicitly.
+        Write-Host "`n  Configuring domain hierarchy sync (NT5DS)..." -ForegroundColor Cyan
+        & w32tm /config /syncfromflags:domhier /reliable:NO /update 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+
         Write-Host "`n  Sync from PDC (pass 2 -- after register)..." -ForegroundColor Cyan
         & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
 
@@ -1164,9 +1171,21 @@ Function Repair-NTPConfiguration {
         Write-Host "`n  Final sync from PDC (pass 4)..." -ForegroundColor Cyan
         & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
 
+        & w32tm /resync /force 2>&1 | ForEach-Object { Write-Host "    $_" }
+
         $finalSrc = & w32tm /query /source 2>&1
-        Write-Host "  Final time source: $finalSrc" -ForegroundColor Green
-        Write-Host "`nDomain member NTP reset complete." -ForegroundColor Green
+        $finalSrcStr = "$finalSrc"
+        $stillBad = $finalSrcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
+                    $finalSrcStr -eq ''
+        if ($stillBad) {
+            Write-Host "  Final time source: $finalSrc" -ForegroundColor Yellow
+            Write-Host "`nWARNING: w32time source is still not syncing from the domain." -ForegroundColor Yellow
+            Write-Host "Check for Group Policy overrides: Computer Configuration -> Administrative Templates -> System -> Windows Time Service" -ForegroundColor Yellow
+            Write-Host "Run 'w32tm /query /configuration' and 'w32tm /query /status' for further diagnostics." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Final time source: $finalSrc" -ForegroundColor Green
+            Write-Host "`nDomain member NTP reset complete." -ForegroundColor Green
+        }
         return
     }
     #endregion

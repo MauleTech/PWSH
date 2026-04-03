@@ -1146,18 +1146,17 @@ Function Repair-NTPConfiguration {
         Write-Host "`n  Registering w32time..." -ForegroundColor Cyan
         & w32tm /register 2>&1 | ForEach-Object { Write-Host "    $_" }
 
-        # Explicitly configure domain hierarchy sync after registration.
-        # w32tm /register restores installation defaults but does not reliably
-        # set syncfromflags on all Windows versions -- configure it explicitly.
-        Write-Host "`n  Configuring domain hierarchy sync (NT5DS)..." -ForegroundColor Cyan
-        & w32tm /config /syncfromflags:domhier /reliable:NO /update 2>&1 |
-            ForEach-Object { Write-Host "    $_" }
-
         Write-Host "`n  Sync from PDC (pass 2 -- after register)..." -ForegroundColor Cyan
         & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
 
         Write-Host "`n  Starting w32time..." -ForegroundColor Cyan
         & net start w32time 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        # w32tm /config uses RPC and requires the service to be running.
+        # Must come after net start w32time -- not before.
+        Write-Host "`n  Configuring domain hierarchy sync (NT5DS)..." -ForegroundColor Cyan
+        & w32tm /config /syncfromflags:domhier /reliable:NO /update 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
 
         Write-Host "`n  Sync from PDC (pass 3 -- after start)..." -ForegroundColor Cyan
         & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
@@ -1177,14 +1176,95 @@ Function Repair-NTPConfiguration {
         $finalSrcStr = "$finalSrc"
         $stillBad = $finalSrcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
                     $finalSrcStr -eq ''
-        if ($stillBad) {
-            Write-Host "  Final time source: $finalSrc" -ForegroundColor Yellow
-            Write-Host "`nWARNING: w32time source is still not syncing from the domain." -ForegroundColor Yellow
-            Write-Host "Check for Group Policy overrides: Computer Configuration -> Administrative Templates -> System -> Windows Time Service" -ForegroundColor Yellow
-            Write-Host "Run 'w32tm /query /configuration' and 'w32tm /query /status' for further diagnostics." -ForegroundColor Yellow
-        } else {
+
+        if (-not $stillBad) {
             Write-Host "  Final time source: $finalSrc" -ForegroundColor Green
             Write-Host "`nDomain member NTP reset complete." -ForegroundColor Green
+            return
+        }
+
+        Write-Host "  Final time source: $finalSrc" -ForegroundColor Yellow
+        Write-Host ""
+
+        # Check whether Group Policy is locking the NTP configuration.
+        # w32tm /config writes to HKLM\SYSTEM\...\Services\W32Time but the service
+        # reads HKLM\SOFTWARE\Policies\Microsoft\W32Time preferentially when GPO
+        # has written values there. Anything tagged (Policy) in /query /configuration
+        # cannot be overridden by w32tm /config.
+        $configOutput = (& w32tm /query /configuration 2>&1) | Out-String
+        $hasPolicySettings = $configOutput -match '\(Policy\)'
+
+        if ($hasPolicySettings) {
+            $policyType      = $null
+            $policyNtpServer = $null
+            if ($configOutput -match 'Type:\s+(\S+)\s+\(Policy\)') {
+                $policyType = $Matches[1]
+            }
+            if ($configOutput -match 'NtpServer:\s+(\S+)\s+\(Policy\)') {
+                # Strip NTP flags (e.g. ",0x8") to get the bare hostname
+                $policyNtpServer = ($Matches[1]) -replace ',.*$', ''
+            }
+
+            Write-Host "Group Policy is overriding w32time configuration:" -ForegroundColor Yellow
+            if ($policyType)      { Write-Host "  Type (Policy):      $policyType" -ForegroundColor Yellow }
+            if ($policyNtpServer) { Write-Host "  NtpServer (Policy): $policyNtpServer" -ForegroundColor Yellow }
+            Write-Host "  'w32tm /config' cannot override Policy-tagged settings." -ForegroundColor Yellow
+
+            # Test whether the GPO-specified NTP server is actually reachable
+            if ($policyNtpServer -and (Get-Command Get-NTPOffset -ErrorAction SilentlyContinue)) {
+                Write-Host "`nTesting NTP reachability of '$policyNtpServer'..." -ForegroundColor Cyan
+                $ntpTest = Get-NTPOffset -Server $policyNtpServer -TimeoutMs 5000
+                if ($ntpTest.Success) {
+                    Write-Host "  '$policyNtpServer' is reachable (offset: $([Math]::Round($ntpTest.OffsetMs / 1000, 2))s)." -ForegroundColor Green
+                    Write-Host "  The server is responding -- w32time may need more time to sync." -ForegroundColor Yellow
+                    Write-Host "  Try 'w32tm /resync /rediscover' in a few minutes." -ForegroundColor Yellow
+                } else {
+                    Write-Host "  '$policyNtpServer' is NOT reachable: $($ntpTest.Error)" -ForegroundColor Red
+                    Write-Host "  The GPO is pointing at an NTP server that is not responding." -ForegroundColor Red
+                }
+            }
+
+            # Run gpupdate in case an admin already corrected the GPO but it hasn't been pulled yet
+            Write-Host "`nRunning 'gpupdate /force' in case the GPO was already corrected..." -ForegroundColor Cyan
+            & gpupdate /force 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+            Start-Sleep -Seconds 5
+            & w32tm /resync /rediscover 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+            $postGPUSrc    = & w32tm /query /source 2>&1
+            $postGPUSrcStr = "$postGPUSrc"
+            $stillBadAfterGPU = $postGPUSrcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
+                                $postGPUSrcStr -eq ''
+
+            if (-not $stillBadAfterGPU) {
+                Write-Host "  Time source after gpupdate: $postGPUSrc" -ForegroundColor Green
+                Write-Host "`nDomain member NTP resolved after Group Policy refresh." -ForegroundColor Green
+                return
+            }
+
+            Write-Host "  Time source after gpupdate: $postGPUSrc" -ForegroundColor Yellow
+            Write-Host "`nGroup Policy is still preventing correct NTP sync. A GPO change is required:" -ForegroundColor Yellow
+            Write-Host "  Path: Computer Configuration -> Administrative Templates -> System -> Windows Time Service -> Time Providers" -ForegroundColor Yellow
+            Write-Host "  Options:" -ForegroundColor Yellow
+            if ($policyNtpServer) {
+                Write-Host "    a. Fix NtpServer in the GPO -- '$policyNtpServer' is not responding." -ForegroundColor Yellow
+                Write-Host "       Recommended: point to the PDC emulator ($pdcHost) or remove the policy." -ForegroundColor Yellow
+            } else {
+                Write-Host "    a. Fix the NtpServer value in the GPO or remove the policy." -ForegroundColor Yellow
+            }
+            Write-Host "    b. Set 'Configure Windows NTP Client' to 'Not Configured' to let" -ForegroundColor Yellow
+            Write-Host "       domain members sync via NT5DS (domain hierarchy) automatically." -ForegroundColor Yellow
+            Write-Host "  After updating the GPO, run 'gpupdate /force' then 'w32tm /resync /rediscover'." -ForegroundColor Yellow
+            Write-Host "`n  Diagnostic commands:" -ForegroundColor Cyan
+            Write-Host "    gpresult /r                  -- which GPOs are applied to this machine" -ForegroundColor Cyan
+            Write-Host "    w32tm /query /configuration  -- all settings with (Policy) vs (Local) tags" -ForegroundColor Cyan
+            Write-Host "    w32tm /query /status         -- sync status and last successful sync time" -ForegroundColor Cyan
+        } else {
+            Write-Host "WARNING: w32time source is still not syncing from the domain." -ForegroundColor Yellow
+            Write-Host "No Group Policy override detected. Check the following:" -ForegroundColor Yellow
+            Write-Host "  - The PDC emulator ($pdcHost) is online and responding to NTP (UDP 123)" -ForegroundColor Yellow
+            Write-Host "  - No firewall is blocking UDP 123 between this machine and the DC" -ForegroundColor Yellow
+            Write-Host "  Run 'w32tm /query /configuration' and 'w32tm /query /status' for details." -ForegroundColor Yellow
         }
         return
     }

@@ -1052,19 +1052,33 @@ Function Repair-NTPConfiguration {
         & w32tm /config /manualpeerlist:$peerList /syncfromflags:manual /reliable:YES /update 2>&1 |
             ForEach-Object { Write-Host "  $_" }
 
-        Write-Host "`nStep 5 -- Stop, apply config (second pass), restart, resync:" -ForegroundColor Cyan
+        Write-Host "`nStep 5 -- Stop, restart, apply config (second pass), resync:" -ForegroundColor Cyan
         & net stop w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+        & net start w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+        # Second /config pass after service is running -- /update uses RPC and
+        # requires the service to be active. Both passes ensure the config
+        # survives the stop/start cycle.
         & w32tm /config /manualpeerlist:$peerList /syncfromflags:manual /reliable:YES /update 2>&1 |
             ForEach-Object { Write-Host "  $_" }
-        & net start w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
 
         Write-Host "`nWaiting 30 seconds for w32time to settle..." -ForegroundColor Cyan
         Start-Sleep -Seconds 30
 
         & w32tm /resync 2>&1 | ForEach-Object { Write-Host "  $_" }
-        $finalSrc = & w32tm /query /source 2>&1
-        Write-Host "`nFinal time source: $finalSrc" -ForegroundColor Green
-        Write-Host "PDC Emulator NTP configuration complete." -ForegroundColor Green
+        $finalSrc    = & w32tm /query /source 2>&1
+        $finalSrcStr = "$finalSrc"
+        $stillBad    = $finalSrcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
+                       $finalSrcStr -eq ''
+        if ($stillBad) {
+            Write-Host "`nFinal time source: $finalSrc" -ForegroundColor Yellow
+            Write-Host "WARNING: PDC Emulator is still not syncing from the NTP pool." -ForegroundColor Yellow
+            Write-Host "  - Verify outbound UDP 123 is not blocked to the internet" -ForegroundColor Yellow
+            Write-Host "  - Check for Group Policy overrides: w32tm /query /configuration" -ForegroundColor Yellow
+            Write-Host "  - Check Event Log: Applications and Services -> Microsoft -> Windows -> Time-Service" -ForegroundColor Yellow
+        } else {
+            Write-Host "`nFinal time source: $finalSrc" -ForegroundColor Green
+            Write-Host "PDC Emulator NTP configuration complete." -ForegroundColor Green
+        }
         return
     }
     #endregion

@@ -918,6 +918,399 @@ Function Repair-RemoteWMI {
     }
 }
 
+Function Repair-NTPConfiguration {
+<#
+.SYNOPSIS
+    Repairs Windows Time Service (w32time) configuration based on domain role.
+.DESCRIPTION
+    Detects whether the machine is a PDC Emulator, additional domain controller,
+    domain-joined member, or standalone, then applies the appropriate NTP fix:
+
+      PDC Emulator        -- Unregisters/re-registers w32time, then configures
+                             Tier 3 NTP pool peers and forces a resync.
+      Additional DC       -- Unregisters/re-registers w32time, then configures
+                             NT5DS domain-hierarchy sync toward the PDC Emulator.
+      Domain member       -- Option A: quick 'net time' sync from the PDC.
+                             Falls through to Option B (full reset) if the
+                             Windows Time source is still bad after Option A.
+                             Use -Force to skip Option A entirely.
+      Standalone          -- Unregisters/re-registers w32time and configures
+                             the Tier 3 NTP pool directly.
+
+    Domain members get their time from domain controllers, which get their time
+    from north-america.pool.ntp.org (Tier 3). Do not configure Tier 1 or Tier 2
+    servers directly.
+
+    NOTE: Allow 30+ seconds after starting w32time before trusting
+    'w32tm /query /source' output. This function includes that wait automatically.
+.PARAMETER NTPPool
+    The Tier 3 NTP pool base name to use for PDC Emulator and standalone
+    configuration. Defaults to 'north-america.pool.ntp.org'. Four numbered
+    sub-pools (0. through 3.) are configured automatically.
+.PARAMETER Force
+    On domain-joined members, skip Option A (quick sync) and go directly to
+    the full Option B reset sequence.
+.EXAMPLE
+    Repair-NTPConfiguration
+    Detects role and applies the appropriate NTP fix automatically.
+.EXAMPLE
+    Repair-NTPConfiguration -Force
+    On a domain member, skips the quick sync attempt and runs the full reset.
+.EXAMPLE
+    Repair-NTPConfiguration -NTPPool 'pool.ntp.org'
+    Uses a custom NTP pool for PDC Emulator or standalone configuration.
+.NOTES
+    Requires Administrator privileges. Restarts the Windows Time Service as part
+    of the repair sequence. Schedule a maintenance window if needed.
+    WARNING: Only Tier 3 NTP pool servers are appropriate for direct configuration.
+    Tier 1 and Tier 2 servers are reserved for authorized NTP infrastructure only.
+#>
+    [CmdletBinding()]
+    param(
+        [ValidateNotNullOrEmpty()]
+        [string]$NTPPool = 'north-america.pool.ntp.org',
+
+        [switch]$Force
+    )
+
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host "Administrator privileges are required." -ForegroundColor Red
+        return
+    }
+
+    if ($NTPPool -notmatch '^[a-zA-Z0-9._-]+$') {
+        Write-Host "Invalid NTP pool name: $NTPPool" -ForegroundColor Red
+        return
+    }
+
+    # DomainRole values from Win32_ComputerSystem:
+    #   0 = Standalone Workstation, 1 = Member Workstation,
+    #   2 = Standalone Server,      3 = Member Server,
+    #   4 = Backup/Additional DC,   5 = PDC Emulator
+    $computerSystem = $null
+    try {
+        $computerSystem = Get-WmiObject Win32_ComputerSystem -ErrorAction Stop
+    } catch {
+        Write-Host "Failed to query Win32_ComputerSystem: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    $domainRole = [int]$computerSystem.DomainRole
+    $domainName = $computerSystem.Domain
+    $isPDC      = $domainRole -eq 5
+    $isAddlDC   = $domainRole -eq 4
+    $isMember   = $domainRole -in @(1, 3)
+
+    Write-Host ""
+    switch ($domainRole) {
+        5       { Write-Host "=== Role: PDC Emulator ===" -ForegroundColor Cyan }
+        4       { Write-Host "=== Role: Additional Domain Controller ===" -ForegroundColor Cyan }
+        3       { Write-Host "=== Role: Domain Member Server ===" -ForegroundColor Cyan }
+        1       { Write-Host "=== Role: Domain Member Workstation ===" -ForegroundColor Cyan }
+        2       { Write-Host "=== Role: Standalone Server ===" -ForegroundColor Cyan }
+        0       { Write-Host "=== Role: Standalone Workstation ===" -ForegroundColor Cyan }
+        default { Write-Host "=== Role: Unknown (DomainRole=$domainRole) ===" -ForegroundColor Cyan }
+    }
+    if ($domainRole -ge 1 -and $domainRole -le 5) {
+        Write-Host "Domain: $domainName" -ForegroundColor Cyan
+    }
+    Write-Host ""
+
+    #region Helper -- discover PDC emulator
+    $pdcHost = $null
+    if ($isAddlDC -or $isMember) {
+        try {
+            $pdcHost = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).PdcRoleOwner.Name
+            Write-Host "PDC Emulator: $pdcHost" -ForegroundColor Cyan
+        } catch {
+            Write-Host "WARNING: Could not discover PDC emulator: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    #endregion
+
+    #region PDC Emulator -- configure external Tier 3 NTP pool
+    if ($isPDC) {
+        $peerList = "0.$NTPPool 1.$NTPPool 2.$NTPPool 3.$NTPPool"
+        Write-Host "NTP peers: $peerList" -ForegroundColor Cyan
+        Write-Host ""
+
+        Write-Host "Step 1 -- Current time source:" -ForegroundColor Cyan
+        $src = & w32tm /query /source 2>&1
+        Write-Host "  $src"
+
+        Write-Host "`nStep 2 -- Stop and unregister w32time:" -ForegroundColor Cyan
+        & net stop w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+        & w32tm /unregister 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+        Write-Host "`nStep 3 -- Register and start w32time:" -ForegroundColor Cyan
+        & w32tm /register 2>&1 | ForEach-Object { Write-Host "  $_" }
+        & net start w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+        Write-Host "`nStep 4 -- Configure NTP peers (first pass):" -ForegroundColor Cyan
+        & w32tm /config /manualpeerlist:$peerList /syncfromflags:manual /reliable:YES /update 2>&1 |
+            ForEach-Object { Write-Host "  $_" }
+
+        Write-Host "`nStep 5 -- Stop, restart, apply config (second pass), resync:" -ForegroundColor Cyan
+        & net stop w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+        & net start w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+        # Second /config pass after service is running -- /update uses RPC and
+        # requires the service to be active. Both passes ensure the config
+        # survives the stop/start cycle.
+        & w32tm /config /manualpeerlist:$peerList /syncfromflags:manual /reliable:YES /update 2>&1 |
+            ForEach-Object { Write-Host "  $_" }
+
+        Write-Host "`nWaiting 30 seconds for w32time to settle..." -ForegroundColor Cyan
+        Start-Sleep -Seconds 30
+
+        & w32tm /resync 2>&1 | ForEach-Object { Write-Host "  $_" }
+        $finalSrc    = & w32tm /query /source 2>&1
+        $finalSrcStr = "$finalSrc"
+        $stillBad    = $finalSrcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
+                       $finalSrcStr -eq ''
+        if ($stillBad) {
+            Write-Host "`nFinal time source: $finalSrc" -ForegroundColor Yellow
+            Write-Host "WARNING: PDC Emulator is still not syncing from the NTP pool." -ForegroundColor Yellow
+            Write-Host "  - Verify outbound UDP 123 is not blocked to the internet" -ForegroundColor Yellow
+            Write-Host "  - Check for Group Policy overrides: w32tm /query /configuration" -ForegroundColor Yellow
+            Write-Host "  - Check Event Log: Applications and Services -> Microsoft -> Windows -> Time-Service" -ForegroundColor Yellow
+        } else {
+            Write-Host "`nFinal time source: $finalSrc" -ForegroundColor Green
+            Write-Host "PDC Emulator NTP configuration complete." -ForegroundColor Green
+        }
+        return
+    }
+    #endregion
+
+    #region Additional DC -- sync via NT5DS domain hierarchy toward PDC
+    if ($isAddlDC) {
+        Write-Host "Step 1 -- Current time source:" -ForegroundColor Cyan
+        $src = & w32tm /query /source 2>&1
+        Write-Host "  $src"
+
+        Write-Host "`nStep 2 -- Stop and unregister w32time:" -ForegroundColor Cyan
+        & net stop w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+        & w32tm /unregister 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+        Write-Host "`nStep 3 -- Register and start w32time:" -ForegroundColor Cyan
+        & w32tm /register 2>&1 | ForEach-Object { Write-Host "  $_" }
+        & net start w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+        Write-Host "`nStep 4 -- Configure NT5DS domain hierarchy sync:" -ForegroundColor Cyan
+        & w32tm /config /syncfromflags:domhier /reliable:NO /update 2>&1 |
+            ForEach-Object { Write-Host "  $_" }
+
+        Write-Host "`nWaiting 30 seconds for w32time to settle..." -ForegroundColor Cyan
+        Start-Sleep -Seconds 30
+
+        & w32tm /resync 2>&1 | ForEach-Object { Write-Host "  $_" }
+        $finalSrc = & w32tm /query /source 2>&1
+        Write-Host "`nFinal time source: $finalSrc" -ForegroundColor Green
+        if ($pdcHost) {
+            Write-Host "This DC should now be syncing from the PDC emulator ($pdcHost) via domain hierarchy." -ForegroundColor Green
+        }
+        Write-Host "Domain Controller NTP configuration complete." -ForegroundColor Green
+        return
+    }
+    #endregion
+
+    #region Domain members -- Option A (quick) then Option B (full reset)
+    if ($isMember) {
+        if (-not $pdcHost) {
+            Write-Host "Cannot proceed: PDC emulator not discovered. Domain member time sync requires a reachable DC." -ForegroundColor Red
+            return
+        }
+
+        if (-not $Force) {
+            Write-Host "Option A: Quick sync from PDC (try this first)" -ForegroundColor Cyan
+            & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+            $src = & w32tm /query /source 2>&1
+            Write-Host "  Time source: $src" -ForegroundColor Cyan
+
+            $srcStr = "$src"
+            $isBadSource = $srcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
+                           $srcStr -eq ''
+
+            if (-not $isBadSource) {
+                Write-Host "`nOption A succeeded -- time synced from domain." -ForegroundColor Green
+                return
+            }
+
+            Write-Host "`nTime source still reports: $src" -ForegroundColor Yellow
+            Write-Host "Option A did not resolve the issue. Proceeding to Option B (full reset)..." -ForegroundColor Yellow
+            Write-Host ""
+        } else {
+            Write-Host "Skipping Option A -- running Option B full reset directly." -ForegroundColor Yellow
+            Write-Host ""
+        }
+
+        Write-Host "Option B: Full reset sequence" -ForegroundColor Cyan
+
+        Write-Host "`n  Stopping w32time..." -ForegroundColor Cyan
+        & net stop w32time 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        Write-Host "`n  Unregistering w32time..." -ForegroundColor Cyan
+        & w32tm /unregister 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        Write-Host "`n  Sync from PDC (pass 1 -- before register)..." -ForegroundColor Cyan
+        & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        Write-Host "`n  Registering w32time..." -ForegroundColor Cyan
+        & w32tm /register 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        Write-Host "`n  Sync from PDC (pass 2 -- after register)..." -ForegroundColor Cyan
+        & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        Write-Host "`n  Starting w32time..." -ForegroundColor Cyan
+        & net start w32time 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        # w32tm /config uses RPC and requires the service to be running.
+        # Must come after net start w32time -- not before.
+        Write-Host "`n  Configuring domain hierarchy sync (NT5DS)..." -ForegroundColor Cyan
+        & w32tm /config /syncfromflags:domhier /reliable:NO /update 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+
+        Write-Host "`n  Sync from PDC (pass 3 -- after start)..." -ForegroundColor Cyan
+        & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        $src = & w32tm /query /source 2>&1
+        Write-Host "  Time source: $src" -ForegroundColor Cyan
+
+        Write-Host "`nWaiting 30 seconds for w32time to settle..." -ForegroundColor Cyan
+        Start-Sleep -Seconds 30
+
+        Write-Host "`n  Final sync from PDC (pass 4)..." -ForegroundColor Cyan
+        & net time "\\$pdcHost" /set /y 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        & w32tm /resync /force 2>&1 | ForEach-Object { Write-Host "    $_" }
+
+        $finalSrc = & w32tm /query /source 2>&1
+        $finalSrcStr = "$finalSrc"
+        $stillBad = $finalSrcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
+                    $finalSrcStr -eq ''
+
+        if (-not $stillBad) {
+            Write-Host "  Final time source: $finalSrc" -ForegroundColor Green
+            Write-Host "`nDomain member NTP reset complete." -ForegroundColor Green
+            return
+        }
+
+        Write-Host "  Final time source: $finalSrc" -ForegroundColor Yellow
+        Write-Host ""
+
+        # Check whether Group Policy is locking the NTP configuration.
+        # w32tm /config writes to HKLM\SYSTEM\...\Services\W32Time but the service
+        # reads HKLM\SOFTWARE\Policies\Microsoft\W32Time preferentially when GPO
+        # has written values there. Anything tagged (Policy) in /query /configuration
+        # cannot be overridden by w32tm /config.
+        $configOutput = (& w32tm /query /configuration 2>&1) | Out-String
+        $hasPolicySettings = $configOutput -match '\(Policy\)'
+
+        if ($hasPolicySettings) {
+            $policyType      = $null
+            $policyNtpServer = $null
+            if ($configOutput -match 'Type:\s+(\S+)\s+\(Policy\)') {
+                $policyType = $Matches[1]
+            }
+            if ($configOutput -match 'NtpServer:\s+(\S+)\s+\(Policy\)') {
+                # Strip NTP flags (e.g. ",0x8") to get the bare hostname
+                $policyNtpServer = ($Matches[1]) -replace ',.*$', ''
+            }
+
+            Write-Host "Group Policy is overriding w32time configuration:" -ForegroundColor Yellow
+            if ($policyType)      { Write-Host "  Type (Policy):      $policyType" -ForegroundColor Yellow }
+            if ($policyNtpServer) { Write-Host "  NtpServer (Policy): $policyNtpServer" -ForegroundColor Yellow }
+            Write-Host "  'w32tm /config' cannot override Policy-tagged settings." -ForegroundColor Yellow
+
+            # Test whether the GPO-specified NTP server is actually reachable
+            if ($policyNtpServer -and (Get-Command Get-NTPOffset -ErrorAction SilentlyContinue)) {
+                Write-Host "`nTesting NTP reachability of '$policyNtpServer'..." -ForegroundColor Cyan
+                $ntpTest = Get-NTPOffset -Server $policyNtpServer -TimeoutMs 5000
+                if ($ntpTest.Success) {
+                    Write-Host "  '$policyNtpServer' is reachable (offset: $([Math]::Round($ntpTest.OffsetMs / 1000, 2))s)." -ForegroundColor Green
+                    Write-Host "  The server is responding -- w32time may need more time to sync." -ForegroundColor Yellow
+                    Write-Host "  Try 'w32tm /resync /rediscover' in a few minutes." -ForegroundColor Yellow
+                } else {
+                    Write-Host "  '$policyNtpServer' is NOT reachable: $($ntpTest.Error)" -ForegroundColor Red
+                    Write-Host "  The GPO is pointing at an NTP server that is not responding." -ForegroundColor Red
+                }
+            }
+
+            # Run gpupdate in case an admin already corrected the GPO but it hasn't been pulled yet
+            Write-Host "`nRunning 'gpupdate /force' in case the GPO was already corrected..." -ForegroundColor Cyan
+            & gpupdate /force 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+            Start-Sleep -Seconds 5
+            & w32tm /resync /rediscover 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+            $postGPUSrc    = & w32tm /query /source 2>&1
+            $postGPUSrcStr = "$postGPUSrc"
+            $stillBadAfterGPU = $postGPUSrcStr -match '(Local CMOS Clock|Free-running System Clock|error)' -or
+                                $postGPUSrcStr -eq ''
+
+            if (-not $stillBadAfterGPU) {
+                Write-Host "  Time source after gpupdate: $postGPUSrc" -ForegroundColor Green
+                Write-Host "`nDomain member NTP resolved after Group Policy refresh." -ForegroundColor Green
+                return
+            }
+
+            Write-Host "  Time source after gpupdate: $postGPUSrc" -ForegroundColor Yellow
+            Write-Host "`nGroup Policy is still preventing correct NTP sync. A GPO change is required:" -ForegroundColor Yellow
+            Write-Host "  Path: Computer Configuration -> Administrative Templates -> System -> Windows Time Service -> Time Providers" -ForegroundColor Yellow
+            Write-Host "  Options:" -ForegroundColor Yellow
+            if ($policyNtpServer) {
+                Write-Host "    a. Fix NtpServer in the GPO -- '$policyNtpServer' is not responding." -ForegroundColor Yellow
+                Write-Host "       Recommended: point to the PDC emulator ($pdcHost) or remove the policy." -ForegroundColor Yellow
+            } else {
+                Write-Host "    a. Fix the NtpServer value in the GPO or remove the policy." -ForegroundColor Yellow
+            }
+            Write-Host "    b. Set 'Configure Windows NTP Client' to 'Not Configured' to let" -ForegroundColor Yellow
+            Write-Host "       domain members sync via NT5DS (domain hierarchy) automatically." -ForegroundColor Yellow
+            Write-Host "  After updating the GPO, run 'gpupdate /force' then 'w32tm /resync /rediscover'." -ForegroundColor Yellow
+            Write-Host "`n  Diagnostic commands:" -ForegroundColor Cyan
+            Write-Host "    gpresult /r                  -- which GPOs are applied to this machine" -ForegroundColor Cyan
+            Write-Host "    w32tm /query /configuration  -- all settings with (Policy) vs (Local) tags" -ForegroundColor Cyan
+            Write-Host "    w32tm /query /status         -- sync status and last successful sync time" -ForegroundColor Cyan
+        } else {
+            Write-Host "WARNING: w32time source is still not syncing from the domain." -ForegroundColor Yellow
+            Write-Host "No Group Policy override detected. Check the following:" -ForegroundColor Yellow
+            Write-Host "  - The PDC emulator ($pdcHost) is online and responding to NTP (UDP 123)" -ForegroundColor Yellow
+            Write-Host "  - No firewall is blocking UDP 123 between this machine and the DC" -ForegroundColor Yellow
+            Write-Host "  Run 'w32tm /query /configuration' and 'w32tm /query /status' for details." -ForegroundColor Yellow
+        }
+        return
+    }
+    #endregion
+
+    #region Standalone -- configure Tier 3 NTP pool directly
+    $peerList = "0.$NTPPool 1.$NTPPool 2.$NTPPool 3.$NTPPool"
+    Write-Host "NTP peers: $peerList" -ForegroundColor Cyan
+    Write-Host ""
+
+    Write-Host "Step 1 -- Stop and unregister w32time:" -ForegroundColor Cyan
+    & net stop w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+    & w32tm /unregister 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+    Write-Host "`nStep 2 -- Register and start w32time:" -ForegroundColor Cyan
+    & w32tm /register 2>&1 | ForEach-Object { Write-Host "  $_" }
+    & net start w32time 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+    Write-Host "`nStep 3 -- Configure NTP peers:" -ForegroundColor Cyan
+    & w32tm /config /manualpeerlist:$peerList /syncfromflags:manual /reliable:YES /update 2>&1 |
+        ForEach-Object { Write-Host "  $_" }
+
+    Write-Host "`nWaiting 30 seconds for w32time to settle..." -ForegroundColor Cyan
+    Start-Sleep -Seconds 30
+
+    & w32tm /resync 2>&1 | ForEach-Object { Write-Host "  $_" }
+    $finalSrc = & w32tm /query /source 2>&1
+    Write-Host "`nFinal time source: $finalSrc" -ForegroundColor Green
+    Write-Host "Standalone NTP configuration complete." -ForegroundColor Green
+    #endregion
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

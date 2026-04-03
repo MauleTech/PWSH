@@ -485,11 +485,28 @@ Function Update-NiniteApps {
 }
 
 function Get-NTPOffset {
-	# Private helper -- queries an NTP server and returns offset info without setting the clock.
+	<#
+	.SYNOPSIS
+		Queries an NTP server and returns time offset information without modifying the system clock.
+	.DESCRIPTION
+		Connects to an NTP server via UDP port 123, sends an NTP request, and calculates
+		the time offset between the local system and the server. Returns a structured object
+		with offset metrics. Does not call Set-Date.
+	.PARAMETER Server
+		The NTP server hostname or IP address to query.
+	.PARAMETER TimeoutMs
+		Socket send/receive timeout in milliseconds. Defaults to 5000.
+	.EXAMPLE
+		$result = Get-NTPOffset -Server 'north-america.pool.ntp.org'
+		if ($result.Success) { Write-Host "Offset: $($result.OffsetMs)ms" }
+	#>
+	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory)]
+		[ValidateNotNullOrEmpty()]
 		[string]$Server,
 
+		[ValidateRange(500, 30000)]
 		[int]$TimeoutMs = 5000
 	)
 
@@ -539,7 +556,7 @@ function Get-NTPOffset {
 	} catch {
 		$Result.Error = $_.Exception.Message
 	} finally {
-		if ($Socket) { try { $Socket.Close() } catch {} }
+		if ($Socket) { try { $Socket.Dispose() } catch {} }
 	}
 
 	return $Result
@@ -615,6 +632,14 @@ Function Update-NTPDateTime {
 
 	$TaskName = 'MauleTech-NTPSync'
 
+	# All parameter sets require admin (Set-Date, Register-ScheduledTask, Unregister-ScheduledTask)
+	$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+		[Security.Principal.WindowsBuiltInRole]::Administrator)
+	if (-not $isAdmin) {
+		Write-Host "Administrator privileges are required." -ForegroundColor Red
+		return
+	}
+
 	#region Unregister Scheduled Task
 	if ($PSCmdlet.ParameterSetName -eq 'Unregister') {
 		$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -637,14 +662,6 @@ Function Update-NTPDateTime {
 		# Validate NTP server name to prevent injection in the encoded command
 		if ($NTPServer -notmatch '^[a-zA-Z0-9._-]+$') {
 			Write-Host "Invalid NTP server name: $NTPServer" -ForegroundColor Red
-			return
-		}
-
-		# Check for admin privileges (required to register SYSTEM tasks)
-		$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-			[Security.Principal.WindowsBuiltInRole]::Administrator)
-		if (-not $isAdmin) {
-			Write-Host "Administrator privileges are required to register a scheduled task." -ForegroundColor Red
 			return
 		}
 
@@ -681,14 +698,19 @@ Function Update-NTPDateTime {
 			'    }' + "`n" +
 			'} catch {' + "`n" +
 			'} finally {' + "`n" +
-			'    if ($Socket) { try { $Socket.Close() } catch {} }' + "`n" +
+			'    if ($Socket) { try { $Socket.Dispose() } catch {} }' + "`n" +
 			'}'
 
 		# Check for existing task
 		$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 		if ($existingTask) {
 			Write-Host "Scheduled task '$TaskName' already exists -- replacing it." -ForegroundColor Yellow
-			Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+			try {
+				Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+			} catch {
+				Write-Host "Failed to remove existing task: $($_.Exception.Message)" -ForegroundColor Red
+				return
+			}
 		}
 
 		$encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($SyncScript))
@@ -727,15 +749,6 @@ Function Update-NTPDateTime {
 	}
 	#endregion
 
-	#region Sync -- Admin Check
-	$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-		[Security.Principal.WindowsBuiltInRole]::Administrator)
-	if (-not $isAdmin) {
-		Write-Host "Administrator privileges are required to set the system clock." -ForegroundColor Red
-		return
-	}
-	#endregion
-
 	#region Sync -- NTP Diagnostics
 	if (-not $SkipDiagnostics) {
 		$ConfiguredSource = $null
@@ -750,9 +763,9 @@ Function Update-NTPDateTime {
 
 		if (-not $ConfiguredSource) {
 			Write-Host "Could not query Windows Time source (service may not be running)." -ForegroundColor Yellow
-		} elseif ($ConfiguredSource -match '^(Local CMOS Clock|Free-running System Clock)$') {
+		} elseif ($ConfiguredSource -match '^(Local CMOS Clock|Free-running System Clock|VM IC Time Synchronization Provider)$') {
 			Write-Host "Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
-			Write-Host "No network time source is configured -- this machine relies on its local hardware clock." -ForegroundColor Yellow
+			Write-Host "No network time source is configured -- this machine is not using NTP." -ForegroundColor Yellow
 		} elseif ($ConfiguredSource -eq $NTPServer -or $ConfiguredSource -match "^$([regex]::Escape($NTPServer)),") {
 			Write-Host "Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
 			Write-Host "Configured source matches the specified NTP server." -ForegroundColor Green
@@ -789,19 +802,17 @@ Function Update-NTPDateTime {
 
 	#region Sync -- Set Clock
 	Write-Host "Current system date/time is:"
-	$(Get-Date).DateTime
-
-	Write-Host -NoNewLine "`nSystem date/time has been set to: "
+	Write-Host (Get-Date).DateTime
 
 	$ntpQuery = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
 	if (-not $ntpQuery.Success) {
-		Write-Host ""
 		Write-Host "Failed to query NTP server '$NTPServer': $($ntpQuery.Error)" -ForegroundColor Red
 		return
 	}
 
 	[String]$NTPDateTime = $ntpQuery.NTPTimeUtc.ToLocalTime()
-	Set-Date $NTPDateTime
+	$newTime = Set-Date $NTPDateTime
+	Write-Host "`nSystem date/time has been set to: $($newTime.DateTime)"
 
 	if ([Math]::Abs($ntpQuery.OffsetMs) -gt 10000) {
 		Write-Host "There was an offset of $([Math]::Round($ntpQuery.OffsetMs / 1000, 2)) seconds." -ForegroundColor Yellow

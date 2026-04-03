@@ -193,15 +193,15 @@ Function Update-DellPackages {
 				Write-Host "'Dell Command | Update' is not installed, installing now."
 				Install-DCU
 
-			}  ElseIf ($DCUAvailableVersion -notmatch $DCUInstalledVersion) {
+			} ElseIf ($DCUAvailableVersion -and ([System.Version]$DCUInstalledVersion -lt [System.Version]$DCUAvailableVersion)) {
 				Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
 
 				#Remove any programs listed through "Add and remove programs"
 				Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
 				Install-DCU
 
-			} ElseIf ($DCUInstalledVersion -eq $DCUAvailableVersion) {
-				Write-Host -ForegroundColor Green "'Dell Command | Update' is current."
+			} Else {
+				Write-Host -ForegroundColor Green "'Dell Command | Update' is current (version $DCUInstalledVersion)."
 			}
 
 			#Configure and run Dell Command Update

@@ -484,66 +484,331 @@ Function Update-NiniteApps {
 	Write-Host "End of Install Ninite Apps"
 }
 
+function Get-NTPOffset {
+	# Private helper -- queries an NTP server and returns offset info without setting the clock.
+	param(
+		[Parameter(Mandatory)]
+		[string]$Server,
+
+		[int]$TimeoutMs = 5000
+	)
+
+	$Result = [PSCustomObject]@{
+		Server     = $Server
+		OffsetMs   = [double]0
+		NTPTimeUtc = [datetime]::MinValue
+		Success    = $false
+		Error      = $null
+	}
+
+	$Socket = $null
+	try {
+		$StartOfEpoch = New-Object DateTime(1900,1,1,0,0,0,[DateTimeKind]::Utc)
+		[Byte[]]$NtpData = ,0 * 48
+		$NtpData[0] = 0x1B
+
+		$Socket = New-Object Net.Sockets.Socket(
+			[Net.Sockets.AddressFamily]::InterNetwork,
+			[Net.Sockets.SocketType]::Dgram,
+			[Net.Sockets.ProtocolType]::Udp)
+		$Socket.SendTimeout    = $TimeoutMs
+		$Socket.ReceiveTimeout = $TimeoutMs
+		$Socket.Connect($Server, 123)
+
+		$t1 = Get-Date
+		[Void]$Socket.Send($NtpData)
+		[Void]$Socket.Receive($NtpData)
+		$t4 = Get-Date
+
+		$IntPart  = [BitConverter]::ToUInt32($NtpData[43..40], 0)
+		$FracPart = [BitConverter]::ToUInt32($NtpData[47..44], 0)
+		$t3ms = $IntPart * 1000 + ($FracPart * 1000 / 0x100000000)
+
+		$IntPart  = [BitConverter]::ToUInt32($NtpData[35..32], 0)
+		$FracPart = [BitConverter]::ToUInt32($NtpData[39..36], 0)
+		$t2ms = $IntPart * 1000 + ($FracPart * 1000 / 0x100000000)
+
+		$t1ms = ([TimeZoneInfo]::ConvertTimeToUtc($t1) - $StartOfEpoch).TotalMilliseconds
+		$t4ms = ([TimeZoneInfo]::ConvertTimeToUtc($t4) - $StartOfEpoch).TotalMilliseconds
+
+		$Offset = (($t2ms - $t1ms) + ($t3ms - $t4ms)) / 2
+
+		$Result.OffsetMs   = $Offset
+		$Result.NTPTimeUtc = $StartOfEpoch.AddMilliseconds($t4ms + $Offset)
+		$Result.Success    = $true
+	} catch {
+		$Result.Error = $_.Exception.Message
+	} finally {
+		if ($Socket) { try { $Socket.Close() } catch {} }
+	}
+
+	return $Result
+}
+
 Function Update-NTPDateTime {
 	<#
 	.SYNOPSIS
-		Immediately updates the clock based on the time received from a Network Time Provider. 'north-america.pool.ntp.org' is used by default.
+		Updates the system clock from an NTP server with sync diagnostics and optional scheduled task.
+	.DESCRIPTION
+		Queries a Network Time Protocol server to get the current accurate time and sets the
+		local system clock. Before updating, performs a diagnostic comparison between the
+		machine's currently configured Windows Time source and the specified NTP server to
+		detect sync discrepancies (e.g., a domain controller that has drifted from the
+		internet NTP pool).
+
+		Optionally registers a self-contained Windows scheduled task for persistent,
+		recurring NTP synchronization without requiring the MauleTech PWSH module.
+	.PARAMETER NTPServer
+		The NTP server to query. Defaults to 'north-america.pool.ntp.org'.
+	.PARAMETER RegisterScheduledTask
+		Creates a Windows scheduled task ('MauleTech-NTPSync') that runs the NTP sync at
+		boot and on a recurring interval. The task is self-contained and does not require
+		the MauleTech PWSH module.
+	.PARAMETER UnregisterScheduledTask
+		Removes the MauleTech-NTPSync scheduled task if it exists.
+	.PARAMETER SyncIntervalHours
+		The interval in hours between NTP syncs when using -RegisterScheduledTask.
+		Defaults to 12. Valid range: 1-168 (one week).
+	.PARAMETER SkipDiagnostics
+		Skip the Windows Time source comparison diagnostic step.
+	.EXAMPLE
+		Update-NTPDateTime
+		Syncs the clock with the default NTP server and shows diagnostics.
+	.EXAMPLE
+		Update-NTPDateTime -NTPServer 'time.nist.gov'
+		Syncs the clock with a specific NTP server.
+	.EXAMPLE
+		Update-NTPDateTime -RegisterScheduledTask
+		Creates a scheduled task that syncs NTP at boot and every 12 hours.
+	.EXAMPLE
+		Update-NTPDateTime -RegisterScheduledTask -SyncIntervalHours 6 -NTPServer 'time.nist.gov'
+		Creates a scheduled task with a custom interval and NTP server.
+	.EXAMPLE
+		Update-NTPDateTime -UnregisterScheduledTask
+		Removes the MauleTech-NTPSync scheduled task.
+	.EXAMPLE
+		Update-NTPDateTime -SkipDiagnostics
+		Syncs the clock without comparing against the configured Windows Time source.
+	.NOTES
+		Requires Administrator privileges to set the system clock or manage scheduled tasks.
 	#>
-	param
-	(
-		[Parameter(Mandatory=$False)]
-		[string]$sNTPServer = 'north-america.pool.ntp.org'
+	[CmdletBinding(DefaultParameterSetName = 'Sync')]
+	param(
+		[Parameter(ParameterSetName = 'Sync')]
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateNotNullOrEmpty()]
+		[string]$NTPServer = 'north-america.pool.ntp.org',
+
+		[Parameter(Mandatory, ParameterSetName = 'Register')]
+		[switch]$RegisterScheduledTask,
+
+		[Parameter(Mandatory, ParameterSetName = 'Unregister')]
+		[switch]$UnregisterScheduledTask,
+
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateRange(1, 168)]
+		[int]$SyncIntervalHours = 12,
+
+		[Parameter(ParameterSetName = 'Sync')]
+		[switch]$SkipDiagnostics
 	)
-	
-	# Displays the current system date and time
+
+	$TaskName = 'MauleTech-NTPSync'
+
+	#region Unregister Scheduled Task
+	if ($PSCmdlet.ParameterSetName -eq 'Unregister') {
+		$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+		if ($existingTask) {
+			try {
+				Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+				Write-Host "Scheduled task '$TaskName' has been removed." -ForegroundColor Green
+			} catch {
+				Write-Host "Failed to remove scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+			}
+		} else {
+			Write-Host "Scheduled task '$TaskName' does not exist." -ForegroundColor Yellow
+		}
+		return
+	}
+	#endregion
+
+	#region Register Scheduled Task
+	if ($PSCmdlet.ParameterSetName -eq 'Register') {
+		# Validate NTP server name to prevent injection in the encoded command
+		if ($NTPServer -notmatch '^[a-zA-Z0-9._-]+$') {
+			Write-Host "Invalid NTP server name: $NTPServer" -ForegroundColor Red
+			return
+		}
+
+		# Check for admin privileges (required to register SYSTEM tasks)
+		$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+			[Security.Principal.WindowsBuiltInRole]::Administrator)
+		if (-not $isAdmin) {
+			Write-Host "Administrator privileges are required to register a scheduled task." -ForegroundColor Red
+			return
+		}
+
+		# Build self-contained NTP sync script (no external dependencies)
+		# NTPServer was already validated against ^[a-zA-Z0-9._-]+$ above
+		$SyncScript = "`$Server = '$NTPServer'" + "`n" +
+			'$StartOfEpoch = New-Object DateTime(1900,1,1,0,0,0,[DateTimeKind]::Utc)' + "`n" +
+			'[Byte[]]$NtpData = ,0 * 48' + "`n" +
+			'$NtpData[0] = 0x1B' + "`n" +
+			'$Socket = $null' + "`n" +
+			'try {' + "`n" +
+			'    $Socket = New-Object Net.Sockets.Socket(' + "`n" +
+			'        [Net.Sockets.AddressFamily]::InterNetwork,' + "`n" +
+			'        [Net.Sockets.SocketType]::Dgram,' + "`n" +
+			'        [Net.Sockets.ProtocolType]::Udp)' + "`n" +
+			'    $Socket.SendTimeout    = 10000' + "`n" +
+			'    $Socket.ReceiveTimeout = 10000' + "`n" +
+			'    $Socket.Connect($Server, 123)' + "`n" +
+			'    $t1 = Get-Date' + "`n" +
+			'    [Void]$Socket.Send($NtpData)' + "`n" +
+			'    [Void]$Socket.Receive($NtpData)' + "`n" +
+			'    $t4 = Get-Date' + "`n" +
+			'    $IntPart  = [BitConverter]::ToUInt32($NtpData[43..40], 0)' + "`n" +
+			'    $FracPart = [BitConverter]::ToUInt32($NtpData[47..44], 0)' + "`n" +
+			'    $t3ms = $IntPart * 1000 + ($FracPart * 1000 / 0x100000000)' + "`n" +
+			'    $IntPart  = [BitConverter]::ToUInt32($NtpData[35..32], 0)' + "`n" +
+			'    $FracPart = [BitConverter]::ToUInt32($NtpData[39..36], 0)' + "`n" +
+			'    $t2ms = $IntPart * 1000 + ($FracPart * 1000 / 0x100000000)' + "`n" +
+			'    $t1ms = ([TimeZoneInfo]::ConvertTimeToUtc($t1) - $StartOfEpoch).TotalMilliseconds' + "`n" +
+			'    $t4ms = ([TimeZoneInfo]::ConvertTimeToUtc($t4) - $StartOfEpoch).TotalMilliseconds' + "`n" +
+			'    $Offset = (($t2ms - $t1ms) + ($t3ms - $t4ms)) / 2' + "`n" +
+			'    if ([Math]::Abs($Offset) -gt 1000) {' + "`n" +
+			'        Set-Date ($StartOfEpoch.AddMilliseconds($t4ms + $Offset).ToLocalTime())' + "`n" +
+			'    }' + "`n" +
+			'} catch {' + "`n" +
+			'} finally {' + "`n" +
+			'    if ($Socket) { try { $Socket.Close() } catch {} }' + "`n" +
+			'}'
+
+		# Check for existing task
+		$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+		if ($existingTask) {
+			Write-Host "Scheduled task '$TaskName' already exists -- replacing it." -ForegroundColor Yellow
+			Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+		}
+
+		$encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($SyncScript))
+		$Action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+			-Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCmd"
+
+		# Two triggers: at startup and repeating every N hours indefinitely
+		$TriggerBoot   = New-ScheduledTaskTrigger -AtStartup
+		$TriggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+			-RepetitionInterval (New-TimeSpan -Hours $SyncIntervalHours) `
+			-RepetitionDuration (New-TimeSpan -Days 36500)
+
+		$Settings = New-ScheduledTaskSettingsSet `
+			-AllowStartIfOnBatteries `
+			-DontStopIfGoingOnBatteries `
+			-StartWhenAvailable `
+			-ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+		$Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+
+		try {
+			Register-ScheduledTask -TaskName $TaskName `
+				-Action $Action `
+				-Trigger @($TriggerBoot, $TriggerRepeat) `
+				-Settings $Settings `
+				-Principal $Principal `
+				-Description "MauleTech NTP time sync -- syncs clock with $NTPServer" `
+				-ErrorAction Stop | Out-Null
+			Write-Host "Scheduled task '$TaskName' created successfully." -ForegroundColor Green
+			Write-Host "  NTP Server: $NTPServer" -ForegroundColor Cyan
+			Write-Host "  Triggers:   At startup + every $SyncIntervalHours hour(s)" -ForegroundColor Cyan
+			Write-Host "  To remove:  Update-NTPDateTime -UnregisterScheduledTask" -ForegroundColor Cyan
+		} catch {
+			Write-Host "Failed to create scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+		}
+		return
+	}
+	#endregion
+
+	#region Sync -- Admin Check
+	$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+		[Security.Principal.WindowsBuiltInRole]::Administrator)
+	if (-not $isAdmin) {
+		Write-Host "Administrator privileges are required to set the system clock." -ForegroundColor Red
+		return
+	}
+	#endregion
+
+	#region Sync -- NTP Diagnostics
+	if (-not $SkipDiagnostics) {
+		$ConfiguredSource = $null
+		try {
+			$w32tmOutput = & w32tm /query /source 2>&1
+			if ($LASTEXITCODE -eq 0 -and "$w32tmOutput" -notmatch 'error') {
+				$ConfiguredSource = ("$w32tmOutput").Trim()
+			}
+		} catch {}
+
+		Write-Host "`n=== NTP Sync Diagnostics ===" -ForegroundColor Cyan
+
+		if (-not $ConfiguredSource) {
+			Write-Host "Could not query Windows Time source (service may not be running)." -ForegroundColor Yellow
+		} elseif ($ConfiguredSource -match '^(Local CMOS Clock|Free-running System Clock)$') {
+			Write-Host "Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
+			Write-Host "No network time source is configured -- this machine relies on its local hardware clock." -ForegroundColor Yellow
+		} elseif ($ConfiguredSource -eq $NTPServer -or $ConfiguredSource -match "^$([regex]::Escape($NTPServer)),") {
+			Write-Host "Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
+			Write-Host "Configured source matches the specified NTP server." -ForegroundColor Green
+		} else {
+			Write-Host "Configured Windows Time source: $ConfiguredSource" -ForegroundColor Cyan
+			Write-Host "Specified NTP server:           $NTPServer" -ForegroundColor Cyan
+
+			# Query both sources and compare
+			$sourceResult = Get-NTPOffset -Server $ConfiguredSource -TimeoutMs 5000
+			$ntpResult    = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
+
+			if ($sourceResult.Success -and $ntpResult.Success) {
+				$discrepancyMs = [Math]::Abs(($sourceResult.NTPTimeUtc - $ntpResult.NTPTimeUtc).TotalMilliseconds)
+				$discrepancySec = [Math]::Round($discrepancyMs / 1000, 2)
+
+				if ($discrepancyMs -gt 2000) {
+					Write-Host "WARNING: '$ConfiguredSource' is $discrepancySec seconds out of sync with '$NTPServer'." -ForegroundColor Yellow
+					Write-Host "This may indicate your time source (e.g., a domain controller) has drifted." -ForegroundColor Yellow
+				} else {
+					Write-Host "Time sources are in sync (discrepancy: ${discrepancySec}s)." -ForegroundColor Green
+				}
+			} else {
+				if (-not $sourceResult.Success) {
+					Write-Host "Could not query configured source '$ConfiguredSource': $($sourceResult.Error)" -ForegroundColor Yellow
+				}
+				if (-not $ntpResult.Success) {
+					Write-Host "Could not query NTP server '$NTPServer': $($ntpResult.Error)" -ForegroundColor Yellow
+				}
+			}
+		}
+		Write-Host ""
+	}
+	#endregion
+
+	#region Sync -- Set Clock
 	Write-Host "Current system date/time is:"
 	$(Get-Date).DateTime
-	
-	# Pre-emptively writes the output label for the new time, so it won't interupt the calculations.
+
 	Write-Host -NoNewLine "`nSystem date/time has been set to: "
-	
-	# Creates a DateTime object representing the start of the epoch
-	$StartOfEpoch=New-Object DateTime(1900,1,1,0,0,0,[DateTimeKind]::Utc)   
-	# Creates a byte array of length 48 and initializes all elements to 0
-	[Byte[]]$NtpData = ,0 * 48
-	# Sets the first byte of the byte array to 0x1B, which is the NTP request header
-	$NtpData[0] = 0x1B
-	# Creates a new socket object for sending and receiving data over the network
-	$Socket = New-Object Net.Sockets.Socket([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Dgram, [Net.Sockets.ProtocolType]::Udp)
-	# Connects the socket to the specified NTP server and port number
-	$Socket.Connect($sNTPServer,123)
-	 
-	# Sends an NTP request to the server and receives an NTP response
-	$t1 = Get-Date    # Start of transaction... the clock is ticking...
-	[Void]$Socket.Send($NtpData)
-	[Void]$Socket.Receive($NtpData)  
-	$t4 = Get-Date    # End of transaction time
-	$Socket.Close()
-	
-	# Calculates the offset between the local system time and the NTP server time
-	$IntPart = [BitConverter]::ToUInt32($NtpData[43..40],0)   # t3
-	$FracPart = [BitConverter]::ToUInt32($NtpData[47..44],0)
-	$t3ms = $IntPart * 1000 + ($FracPart * 1000 / 0x100000000)
- 
-	$IntPart = [BitConverter]::ToUInt32($NtpData[35..32],0)   # t2
-	$FracPart = [BitConverter]::ToUInt32($NtpData[39..36],0)
-	$t2ms = $IntPart * 1000 + ($FracPart * 1000 / 0x100000000)
- 
-	$t1ms = ([TimeZoneInfo]::ConvertTimeToUtc($t1) - $StartOfEpoch).TotalMilliseconds
-	$t4ms = ([TimeZoneInfo]::ConvertTimeToUtc($t4) - $StartOfEpoch).TotalMilliseconds
-  
-	$Offset = (($t2ms - $t1ms) + ($t3ms-$t4ms))/2
-	
-	# Sets the local system time to the NTP server time
-	[String]$NTPDateTime = $StartOfEpoch.AddMilliseconds($t4ms + $Offset).ToLocalTime() 
-	Set-Date $NTPDateTime
-	
-	# Checks if the offset is greater than 10 seconds and prints a message accordingly
-	If ([Math]::Abs($Offset) -gt 10000) {
-	Write-Host "There was an offset of $($Offset / 1000) seconds."
-	} Else {
-		Write-Host "The offset was negligible."
+
+	$ntpQuery = Get-NTPOffset -Server $NTPServer -TimeoutMs 5000
+	if (-not $ntpQuery.Success) {
+		Write-Host ""
+		Write-Host "Failed to query NTP server '$NTPServer': $($ntpQuery.Error)" -ForegroundColor Red
+		return
 	}
+
+	[String]$NTPDateTime = $ntpQuery.NTPTimeUtc.ToLocalTime()
+	Set-Date $NTPDateTime
+
+	if ([Math]::Abs($ntpQuery.OffsetMs) -gt 10000) {
+		Write-Host "There was an offset of $([Math]::Round($ntpQuery.OffsetMs / 1000, 2)) seconds." -ForegroundColor Yellow
+	} else {
+		Write-Host "The offset was negligible." -ForegroundColor Green
+	}
+	#endregion
 }
 
 Function Update-O365Apps {

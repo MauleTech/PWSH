@@ -717,11 +717,10 @@ Function Update-NTPDateTime {
 		$Action = New-ScheduledTaskAction -Execute 'powershell.exe' `
 			-Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCmd"
 
-		# Two triggers: at startup and repeating every N hours indefinitely
+		# Two triggers: at startup and repeating every N hours
 		$TriggerBoot   = New-ScheduledTaskTrigger -AtStartup
 		$TriggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-			-RepetitionInterval (New-TimeSpan -Hours $SyncIntervalHours) `
-			-RepetitionDuration (New-TimeSpan -Days 36500)
+			-RepetitionInterval (New-TimeSpan -Hours $SyncIntervalHours)
 
 		$Settings = New-ScheduledTaskSettingsSet `
 			-AllowStartIfOnBatteries `
@@ -738,6 +737,12 @@ Function Update-NTPDateTime {
 				-Principal $Principal `
 				-Description "MauleTech NTP time sync -- syncs clock with $NTPServer" `
 				-ErrorAction Stop | Out-Null
+
+			# Set repetition duration to indefinite (cannot be done via New-ScheduledTaskTrigger)
+			$task = Get-ScheduledTask -TaskName $TaskName
+			$task.Triggers[1].Repetition.Duration = ''
+			$task | Set-ScheduledTask | Out-Null
+
 			Write-Host "Scheduled task '$TaskName' created successfully." -ForegroundColor Green
 			Write-Host "  NTP Server: $NTPServer" -ForegroundColor Cyan
 			Write-Host "  Triggers:   At startup + every $SyncIntervalHours hour(s)" -ForegroundColor Cyan

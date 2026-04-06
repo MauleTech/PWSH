@@ -1545,7 +1545,7 @@ Function Update-WindowsTo11 {
 		[string]$ScheduledTaskName = "MauleTech-UpdateWindowsTo11",
 		[string[]]$NetworkPaths = @(
 			"\\zeus\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
-			"\\dc0\Win11_24H2$\setup.exe",
+			"\\dc0\Win11$\setup.exe",
 			"\\fileserver\Images\Win11\setup.exe"
 		)
 	)

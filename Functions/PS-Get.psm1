@@ -391,6 +391,7 @@ function Get-ADLockedAccount {
 			try {
 				$unlockParams = @{ Identity = $sam }
 				if ($dc) { $unlockParams['Server'] = $dc }
+				Write-Host "Attempting to unlock: $sam..." -ForegroundColor Cyan
 				Unlock-ADAccount @unlockParams -ErrorAction Stop
 
 				# Re-query to get post-unlock state and emit updated object
@@ -404,9 +405,9 @@ function Get-ADLockedAccount {
 				} else { $null }
 
 				if (-not $verify.LockedOut) {
-					Write-Verbose "$sam successfully unlocked."
+					Write-Host "Unlocked: $sam" -ForegroundColor Green
 				} else {
-					Write-Warning "$sam still appears locked after unlock attempt."
+					Write-Host "Failed to unlock: $sam (still locked after attempt)" -ForegroundColor Red
 				}
 			} catch {
 				Write-Error "Failed to unlock ${sam}: $_"

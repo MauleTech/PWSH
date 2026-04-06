@@ -188,8 +188,7 @@ Function Repair-DomainTrust {
 			Write-Fatal "Could not enumerate DCs via nltest either (exit code $LASTEXITCODE)."
 			Write-Step "Falling back to DNS SRV records to discover domain controllers..."
 			Try {
-				# _ldap._tcp.<domain> SRV records enumerate DCs by design;
-				# no ambiguity with the resolver's own address.
+				# SRV avoids filtering out the resolver's own IP (common when DC == DNS server).
 				$srvRecords = Resolve-DnsName -Name "_ldap._tcp.$detectedDomain" -Type SRV -ErrorAction Stop
 				$dcs = @($srvRecords | Where-Object { $_.Type -eq 'SRV' } |
 					Select-Object -ExpandProperty NameTarget)

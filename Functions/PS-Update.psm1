@@ -1545,7 +1545,7 @@ Function Update-WindowsTo11 {
 		[string]$ScheduledTaskName = "MauleTech-UpdateWindowsTo11",
 		[string[]]$NetworkPaths = @(
 			"\\zeus\Win11Install$\Win11_25H2_English_x64.10.25\setup.exe",
-			"\\dc0\Win11_24H2$\setup.exe",
+			"\\dc0\Win11$\setup.exe",
 			"\\fileserver\Images\Win11\setup.exe"
 		)
 	)
@@ -2015,8 +2015,8 @@ Function Update-WindowsTo11 {
 		$encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($TaskCommand))
 		$Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
 		$Trigger = New-ScheduledTaskTrigger -Once -At $ScheduleAt
-		# 6-hour execution time limit as a safety cap; no trigger EndBoundary so the task starts even if delayed
-		$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+		# 10-hour execution time limit as a safety cap; task only runs at scheduled time
+		$Settings = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 10)
 		$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 		try {

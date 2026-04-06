@@ -186,6 +186,17 @@ Function Repair-DomainTrust {
 			Write-Pass "nltest found DC(s): $($dcs -join ', ')"
 		} Else {
 			Write-Fatal "Could not enumerate DCs via nltest either (exit code $LASTEXITCODE)."
+			Write-Step "Falling back to DNS SRV records to discover domain controllers..."
+			Try {
+				# _ldap._tcp.<domain> SRV records enumerate DCs by design;
+				# no ambiguity with the resolver's own address.
+				$srvRecords = Resolve-DnsName -Name "_ldap._tcp.$detectedDomain" -Type SRV -ErrorAction Stop
+				$dcs = @($srvRecords | Where-Object { $_.Type -eq 'SRV' } |
+					Select-Object -ExpandProperty NameTarget)
+				Write-Pass "DNS SRV returned $($dcs.Count) DC(s): $($dcs -join ', ')"
+			} Catch {
+				Write-Fatal "DNS SRV fallback failed: $($_.Exception.Message)"
+			}
 		}
 	}
 
@@ -252,22 +263,22 @@ Function Repair-DomainTrust {
 		Write-Step "Step 6: Remoting into DC ($targetDC) to check computer account in AD..."
 		$dcSession = $null
 		Try {
-			$dcSession = New-PSSession -ComputerName $targetDC -Credential $cred -ErrorAction Stop
+			$sessionOpts = New-PSSessionOption -OpenTimeout 30000 -OperationTimeout 60000
+			$dcSession = New-PSSession -ComputerName $targetDC -Credential $cred -SessionOption $sessionOpts -ErrorAction Stop
 			Write-Pass "PSSession to $targetDC established."
 
 			$acctStatus = Invoke-Command -Session $dcSession -ScriptBlock {
 				Param($cn)
 				Import-Module ActiveDirectory -ErrorAction Stop
-				$acct = Get-ADComputer $cn -Properties Enabled, PasswordLastSet, LockedOut -ErrorAction Stop
+				$acct = Get-ADComputer $cn -Properties Enabled, PasswordLastSet -ErrorAction Stop
 				[pscustomobject]@{
 					Enabled           = $acct.Enabled
 					PasswordLastSet   = $acct.PasswordLastSet
-					LockedOut         = $acct.LockedOut
 					DistinguishedName = $acct.DistinguishedName
 				}
 			} -ArgumentList $localComputer
 
-			Write-Verbose "AD account status: Enabled=$($acctStatus.Enabled) | PasswordLastSet=$($acctStatus.PasswordLastSet) | LockedOut=$($acctStatus.LockedOut)"
+			Write-Verbose "AD account status: Enabled=$($acctStatus.Enabled) | PasswordLastSet=$($acctStatus.PasswordLastSet)"
 
 			# If account is disabled, enable it
 			If (-not $acctStatus.Enabled) {
@@ -277,16 +288,6 @@ Function Repair-DomainTrust {
 					Enable-ADAccount -Identity $cn
 				} -ArgumentList $localComputer
 				Write-Pass "Computer account re-enabled."
-			}
-
-			# If account is locked, unlock it
-			If ($acctStatus.LockedOut) {
-				Write-Fail "Computer account is LOCKED OUT. Unlocking..."
-				Invoke-Command -Session $dcSession -ScriptBlock {
-					Param($cn)
-					Unlock-ADAccount -Identity $cn
-				} -ArgumentList $localComputer
-				Write-Pass "Computer account unlocked."
 			}
 
 			# Only cycle the account if trust is still broken after fixing state
@@ -343,7 +344,7 @@ Function Repair-DomainTrust {
 		$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($cred.Password)
 		Try {
 			$plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-			$netdomResult = netdom resetpwd /server:$targetDC /userd:$($cred.UserName) /passwordd:$plain 2>&1
+			$null = netdom resetpwd /server:$targetDC /userd:$($cred.UserName) /passwordd:$plain 2>&1
 			Write-Verbose "netdom resetpwd completed with exit code: $LASTEXITCODE"
 			If ($LASTEXITCODE -eq 0) {
 				Write-Pass "netdom resetpwd completed. A reboot will be required."

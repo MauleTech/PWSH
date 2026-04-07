@@ -1641,25 +1641,32 @@ Function Get-FileDownload {
 
 	# Method 5: certutil -urlcache (available on all Windows versions)
 	# A well-known sysadmin trick, extremely reliable as a deep fallback on legacy systems.
+	# Skipped if Sophos is running: certutil downloading files triggers Sophos false-positive detections.
 	If (-not $Downloaded) {
-		Try {
-			$CertutilExe = Get-Command 'certutil.exe' -ErrorAction Stop
-			If ($ShowProgress) {
-				& $CertutilExe.Source -urlcache -split -f $URL.AbsoluteUri $FilePath
-			} Else {
-				$null = & $CertutilExe.Source -urlcache -split -f $URL.AbsoluteUri $FilePath 2>&1
-			}
-			If ($LASTEXITCODE -eq 0 -and (Test-Path $FilePath)) {
-				$Downloaded = $true
-				Write-Verbose 'Downloaded using certutil.'
-			} Else {
-				Throw "certutil exited with code $LASTEXITCODE"
-			}
-		} Catch {
-			$DownloadErrors.Add("certutil: $_")
-			Write-Verbose "certutil method failed: $_"
-			If (-not $Downloaded -and (Test-Path $FilePath)) {
-				Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+		$SophosActive = [bool](Get-Service -Name '*Sophos*' -ErrorAction SilentlyContinue |
+			Where-Object { $_.Status -eq 'Running' })
+		If ($SophosActive) {
+			Write-Verbose 'Skipping certutil method: Sophos antivirus is active (certutil download flagged as malicious).'
+		} Else {
+			Try {
+				$CertutilExe = Get-Command 'certutil.exe' -ErrorAction Stop
+				If ($ShowProgress) {
+					& $CertutilExe.Source -urlcache -split -f $URL.AbsoluteUri $FilePath
+				} Else {
+					$null = & $CertutilExe.Source -urlcache -split -f $URL.AbsoluteUri $FilePath 2>&1
+				}
+				If ($LASTEXITCODE -eq 0 -and (Test-Path $FilePath)) {
+					$Downloaded = $true
+					Write-Verbose 'Downloaded using certutil.'
+				} Else {
+					Throw "certutil exited with code $LASTEXITCODE"
+				}
+			} Catch {
+				$DownloadErrors.Add("certutil: $_")
+				Write-Verbose "certutil method failed: $_"
+				If (-not $Downloaded -and (Test-Path $FilePath)) {
+					Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+				}
 			}
 		}
 	}

@@ -227,7 +227,7 @@ Function Start-ImperialMarch {
 
 Function Start-PPKGLog ([String] $LogLabel) {
 	Write-Host "Making a log file for debugging"
-		$LogPath = "$ITFolder\" + $SiteCode + "-" + $LogLabel + ".log"
+		$LogPath = "$ITFolder\Logs\" + $SiteCode + "-" + $LogLabel + ".log"
 		Start-Transcript -path $LogPath -Force -Append
 }
 

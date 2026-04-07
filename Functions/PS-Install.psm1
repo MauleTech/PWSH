@@ -91,7 +91,6 @@ Function Install-Choco {
 	Enable-SSL
 	$ChocoInstallScript = Join-Path -Path $ITFolder -ChildPath "GitHub\PWSH\Scripts\Chocolatey\installchoco.ps1"
 	& $ChocoInstallScript
-	& $ChocoInstallScript
 }
 
 function Install-ClaudeCode {

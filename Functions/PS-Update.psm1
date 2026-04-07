@@ -206,13 +206,13 @@ Function Update-DellPackages {
 
 			#Configure and run Dell Command Update
 			If (Test-Path $DCUx86) {
-				& $DCUx86 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify
+				& $DCUx86 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
 
-				& $DCUx86 /applyUpdates -reboot=disable
+				& $DCUx86 /applyUpdates -reboot=disable -forceupdate
 			} ElseIf (Test-Path $DCUx64) {
-				& $DCUx64 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify
+				& $DCUx64 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
 
-				& $DCUx64 /applyUpdates -reboot=disable
+				& $DCUx64 /applyUpdates -reboot=disable -forceupdate
 			} Else { Write-Error "Dell Command Update CLI not found."}
 
 		} Else { Write-Host "This is not a Dell Computer" }

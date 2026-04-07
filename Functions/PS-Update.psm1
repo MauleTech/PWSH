@@ -176,7 +176,7 @@ Function Update-DellPackages {
 				If (-not $DCUInstalled) {
 					Write-Host "Falling back to Chocolatey for DCU installation." -ForegroundColor Yellow
 					choco upgrade dotnet-8.0-desktopruntime --exact -y --force --forcedependencies -i
-					Choco upgrade DellCommandUpdate --exact -y --force --forcedependencies -i --ignorechecksums
+					choco upgrade DellCommandUpdate --exact -y --force --forcedependencies -i --ignorechecksums
 				}
 			}
 
@@ -202,6 +202,7 @@ Function Update-DellPackages {
 			$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
 			If (-not $DCUInstalledVersion -and (Test-Path $DCUx86 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx86).VersionInfo.ProductVersion}
 			If (-not $DCUInstalledVersion -and (Test-Path $DCUx64 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx64).VersionInfo.ProductVersion}
+			$DCUAvailableVersion = $null
 			If (Get-Command winget -ErrorAction SilentlyContinue) {
 				$wingetVersionLine = winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:" | Select-Object -First 1
 				If ($wingetVersionLine) {

@@ -31,12 +31,10 @@ If ((Get-Command "$env:PROGRAMDATA\chocolatey\choco.exe" -ErrorAction SilentlyCo
 
 If (Get-Command choco.exe -ErrorAction SilentlyContinue) {
     Set-ChocolateySources
-    If (Get-Command choco -errorAction SilentlyContinue) {
-        choco upgrade chocolatey -y
-    }
+    choco upgrade chocolatey -y
 } else {
     $installed = $false
-    
+
     # Method 1: Try winget
     if (-not $installed) {
         try {
@@ -50,7 +48,7 @@ If (Get-Command choco.exe -ErrorAction SilentlyContinue) {
             Write-Host "Winget installation failed. Trying next method."
         }
     }
-    
+
     # Method 2: Try NuGet
     if (-not $installed) {
         try {
@@ -72,21 +70,16 @@ If (Get-Command choco.exe -ErrorAction SilentlyContinue) {
         }
         finally {
             # Cleanup NuGet artifacts
-            if (Get-PSRepository -Name 'MauleCache' -ErrorAction SilentlyContinue) {
-                Get-PSRepository -Name 'MauleCache' | Unregister-PSRepository
-            }
-            if (Test-Path "$ITFolder\Chocolatey") {
-                Remove-Item -path "$ITFolder\Chocolatey" -Recurse -Force
-            }
+            Get-PSRepository -Name 'MauleCache' -ErrorAction SilentlyContinue | Unregister-PSRepository
+            Remove-Item -Path "$ITFolder\Chocolatey" -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    
+
     # Method 3: Official install script
     if (-not $installed) {
         try {
             Write-Host "Attempting to use chocolatey's script to install chocolatey."
             [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force
             Invoke-ValidatedDownload -Uri 'https://community.chocolatey.org/install.ps1' | Invoke-Expression
             Update-ChocoPath
             Get-Command 'choco.exe' -ErrorAction Stop

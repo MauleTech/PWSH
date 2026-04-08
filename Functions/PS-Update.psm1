@@ -166,11 +166,15 @@ Function Update-DellPackages {
 				If (-not $DCUInstalled -and ($IsSystem -or -not $WingetAvail)) {
 					Write-Host "Running as SYSTEM or winget not directly available. Trying Start-PSWinGet..." -ForegroundColor Yellow
 					Try {
-						Start-PSWinGet -Command 'Install-WinGetPackage "Microsoft.DotNet.DesktopRuntime.8" ; Install-WinGetPackage "Dell.CommandUpdate"'
-						$DCUInstalled = $true
+						# Update-PowerShellModule must be included in the command so that the spawned pwsh Core
+						# session imports Microsoft.WinGet.Client before calling Install-WinGetPackage.
+						# When Start-PSWinGet runs in PS5 it spawns a new pwsh process; the module is installed
+						# in the caller's session but not auto-imported in the child process.
+						Start-PSWinGet -Command 'Update-PowerShellModule -ModuleName Microsoft.WinGet.Client ; Install-WinGetPackage "Microsoft.DotNet.DesktopRuntime.8" ; Install-WinGetPackage "Dell.CommandUpdate"'
 					} Catch {
 						Write-Warning "Start-PSWinGet failed: $_"
 					}
+					$DCUInstalled = (Test-Path $DCUx86) -or (Test-Path $DCUx64)
 				}
 
 				If (-not $DCUInstalled) {

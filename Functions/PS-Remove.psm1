@@ -612,7 +612,7 @@ Function Remove-PathForcefully {
 			[parameter(Mandatory = $true)]
 			[string] $SubPath
 		)
-		$SubPath = (Resolve-Path -LiteralPath $SubPath -ErrorAction SilentlyContinue).Path
+		$SubPath = (Resolve-Path -LiteralPath $SubPath -ErrorAction SilentlyContinue).ProviderPath
 		If ($SubPath) {
 			try {
 				Remove-Item -LiteralPath $SubPath -Force -Recurse -ErrorAction Stop

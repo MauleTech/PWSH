@@ -37,7 +37,7 @@ Function Protect-ConfigFile {
 		$OutputPath = [System.IO.Path]::ChangeExtension($Path, '.enc')
 	}
 
-	$plainBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $Path).Path)
+	$plainBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $Path).ProviderPath)
 
 	# Generate random salt and IV
 	$salt = New-Object byte[] 16

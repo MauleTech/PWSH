@@ -124,7 +124,7 @@ Function Send-Item {
         $displayLabel = "TEXT: $Text"
     } else {
         $resolvedPath = Resolve-Path -Path $Path -ErrorAction Stop
-        $displayLabel = $resolvedPath.Path
+        $displayLabel = $resolvedPath.ProviderPath
     }
 
     Write-Host ""
@@ -143,7 +143,7 @@ Function Send-Item {
     if ($PSCmdlet.ParameterSetName -eq 'Text') {
         $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, '--text', $Text)
     } else {
-        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.Path)
+        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.ProviderPath)
     }
 
     & $crocExe @crocArgs

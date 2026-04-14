@@ -10,7 +10,7 @@ Function Receive-Item {
     .PARAMETER OutPath
         Optional directory to save received files into. Defaults to current directory.
     .PARAMETER Overwrite
-        Accept incoming files without prompting (adds --yes flag).
+        Overwrite existing files without prompting (adds --overwrite flag).
     .EXAMPLE
         Receive-Item -Code "1234-apple-banana-cherry"
     .EXAMPLE
@@ -38,7 +38,7 @@ Function Receive-Item {
     try {
         $crocArgs = @()
         if ($Overwrite) {
-            $crocArgs += '--yes'
+            $crocArgs += '--overwrite'
         }
         $crocArgs += $Code
 

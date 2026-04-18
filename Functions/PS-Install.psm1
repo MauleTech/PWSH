@@ -235,7 +235,7 @@ Function Install-NetExtender {
 		Write-Host "Downloading & Installing NetExtender"
 		If (Get-Command winget -ErrorAction SilentlyContinue) {
 			winget source update
-			winget install --id SonicWall.NetExtender -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+			Invoke-WinGetInstall -Id SonicWall.NetExtender
 		} Else {
 			If (!(Get-Command choco -ErrorAction SilentlyContinue)) {Install-Choco}
 			Choco upgrade sonicwall-sslvpn-netextender -y
@@ -1590,12 +1590,52 @@ Function Install-WinGet {
 	}
 }
 
+Function Invoke-WinGetInstall {
+	<#
+	.SYNOPSIS
+		Run winget install or upgrade with Maule's standard hardened arg set.
+	.DESCRIPTION
+		Wraps winget install/upgrade with the refined arg set used across this
+		repo: --exact, --silent, --source winget, --accept-package-agreements,
+		--accept-source-agreements, --disable-interactivity. Modeled after
+		UniGetUI's install arguments. Use -Extra to pass additional flags.
+	.PARAMETER Id
+		Winget package ID (e.g., 'Microsoft.Edge').
+	.PARAMETER Command
+		Either 'install' or 'upgrade'. Default: install.
+	.PARAMETER Extra
+		Additional arguments (e.g., '--force', '--version', '1.2.3').
+	.EXAMPLE
+		Invoke-WinGetInstall -Id Microsoft.Edge
+	.EXAMPLE
+		Invoke-WinGetInstall -Id Dell.CommandUpdate -Command upgrade
+	#>
+	[CmdletBinding()]
+	Param(
+		[Parameter(Mandatory = $true)][string]$Id,
+		[ValidateSet('install', 'upgrade')][string]$Command = 'install',
+		[string[]]$Extra
+	)
+	$WingetArgs = @(
+		$Command,
+		'--id', $Id,
+		'-e',
+		'-h',
+		'--accept-package-agreements',
+		'--accept-source-agreements',
+		'--source', 'winget',
+		'--disable-interactivity'
+	)
+	If ($Extra) { $WingetArgs += $Extra }
+	& winget @WingetArgs
+}
+
 Function Install-WinGetApps {
 	If (-not (Get-Command -Name "winget" -ErrorAction SilentlyContinue)) {Install-Winget}
 	winget source update
 	$Apps = '7zip.7zip', 'Google.Chrome', 'Mozilla.FirefoxESR', 'Zoom.Zoom', 'Notepad++.Notepad++', 'Adobe.AdobeAcrobatReaderDC', 'VideoLAN.VLC', 'Microsoft.PowerShell'
 	ForEach ($Id in $Apps) {
-		winget install -e --id $Id -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+		Invoke-WinGetInstall -Id $Id
 	}
 }
 
@@ -1650,7 +1690,7 @@ Function Install-Croc {
     if (-not $isSystem -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Host "Attempting install via winget..." -ForegroundColor Cyan
         try {
-            $null = winget install --id schollz.croc -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity 2>&1
+            $null = Invoke-WinGetInstall -Id schollz.croc 2>&1
             $found = Find-CrocExe
             if ($found) {
                 Write-Host "croc installed via winget at: $found" -ForegroundColor Green

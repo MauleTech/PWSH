@@ -72,24 +72,14 @@ Set-Location ..
 
 # Delete the temporary folder
 Remove-Item -Path $tempFolderPath -Recurse -Force
-
-
-
-#Get path
-$ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe"
-	if ($ResolveWingetPath){
-		   $WingetPath = $ResolveWingetPath[-1].Path
-	}
-$WinGetExe = (Get-ChildItem $ResolveWingetPath[-1] | Where-Object -Property Name -Match winget.exe).FullName
-
 #Pin Webroot
-& $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName pin add Webroot.SecureAnywhere --accept-source-agreements
+winget pin add Webroot.SecureAnywhere --accept-source-agreements --disable-interactivity
 
 #List Updates
-& $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName upgrade --accept-source-agreements --source winget --disable-interactivity
+winget upgrade --accept-source-agreements --source winget --disable-interactivity
 
 #Install Updates
-& $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName upgrade --accept-source-agreements --source winget --all -h --accept-package-agreements --include-unknown --force --disable-interactivity
+winget upgrade --all -h --accept-package-agreements --accept-source-agreements --source winget --include-unknown --force --disable-interactivity
 
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor

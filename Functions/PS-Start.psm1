@@ -372,7 +372,7 @@ Function Start-PSTaskManager {
 	If (-not $IsSystem -and $WingetAvail) {
 		Write-Host "[1/4] Trying winget..." -ForegroundColor Cyan
 		Try {
-			winget install --id marlocarlo.pstop -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+			Invoke-WinGetInstall -Id marlocarlo.pstop
 			# winget modifies PATH but the current session doesn't see it yet - refresh before checking
 			$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
 			If (Get-Command pstop -ErrorAction SilentlyContinue) { $Installed = $true }

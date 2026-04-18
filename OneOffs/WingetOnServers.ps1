@@ -86,10 +86,10 @@ $WinGetExe = (Get-ChildItem $ResolveWingetPath[-1] | Where-Object -Property Name
 & $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName pin add Webroot.SecureAnywhere --accept-source-agreements
 
 #List Updates
-& $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName upgrade --accept-source-agreements --source winget
+& $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName upgrade --accept-source-agreements --source winget --disable-interactivity
 
 #Install Updates
-& $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName upgrade --accept-source-agreements --source winget --all -h
+& $(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -Recurse | Where-Object -Property Name -Match winget.exe).FullName upgrade --accept-source-agreements --source winget --all -h --accept-package-agreements --include-unknown --force --disable-interactivity
 
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor

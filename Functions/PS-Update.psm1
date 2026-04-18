@@ -158,8 +158,8 @@ Function Update-DellPackages {
 				If (-not $IsSystem -and $WingetAvail) {
 					Write-Host "Using winget to install Dell Command Update and dependencies." -ForegroundColor Cyan
 					winget source update
-					winget install --id Microsoft.DotNet.DesktopRuntime.8 -e -h --accept-package-agreements --accept-source-agreements --source winget
-					winget install --id Dell.CommandUpdate -e -h --accept-package-agreements --accept-source-agreements --source winget
+					winget install --id Microsoft.DotNet.DesktopRuntime.8 -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+					winget install --id Dell.CommandUpdate -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 					$DCUInstalled = $true
 				}
 
@@ -438,7 +438,7 @@ Function Update-Edge {
 	Write-Host "Updating Microsoft Edge"
 	If (Get-Process MicrosoftEdge -ErrorAction SilentlyContinue) {Get-Process MicrosoftEdge | Stop-Process -Force}
 	If (Get-Command winget -ErrorAction SilentlyContinue) {
-		winget install --id Microsoft.Edge -e -h --accept-package-agreements --accept-source-agreements
+		winget install --id Microsoft.Edge -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 	} Else {
 		If (!(Get-Command choco -ErrorAction SilentlyContinue)) {Install-Choco}
 		Choco upgrade microsoft-edge -y
@@ -1357,7 +1357,7 @@ Function Update-PowershellModules {
 
 Function Update-PSWinGetPackages {
 	If (Get-Command -Name "winget.exe" -ErrorAction SilentlyContinue) {
-		& winget.exe update --all --silent  --accept-package-agreements --accept-source-agreements --include-unknown --force
+		& winget.exe update --all --silent --accept-package-agreements --accept-source-agreements --source winget --include-unknown --force --disable-interactivity
 	} Else {
 		Start-PSWinGet -Command 'Get-WinGetPackage | Where {$_.IsUpdateAvailable -eq $True} | Update-WinGetPackage -Mode Silent -Verbose'
 	}
@@ -1367,7 +1367,7 @@ Function Update-PWSH {
 	Write-Host "Updating PWSH"
 	If (Get-Command winget -ErrorAction SilentlyContinue) {
 		winget source update
-		winget install --id Microsoft.PowerShell -e -h --accept-package-agreements --accept-source-agreements
+		winget install --id Microsoft.PowerShell -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 	} Else {
 		If (!(Get-Command choco -ErrorAction SilentlyContinue)) {Install-Choco}
 		Choco upgrade pwsh -y -force

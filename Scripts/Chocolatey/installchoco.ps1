@@ -39,7 +39,7 @@ If (Get-Command choco.exe -ErrorAction SilentlyContinue) {
     if (-not $installed) {
         try {
             Write-Host "Attempting to use winget to install chocolatey."
-            winget install --id chocolatey.chocolatey --source winget -h --accept-package-agreements --accept-source-agreements
+            winget install --id chocolatey.chocolatey -e --source winget -h --accept-package-agreements --accept-source-agreements --disable-interactivity
             Update-ChocoPath
             Get-Command 'choco.exe' -ErrorAction Stop
             $installed = $true

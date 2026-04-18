@@ -235,7 +235,7 @@ Function Install-NetExtender {
 		Write-Host "Downloading & Installing NetExtender"
 		If (Get-Command winget -ErrorAction SilentlyContinue) {
 			winget source update
-			winget install --id SonicWall.NetExtender -e -h --accept-package-agreements --accept-source-agreements
+			winget install --id SonicWall.NetExtender -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 		} Else {
 			If (!(Get-Command choco -ErrorAction SilentlyContinue)) {Install-Choco}
 			Choco upgrade sonicwall-sslvpn-netextender -y
@@ -1593,14 +1593,14 @@ Function Install-WinGet {
 Function Install-WinGetApps {
 	If (-not (Get-Command -Name "winget" -ErrorAction SilentlyContinue)) {Install-Winget}
 	winget source update
-	Winget install -e --id 7zip.7zip -h --accept-package-agreements --accept-source-agreements
-	Winget install -e --id Google.Chrome -h --accept-package-agreements --accept-source-agreements
-	Winget install -e --id Mozilla.FirefoxESR -h --accept-package-agreements --accept-source-agreements
-	Winget install -e --id Zoom.Zoom -h --accept-package-agreements --accept-source-agreements
-	Winget install -e --id Notepad++.Notepad++ -h --accept-package-agreements --accept-source-agreements
-	Winget install -e --id Adobe.AdobeAcrobatReaderDC -h --accept-package-agreements --accept-source-agreements
-	Winget install -e --id VideoLAN.VLC -h --accept-package-agreements --accept-source-agreements
-	Winget install -e --id Microsoft.PowerShell -h --accept-package-agreements --accept-source-agreements
+	Winget install -e --id 7zip.7zip -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	Winget install -e --id Google.Chrome -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	Winget install -e --id Mozilla.FirefoxESR -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	Winget install -e --id Zoom.Zoom -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	Winget install -e --id Notepad++.Notepad++ -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	Winget install -e --id Adobe.AdobeAcrobatReaderDC -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	Winget install -e --id VideoLAN.VLC -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	Winget install -e --id Microsoft.PowerShell -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 }
 
 Function Install-WinRepairToolbox {
@@ -1654,7 +1654,7 @@ Function Install-Croc {
     if (-not $isSystem -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Host "Attempting install via winget..." -ForegroundColor Cyan
         try {
-            $null = winget install schollz.croc --accept-package-agreements --accept-source-agreements 2>&1
+            $null = winget install --id schollz.croc -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity 2>&1
             $found = Find-CrocExe
             if ($found) {
                 Write-Host "croc installed via winget at: $found" -ForegroundColor Green

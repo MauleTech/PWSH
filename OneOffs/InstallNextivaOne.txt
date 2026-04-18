@@ -2,9 +2,9 @@
 
 If (Get-Command -Name "winget" -CommandType Application -ErrorAction SilentlyContinue) {
 	If (Get-Command -Name "$($Env:LOCALAPPDATA)\Programs\NextivaONE\NextivaONE.exe" -CommandType Application -ErrorAction SilentlyContinue) {
-		winget upgrade Nextiva.NextivaOne --accept-package-agreements --accept-source-agreements
+		winget upgrade --id Nextiva.NextivaOne -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 	} Else {
-		winget install Nextiva.NextivaOne --accept-package-agreements --accept-source-agreements
+		winget install --id Nextiva.NextivaOne -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 	}
 } Else {
 	Function Get-FileDownload {
@@ -55,8 +55,8 @@ If (Get-Command -Name "winget" -CommandType Application -ErrorAction SilentlyCon
 	Remove-Item -Path $DownloadFilePath -Force -ErrorAction SilentlyContinue
 
 	If (Get-Command -Name "$($Env:LOCALAPPDATA)\Programs\NextivaONE\NextivaONE.exe" -CommandType Application -ErrorAction SilentlyContinue) {
-		winget upgrade Nextiva.NextivaOne --accept-package-agreements --accept-source-agreements
+		winget upgrade --id Nextiva.NextivaOne -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 	} Else {
-		winget install Nextiva.NextivaOne --accept-package-agreements --accept-source-agreements
+		winget install --id Nextiva.NextivaOne -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 	}
 }

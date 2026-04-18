@@ -351,7 +351,7 @@ Function Start-PSTaskManager {
 
 	Write-Host "pstop not found. Attempting installation..." -ForegroundColor Cyan
 
-	# Reused launch logic — avoids duplicating the PATH-vs-ITFolder decision
+	# Reused launch logic - avoids duplicating the PATH-vs-ITFolder decision
 	$LaunchPstop = {
 		$Cmd = Get-Command pstop -ErrorAction SilentlyContinue
 		If ($Cmd) {
@@ -372,8 +372,8 @@ Function Start-PSTaskManager {
 	If (-not $IsSystem -and $WingetAvail) {
 		Write-Host "[1/4] Trying winget..." -ForegroundColor Cyan
 		Try {
-			winget install --id marlocarlo.pstop -e -h --accept-package-agreements --accept-source-agreements
-			# winget modifies PATH but the current session doesn't see it yet — refresh before checking
+			Invoke-WinGetInstall -Id marlocarlo.pstop
+			# winget modifies PATH but the current session doesn't see it yet - refresh before checking
 			$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
 			If (Get-Command pstop -ErrorAction SilentlyContinue) { $Installed = $true }
 		} Catch {

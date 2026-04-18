@@ -1593,14 +1593,10 @@ Function Install-WinGet {
 Function Install-WinGetApps {
 	If (-not (Get-Command -Name "winget" -ErrorAction SilentlyContinue)) {Install-Winget}
 	winget source update
-	Winget install -e --id 7zip.7zip -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
-	Winget install -e --id Google.Chrome -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
-	Winget install -e --id Mozilla.FirefoxESR -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
-	Winget install -e --id Zoom.Zoom -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
-	Winget install -e --id Notepad++.Notepad++ -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
-	Winget install -e --id Adobe.AdobeAcrobatReaderDC -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
-	Winget install -e --id VideoLAN.VLC -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
-	Winget install -e --id Microsoft.PowerShell -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	$Apps = '7zip.7zip', 'Google.Chrome', 'Mozilla.FirefoxESR', 'Zoom.Zoom', 'Notepad++.Notepad++', 'Adobe.AdobeAcrobatReaderDC', 'VideoLAN.VLC', 'Microsoft.PowerShell'
+	ForEach ($Id in $Apps) {
+		winget install -e --id $Id -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
+	}
 }
 
 Function Install-WinRepairToolbox {

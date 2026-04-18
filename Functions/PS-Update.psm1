@@ -472,7 +472,7 @@ Function Update-Everything {
 
 # Update-ITFunctions is defined in LoadFunctions.txt using Sync-PWSHRepository
 # (with Invoke-Git timeout protection, GIT_TERMINAL_PROMPT=0, and remote-branch fallback).
-# Do NOT redefine it here — this module loads after the bootstrap and would shadow the better version.
+# Do NOT redefine it here - this module loads after the bootstrap and would shadow the better version.
 
 Function Update-ITS247Agent {
 	$DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion

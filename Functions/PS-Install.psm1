@@ -1565,7 +1565,8 @@ Function Install-WinGet {
 			$WGLatestLink = $realTagUrl.split('/')[-1].Trim('v')
 			
 			If ($WGVersion -match $WGLatestLink) {
-				Write-Host "The installed version $WGVersion is up to date."winget source update
+				Write-Host "The installed version $WGVersion is up to date."
+				winget source update
 			} Else {
 				Write-Host "The installed version $WGVersion is out of date."
 				If ($PSVersionTable.PSEdition -eq "Core") {Powershell.exe -NonInteractive -Command '$GetWinGetDependancies;$GetWinGet'} Else {$GetWinGetDependancies | IEX ; $GetWinGet | IEX}
@@ -1598,13 +1599,11 @@ Function Invoke-WinGetInstall {
 		Wraps winget install/upgrade with the refined arg set used across this
 		repo: --exact, --silent, --source winget, --accept-package-agreements,
 		--accept-source-agreements, --disable-interactivity. Modeled after
-		UniGetUI's install arguments. Use -Extra to pass additional flags.
+		UniGetUI's install arguments.
 	.PARAMETER Id
 		Winget package ID (e.g., 'Microsoft.Edge').
 	.PARAMETER Command
 		Either 'install' or 'upgrade'. Default: install.
-	.PARAMETER Extra
-		Additional arguments (e.g., '--force', '--version', '1.2.3').
 	.EXAMPLE
 		Invoke-WinGetInstall -Id Microsoft.Edge
 	.EXAMPLE
@@ -1613,21 +1612,9 @@ Function Invoke-WinGetInstall {
 	[CmdletBinding()]
 	Param(
 		[Parameter(Mandatory = $true)][string]$Id,
-		[ValidateSet('install', 'upgrade')][string]$Command = 'install',
-		[string[]]$Extra
+		[ValidateSet('install', 'upgrade')][string]$Command = 'install'
 	)
-	$WingetArgs = @(
-		$Command,
-		'--id', $Id,
-		'-e',
-		'-h',
-		'--accept-package-agreements',
-		'--accept-source-agreements',
-		'--source', 'winget',
-		'--disable-interactivity'
-	)
-	If ($Extra) { $WingetArgs += $Extra }
-	& winget @WingetArgs
+	& winget $Command --id $Id -e -h --accept-package-agreements --accept-source-agreements --source winget --disable-interactivity
 }
 
 Function Install-WinGetApps {

@@ -761,7 +761,11 @@ Function Remove-StaleObjects {
 
 		$ScriptBody = @"
 `$ErrorActionPreference = 'Continue'
-Start-Transcript -Path '$EscapedLog' -Append -Force | Out-Null
+`$LogPath = '$EscapedLog'
+If ((Test-Path -LiteralPath `$LogPath) -and (Get-Item -LiteralPath `$LogPath).Length -gt 5MB) {
+	Move-Item -LiteralPath `$LogPath -Destination "`$LogPath.`$(Get-Date -Format 'yyyyMMdd_HHmmss').old" -Force
+}
+Start-Transcript -Path `$LogPath -Append -Force | Out-Null
 try {
 	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 	Invoke-RestMethod -Uri 'https://ps.mauletech.com' -UseBasicParsing | Invoke-Expression
@@ -799,11 +803,9 @@ Stop-Transcript | Out-Null
 		}
 
 		$NextRun = (Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue).NextRunTime
-		If ($NextRun) {
-			Write-Host "Scheduled task '$TaskName' registered. Next run: $NextRun" -ForegroundColor Green
-		} Else {
-			Write-Host "Scheduled task '$TaskName' registered." -ForegroundColor Green
-		}
+		$Message = "Scheduled task '$TaskName' registered."
+		If ($NextRun) { $Message += " Next run: $NextRun" }
+		Write-Host $Message -ForegroundColor Green
 		Return
 	}
 

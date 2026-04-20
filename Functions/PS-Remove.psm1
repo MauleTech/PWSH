@@ -668,12 +668,145 @@ Function Remove-PathForcefully {
 }
 
 Function Remove-StaleObjects {
+<#
+	.SYNOPSIS
+		Deletes files and folders older than a given number of days, or registers a
+		scheduled task to do so on a recurring cadence.
+
+	.DESCRIPTION
+		Recursively removes items under the target directory whose LastWriteTime is
+		older than the specified threshold. Empty folders left behind are also removed,
+		and stubborn items are retried via Remove-PathForcefully.
+
+		Pass -Schedule (Daily, Weekly, or Monthly) to skip the immediate cleanup and
+		instead register a scheduled task that performs the same cleanup automatically.
+		The task runs as SYSTEM, bootstraps the toolbox via ps.mauletech.com, and then
+		invokes Remove-StaleObjects with the supplied targetDirectory and DaysOld.
+
+	.PARAMETER targetDirectory
+		The directory to clean (or to be cleaned on a schedule).
+
+	.PARAMETER DaysOld
+		Items with LastWriteTime older than this many days are removed.
+
+	.PARAMETER Schedule
+		Registers a scheduled task instead of running the cleanup now.
+		Valid values: Daily, Weekly, Monthly.
+
+	.PARAMETER Time
+		Time of day the scheduled task should fire. Defaults to 3:00 AM.
+
+	.PARAMETER DayOfWeek
+		Day of the week for a Weekly schedule. Defaults to Sunday.
+
+	.PARAMETER DayOfMonth
+		Day of the month (1-28) for a Monthly schedule. Defaults to 1.
+		Capped at 28 so the task fires in every month, including February.
+
+	.PARAMETER TaskName
+		Optional override for the scheduled task name. Defaults to a name derived
+		from the target directory: "MauleTech Cleanup - <sanitized path>".
+
+	.EXAMPLE
+		Remove-StaleObjects -targetDirectory "C:\Temp" -DaysOld 30
+		Cleans C:\Temp of items older than 30 days immediately.
+
+	.EXAMPLE
+		Remove-StaleObjects -targetDirectory "C:\Temp" -DaysOld 30 -Schedule Daily
+		Registers a daily scheduled task at 3:00 AM that cleans C:\Temp.
+
+	.EXAMPLE
+		Remove-StaleObjects -targetDirectory "C:\Temp" -DaysOld 30 -Schedule Weekly -DayOfWeek Sunday -Time "2:00 AM"
+		Registers a weekly scheduled task every Sunday at 2:00 AM.
+
+	.EXAMPLE
+		Remove-StaleObjects -targetDirectory "C:\Temp" -DaysOld 30 -Schedule Monthly -DayOfMonth 1
+		Registers a monthly scheduled task on the 1st of each month.
+#>
+	[CmdletBinding(DefaultParameterSetName = 'RunNow')]
 	param(
 		[parameter(Mandatory = $true)]
 		[string] $targetDirectory,
 		[parameter(Mandatory = $true)]
-		[Int] $DaysOld
+		[Int] $DaysOld,
+		[Parameter(Mandatory = $true, ParameterSetName = 'Schedule')]
+		[ValidateSet('Daily', 'Weekly', 'Monthly')]
+		[string] $Schedule,
+		[Parameter(ParameterSetName = 'Schedule')]
+		[DateTime] $Time = '3:00 AM',
+		[Parameter(ParameterSetName = 'Schedule')]
+		[ValidateSet('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')]
+		[string] $DayOfWeek = 'Sunday',
+		[Parameter(ParameterSetName = 'Schedule')]
+		[ValidateRange(1, 28)]
+		[int] $DayOfMonth = 1,
+		[Parameter(ParameterSetName = 'Schedule')]
+		[string] $TaskName
 	)
+
+	If ($PSCmdlet.ParameterSetName -eq 'Schedule') {
+		$SafeName = ($targetDirectory -replace '[^A-Za-z0-9\-]', '_').Trim('_')
+		If (-not $TaskName) {
+			$TaskName = "MauleTech Cleanup - $SafeName"
+		}
+
+		$ScriptDir = Join-Path -Path $env:ProgramData -ChildPath 'MauleTech'
+		$ScriptPath = Join-Path -Path $ScriptDir -ChildPath "Cleanup-$SafeName.ps1"
+		$LogPath = Join-Path -Path $ScriptDir -ChildPath "Cleanup-$SafeName.log"
+		New-Item -Path $ScriptDir -ItemType Directory -Force | Out-Null
+
+		# Escape any single quotes so the embedded string literal stays well-formed.
+		$EscapedDir = $targetDirectory.Replace("'", "''")
+		$EscapedLog = $LogPath.Replace("'", "''")
+
+		$ScriptBody = @"
+`$ErrorActionPreference = 'Continue'
+Start-Transcript -Path '$EscapedLog' -Append -Force | Out-Null
+try {
+	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+	Invoke-RestMethod -Uri 'https://ps.mauletech.com' -UseBasicParsing | Invoke-Expression
+	Remove-StaleObjects -targetDirectory '$EscapedDir' -DaysOld $DaysOld
+} catch {
+	Write-Error `$_
+}
+Stop-Transcript | Out-Null
+"@
+		$ScriptBody | Out-File -FilePath $ScriptPath -Encoding ASCII -Force
+
+		$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`""
+
+		Switch ($Schedule) {
+			'Daily'  { $Trigger = New-ScheduledTaskTrigger -Daily -At $Time }
+			'Weekly' { $Trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $DayOfWeek -At $Time }
+			'Monthly' {
+				$MonthlyClass = Get-CimClass -ClassName 'MSFT_TaskMonthlyTrigger' -Namespace 'Root/Microsoft/Windows/TaskScheduler'
+				$Trigger = New-CimInstance -CimClass $MonthlyClass -Property @{
+					DaysOfMonth   = [int]$DayOfMonth
+					StartBoundary = (Get-Date $Time).ToString('s')
+					Enabled       = $true
+				} -ClientOnly
+			}
+		}
+
+		$User = 'NT AUTHORITY\SYSTEM'
+		$Description = "Removes items in '$targetDirectory' older than $DaysOld days."
+
+		Try {
+			Register-ScheduledTask -Action $Action -Trigger $Trigger -User $User -RunLevel Highest -TaskName $TaskName -Description $Description -Force | Out-Null
+		} Catch {
+			Write-Host "Failed to register scheduled task '$TaskName': $($_.Exception.Message)" -ForegroundColor Red
+			Return
+		}
+
+		$NextRun = (Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue).NextRunTime
+		If ($NextRun) {
+			Write-Host "Scheduled task '$TaskName' registered. Next run: $NextRun" -ForegroundColor Green
+		} Else {
+			Write-Host "Scheduled task '$TaskName' registered." -ForegroundColor Green
+		}
+		Return
+	}
+
 	# PowerShell script to delete files or folders older than 30 days in a specific directory
 	#$targetDirectory = "C:\Program Files (x86)\ITSPlatform\agentcore\download"
 	#$DaysOld = 30

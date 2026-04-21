@@ -1728,7 +1728,7 @@ Function Get-FileDownload {
 Function Get-InstalledApplication {
 	<#
 	.SYNOPSIS
-		Gets installed applications from multiple sources including WMI, PowerShell Package Provider, and Registry.
+		Gets installed applications from the PowerShell Package Provider and Registry uninstall keys.
 
 	.DESCRIPTION
 		Scans multiple application repositories to find installed applications.
@@ -1768,22 +1768,6 @@ Function Get-InstalledApplication {
 	$AllApps = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 	Write-Verbose '[Scanning All App sources]'
-
-	# Scan CIM/WMI Repository (using Get-CimInstance instead of deprecated Get-WmiObject)
-	# Note: Win32_Product can be slow and may trigger MSI repairs on scanned applications
-	Write-Verbose '--[Scanning CIM Repository (this may take a moment)]'
-	Try {
-		Get-CimInstance -Class Win32_Product -ErrorAction SilentlyContinue |
-			Where-Object { $_.Name } |
-			ForEach-Object {
-				$AllApps.Add([PSCustomObject]@{
-					Name    = $_.Name
-					Version = $_.Version
-				})
-			}
-	} Catch {
-		Write-Verbose "Failed to query CIM repository: $_"
-	}
 
 	# Scan Native PowerShell Package Repository
 	Write-Verbose '--[Scanning Native PowerShell Repository]'

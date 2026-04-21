@@ -197,6 +197,11 @@ Function Add-RDPShortcut {
 	.PARAMETER PassThru
 		Return the paths of created RDP files.
 
+	.PARAMETER SigningPassword
+		Password to decrypt the Azure Key Vault signing config from BinCache. When provided,
+		each created RDP file will be digitally signed to suppress the Unknown Publisher
+		security warning.
+
 	.OUTPUTS
 		System.String[]
 		When using -PassThru, returns an array of created RDP file paths.
@@ -253,7 +258,9 @@ Function Add-RDPShortcut {
 		[Parameter()]
 		[String]$User,
 		[Parameter()]
-		[Switch]$PassThru
+		[Switch]$PassThru,
+		[Parameter()]
+		[String]$SigningPassword
 	)
 
 	begin {
@@ -728,6 +735,10 @@ server port:i:3389
 			Write-Host "Successfully created RDP shortcuts" -ForegroundColor Green
 		}
 
+		if (-not [string]::IsNullOrEmpty($SigningPassword) -and $CreatedFiles.Count -gt 0) {
+			Set-RDPSignature -Path $CreatedFiles.ToArray() -SigningPassword $SigningPassword
+		}
+
 		# Return created file paths if PassThru is specified
 		if ($PassThru) {
 			return $CreatedFiles.ToArray()
@@ -750,6 +761,141 @@ Function Add-WebShortcut{
 	$Favorite = $Shell.CreateShortcut($URLFilePath)
 	$Favorite.TargetPath = $Url
 	$Favorite.Save()
+}
+
+Function Add-RDPCertificate {
+<#
+.SYNOPSIS
+	Extracts the signing certificate from a signed RDP file and adds it to the Trusted Publishers store.
+.DESCRIPTION
+	Reads the signature:s: field from one or more signed .rdp files, extracts the signer's certificate
+	from the embedded PKCS#7 data, and imports it to Cert:\LocalMachine\TrustedPublisher (falling back
+	to Cert:\CurrentUser\TrustedPublisher if the machine store is inaccessible). Once the certificate
+	is trusted, Windows will not show the Unknown Publisher security warning when launching the file.
+.PARAMETER Path
+	One or more paths to signed .rdp files. Accepts pipeline input from Get-ChildItem.
+.PARAMETER CurrentUser
+	Import to the current user's Trusted Publishers store rather than the local machine store.
+.EXAMPLE
+	Add-RDPCertificate -Path "C:\Users\Public\Desktop\Server.rdp"
+	Trusts the signing certificate from a single RDP file.
+.EXAMPLE
+	Get-ChildItem "C:\RDP Files" -Filter *.rdp | Add-RDPCertificate
+	Trusts the signing certificate from all RDP files in a folder.
+#>
+	[CmdletBinding(SupportsShouldProcess)]
+	param(
+		[Parameter(Mandatory=$true, ValueFromPipeline=$true, ValueFromPipelineByPropertyName=$true)]
+		[Alias('FullName')]
+		[string[]]$Path,
+		[Parameter()]
+		[switch]$CurrentUser
+	)
+
+	begin {
+		Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+	}
+
+	process {
+		foreach ($rdpFile in $Path) {
+			if (-not (Test-Path $rdpFile -PathType Leaf)) {
+				Write-Host "File not found: $rdpFile" -ForegroundColor Red
+				continue
+			}
+			if ([System.IO.Path]::GetExtension($rdpFile) -ine '.rdp') {
+				Write-Host "Not an RDP file: $rdpFile" -ForegroundColor Red
+				continue
+			}
+
+			$content = Get-Content -Path $rdpFile -Raw
+			if ($content -notmatch '(?m)^signature:s:(.+)$') {
+				Write-Host "$(Split-Path $rdpFile -Leaf): no signature found -- file is not signed." -ForegroundColor Yellow
+				continue
+			}
+			# RDP signature values may contain embedded whitespace from line-wrapping
+			$sigBase64 = $Matches[1].Trim() -replace '\s+', ''
+
+			try {
+				$sigBytes = [Convert]::FromBase64String($sigBase64)
+			} catch {
+				Write-Host "$(Split-Path $rdpFile -Leaf): failed to decode signature: $_" -ForegroundColor Red
+				continue
+			}
+
+			try {
+				# rdpsign.exe prepends a 12-byte proprietary header before the PKCS#7 blob.
+				# Locate the ASN.1 SEQUENCE tag (0x30) to skip it.
+				$pkcs7Start = 0
+				for ($i = 0; $i -lt [Math]::Min(32, $sigBytes.Length); $i++) {
+					if ($sigBytes[$i] -eq 0x30) { $pkcs7Start = $i; break }
+				}
+				$pkcs7Bytes = $sigBytes[$pkcs7Start..($sigBytes.Length - 1)]
+				$cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+				$cms.Decode($pkcs7Bytes)
+				$cert = $cms.SignerInfos[0].Certificate
+			} catch {
+				Write-Host "$(Split-Path $rdpFile -Leaf): failed to parse signature: $_" -ForegroundColor Red
+				continue
+			}
+
+			if ($null -eq $cert) {
+				Write-Host "$(Split-Path $rdpFile -Leaf): no certificate embedded in signature." -ForegroundColor Yellow
+				continue
+			}
+
+			Write-Host "$(Split-Path $rdpFile -Leaf)" -ForegroundColor Cyan
+			Write-Host "  Subject:    $($cert.Subject)" -ForegroundColor Gray
+			Write-Host "  Thumbprint: $($cert.Thumbprint)" -ForegroundColor Gray
+			Write-Host "  Expires:    $($cert.NotAfter.ToString('yyyy-MM-dd'))" -ForegroundColor Gray
+
+			$storeLocation = if ($CurrentUser) {
+				[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+			} else {
+				[System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+			}
+
+			$trusted = $false
+			$store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', $storeLocation)
+			try {
+				$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+				if ($store.Certificates | Where-Object { $_.Thumbprint -eq $cert.Thumbprint }) {
+					Write-Host "  Already trusted in $storeLocation\TrustedPublisher." -ForegroundColor Green
+					$trusted = $true
+				} elseif ($PSCmdlet.ShouldProcess("$storeLocation\TrustedPublisher", "Add certificate '$($cert.Subject)'")) {
+					$store.Add($cert)
+					Write-Host "  [TRUSTED] Added to $storeLocation\TrustedPublisher." -ForegroundColor Green
+					$trusted = $true
+				}
+			} catch {
+				if (-not $CurrentUser) {
+					Write-Host "  LocalMachine store not accessible, retrying with CurrentUser..." -ForegroundColor Yellow
+				} else {
+					Write-Host "  Failed to add certificate: $_" -ForegroundColor Red
+				}
+			} finally {
+				$store.Close()
+			}
+
+			if (-not $trusted -and -not $CurrentUser) {
+				$cuStore = New-Object System.Security.Cryptography.X509Certificates.X509Store(
+					'TrustedPublisher',
+					[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+				try {
+					$cuStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+					if ($cuStore.Certificates | Where-Object { $_.Thumbprint -eq $cert.Thumbprint }) {
+						Write-Host "  Already trusted in CurrentUser\TrustedPublisher." -ForegroundColor Green
+					} elseif ($PSCmdlet.ShouldProcess('CurrentUser\TrustedPublisher', "Add certificate '$($cert.Subject)'")) {
+						$cuStore.Add($cert)
+						Write-Host "  [TRUSTED] Added to CurrentUser\TrustedPublisher." -ForegroundColor Green
+					}
+				} catch {
+					Write-Host "  Failed to add certificate: $_" -ForegroundColor Red
+				} finally {
+					$cuStore.Close()
+				}
+			}
+		}
+	}
 }
 
 # SIG # Begin signature block

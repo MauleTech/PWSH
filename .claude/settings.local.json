@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh pr view:*)",
+      "Bash(git fetch:*)",
+      "Bash(gh pr list:*)",
+      "Bash(git checkout:*)",
+      "Bash(gh pr checkout:*)",
+      "Bash(git merge:*)",
+      "Bash(xxd:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(pwsh:*)",
+      "Bash(powershell.exe:*)",
+      "Bash(gh pr:*)",
+      "Bash(\"C:/IT/GitHub/MinGit/mingw64/bin/git.exe\" --version 2>&1)",
+      "Bash(\"C:/IT/GitHub/MinGit/mingw64/bin/git.exe\" --exec-path 2>&1)"
+    ]
+  }
+}

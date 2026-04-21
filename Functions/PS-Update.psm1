@@ -184,13 +184,24 @@ Function Update-DellPackages {
 				}
 			}
 
+			Write-Host "Scanning installed applications..." -ForegroundColor Cyan
+			$InstalledApps = Get-InstalledApplication
+
 			If ((!(Test-Path $DCUx86)) -and (!(Test-Path $DCUx64))) {
 				Write-Host "Checking if 'Dell Command | Update' is current."
 				#Remove any Windows 10 "Apps"
 				Get-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -like "*Dell*Update*"} | Remove-ProvisionedAppPackage -Online
-				Uninstall-Application -AppToUninstall "Dell*Update"
+				If ($InstalledApps.Name -match 'Dell.*Update') {
+					Uninstall-Application -AppToUninstall "Dell*Update"
+				} Else {
+					Write-Host -ForegroundColor Green "No conflicting 'Dell*Update' apps found; skipping."
+				}
 				Get-Package "Dell*Windows 10" -ErrorAction SilentlyContinue | Uninstall-Package -AllVersions -Force
-				Uninstall-Application -AppToUninstall "Alienware Update for Windows Universal" -ErrorAction SilentlyContinue
+				If ($InstalledApps.Name -match 'Alienware Update for Windows Universal') {
+					Uninstall-Application -AppToUninstall "Alienware Update for Windows Universal"
+				} Else {
+					Write-Host -ForegroundColor Green "No 'Alienware Update for Windows Universal' found; skipping."
+				}
 				If (Get-AppxPackage *Dell*Update*){
 					$apps = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall,HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall | Get-ItemProperty | Where-Object {$_.DisplayName -like "Dell*Update*" } | Select-Object -Property DisplayName, UninstallString
 					ForEach ($ver in $apps) {
@@ -229,7 +240,9 @@ Function Update-DellPackages {
 				Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
 
 				#Remove any programs listed through "Add and remove programs"
-				Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
+				If ($InstalledApps.Name -match 'Dell Command \| Update') {
+					Uninstall-Application -AppToUninstall "Dell Command | Update"
+				}
 				Install-DCU
 
 			} Else {

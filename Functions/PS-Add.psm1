@@ -420,13 +420,15 @@ Function Add-RDPShortcut {
 				if (Test-Path $regPath) {
 					$desktopPath = (Get-ItemProperty -Path $regPath -Name "Desktop" -ErrorAction SilentlyContinue).Desktop
 					if ($desktopPath) {
-						# Expand environment variables
-						$desktopPath = [Environment]::ExpandEnvironmentVariables($desktopPath)
-						# If path contains %USERPROFILE%, replace with actual path
+						# Replace %USERPROFILE% before expanding other env vars, because
+						# ExpandEnvironmentVariables runs in the current (possibly SYSTEM) context
+						# and would substitute the wrong profile path for the target user.
 						if ($desktopPath -like "*%USERPROFILE%*" -and $DefaultPath) {
 							$userProfilePath = Split-Path -Parent $DefaultPath
 							$desktopPath = $desktopPath -replace '%USERPROFILE%', $userProfilePath
 						}
+						# Expand any remaining environment variables (e.g. OneDrive paths)
+						$desktopPath = [Environment]::ExpandEnvironmentVariables($desktopPath)
 						if (Test-Path $desktopPath) {
 							Write-Verbose "Found redirected Desktop for SID ${UserSID} at: $desktopPath"
 							return $desktopPath

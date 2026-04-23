@@ -148,16 +148,14 @@ Function Update-DellPackages {
 			# Decide the install source ONCE and reuse for both the available-version check
 			# and the actual install. Mixing sources (e.g. check via choco, install via winget)
 			# causes upgrade loops when the two catalogs disagree on the latest version.
-			$WingetAvail   = [bool](Get-Command winget -ErrorAction SilentlyContinue)
 			$IsSystem      = $(whoami) -eq "nt authority\system"
-			$InstallSource = If ($WingetAvail) { 'winget' } Else { 'choco' }
+			$InstallSource = If (Get-Command winget -ErrorAction SilentlyContinue) { 'winget' } Else { 'choco' }
 			Write-Host "DCU package source for this run: $InstallSource" -ForegroundColor Cyan
 
 			Function Install-DCU {
 				#Starts the IPMI Service if needed
 				$IPMIService = (Get-Service -Name IPMIDRV -ErrorAction SilentlyContinue).Status
 				If ($IPMIService -and $IPMIService -ne "Running") {Start-Service -Name IPMIDRV}
-				#Install the latest
 				Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
 
 				If ($InstallSource -eq 'winget') {
@@ -185,24 +183,29 @@ Function Update-DellPackages {
 				}
 			}
 
-			Write-Host "Scanning installed applications..." -ForegroundColor Cyan
-			$InstalledApps = Get-InstalledApplication
-
 			If ((!(Test-Path $DCUx86)) -and (!(Test-Path $DCUx64))) {
 				Write-Host "Checking if 'Dell Command | Update' is current."
 				#Remove any Windows 10 "Apps"
 				Get-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -like "*Dell*Update*"} | Remove-ProvisionedAppPackage -Online
-				If ($InstalledApps.Name -match 'Dell.*Update') {
-					Uninstall-Application -AppToUninstall "Dell*Update"
-				} Else {
-					Write-Host -ForegroundColor Green "No conflicting 'Dell*Update' apps found; skipping."
+
+				# Scan once to gate the uninstall calls below. Uninstall-Application's
+				# internal WMI scan is the expensive part; skipping it when no match
+				# exists is the whole point.
+				Write-Host "Scanning installed applications for conflicts..." -ForegroundColor Cyan
+				$InstalledApps = Get-InstalledApplication
+
+				$Conflicts = @(
+					@{ Pattern = 'Dell.*Update';                           App = 'Dell*Update' },
+					@{ Pattern = 'Alienware Update for Windows Universal'; App = 'Alienware Update for Windows Universal' }
+				)
+				ForEach ($c in $Conflicts) {
+					If ($InstalledApps.Name -match $c.Pattern) {
+						Uninstall-Application -AppToUninstall $c.App
+					} Else {
+						Write-Host -ForegroundColor Green "No '$($c.App)' found; skipping."
+					}
 				}
 				Get-Package "Dell*Windows 10" -ErrorAction SilentlyContinue | Uninstall-Package -AllVersions -Force
-				If ($InstalledApps.Name -match 'Alienware Update for Windows Universal') {
-					Uninstall-Application -AppToUninstall "Alienware Update for Windows Universal"
-				} Else {
-					Write-Host -ForegroundColor Green "No 'Alienware Update for Windows Universal' found; skipping."
-				}
 				If (Get-AppxPackage *Dell*Update*){
 					$apps = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall,HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall | Get-ItemProperty | Where-Object {$_.DisplayName -like "Dell*Update*" } | Select-Object -Property DisplayName, UninstallString
 					ForEach ($ver in $apps) {
@@ -250,9 +253,7 @@ Function Update-DellPackages {
 				Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
 
 				#Remove any programs listed through "Add and remove programs"
-				If ($InstalledApps.Name -match 'Dell Command \| Update') {
-					Uninstall-Application -AppToUninstall "Dell Command | Update"
-				}
+				Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
 				Install-DCU
 
 			} Else {

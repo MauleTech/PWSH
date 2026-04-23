@@ -145,40 +145,41 @@ Function Update-DellPackages {
 			$DCUx86 = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
 			$DCUx64 = Join-Path -Path $Env:ProgramFiles -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
 
+			# Decide the install source ONCE and reuse for both the available-version check
+			# and the actual install. Mixing sources (e.g. check via choco, install via winget)
+			# causes upgrade loops when the two catalogs disagree on the latest version.
+			$WingetAvail   = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+			$IsSystem      = $(whoami) -eq "nt authority\system"
+			$InstallSource = If ($WingetAvail) { 'winget' } Else { 'choco' }
+			Write-Host "DCU package source for this run: $InstallSource" -ForegroundColor Cyan
+
 			Function Install-DCU {
 				#Starts the IPMI Service if needed
 				$IPMIService = (Get-Service -Name IPMIDRV -ErrorAction SilentlyContinue).Status
 				If ($IPMIService -and $IPMIService -ne "Running") {Start-Service -Name IPMIDRV}
 				#Install the latest
 				Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
-				$IsSystem    = $(whoami) -eq "nt authority\system"
-				$WingetAvail = [bool](Get-Command winget -ErrorAction SilentlyContinue)
-				$DCUInstalled = $false
 
-				If (-not $IsSystem -and $WingetAvail) {
-					Write-Host "Using winget to install Dell Command Update and dependencies." -ForegroundColor Cyan
-					winget source update
-					Invoke-WinGetInstall -Id Microsoft.DotNet.DesktopRuntime.8
-					Invoke-WinGetInstall -Id Dell.CommandUpdate
-					$DCUInstalled = $true
-				}
-
-				If (-not $DCUInstalled -and ($IsSystem -or -not $WingetAvail)) {
-					Write-Host "Running as SYSTEM or winget not directly available. Trying Start-PSWinGet..." -ForegroundColor Yellow
-					Try {
-						# Update-PowerShellModule must be included in the command so that the spawned pwsh Core
-						# session imports Microsoft.WinGet.Client before calling Install-WinGetPackage.
-						# When Start-PSWinGet runs in PS5 it spawns a new pwsh process; the module is installed
-						# in the caller's session but not auto-imported in the child process.
-						Start-PSWinGet -Command 'Update-PowerShellModule -ModuleName Microsoft.WinGet.Client ; Install-WinGetPackage "Microsoft.DotNet.DesktopRuntime.8" ; Install-WinGetPackage "Dell.CommandUpdate"'
-					} Catch {
-						Write-Warning "Start-PSWinGet failed: $_"
+				If ($InstallSource -eq 'winget') {
+					If (-not $IsSystem) {
+						Write-Host "Using winget to install Dell Command Update and dependencies." -ForegroundColor Cyan
+						winget source update
+						Invoke-WinGetInstall -Id Microsoft.DotNet.DesktopRuntime.8
+						Invoke-WinGetInstall -Id Dell.CommandUpdate
+					} Else {
+						Write-Host "Running as SYSTEM; invoking winget via Start-PSWinGet." -ForegroundColor Yellow
+						Try {
+							# Update-PowerShellModule must be included in the command so that the spawned pwsh Core
+							# session imports Microsoft.WinGet.Client before calling Install-WinGetPackage.
+							# When Start-PSWinGet runs in PS5 it spawns a new pwsh process; the module is installed
+							# in the caller's session but not auto-imported in the child process.
+							Start-PSWinGet -Command 'Update-PowerShellModule -ModuleName Microsoft.WinGet.Client ; Install-WinGetPackage "Microsoft.DotNet.DesktopRuntime.8" ; Install-WinGetPackage "Dell.CommandUpdate"'
+						} Catch {
+							Write-Warning "Start-PSWinGet failed: $_"
+						}
 					}
-					$DCUInstalled = (Test-Path $DCUx86) -or (Test-Path $DCUx64)
-				}
-
-				If (-not $DCUInstalled) {
-					Write-Host "Falling back to Chocolatey for DCU installation." -ForegroundColor Yellow
+				} Else {
+					Write-Host "Using Chocolatey to install Dell Command Update and dependencies." -ForegroundColor Cyan
 					choco upgrade dotnet-8.0-desktopruntime --exact -y --force --forcedependencies -i
 					choco upgrade DellCommandUpdate --exact -y --force --forcedependencies -i --ignorechecksums
 				}
@@ -217,19 +218,28 @@ Function Update-DellPackages {
 			$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
 			If (-not $DCUInstalledVersion -and (Test-Path $DCUx86 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx86).VersionInfo.ProductVersion}
 			If (-not $DCUInstalledVersion -and (Test-Path $DCUx64 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx64).VersionInfo.ProductVersion}
+			# Query available version from the SAME source that will install it. If the
+			# query source and install source can disagree, the installed version will
+			# never match what the check reports and every run will trigger a needless
+			# uninstall + reinstall.
 			$DCUAvailableVersion = $null
-			If (Get-Command winget -ErrorAction SilentlyContinue) {
-				$wingetVersionLine = winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:" | Select-Object -First 1
-				If ($wingetVersionLine) {
-					$DCUAvailableVersion = $wingetVersionLine.Line.Replace("Version: ","").Trim()
-				} Else {
-					Write-Host "winget could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
+			Switch ($InstallSource) {
+				'winget' {
+					$wingetVersionLine = winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:" | Select-Object -First 1
+					If ($wingetVersionLine) {
+						$DCUAvailableVersion = $wingetVersionLine.Line.Replace("Version: ","").Trim()
+					} Else {
+						Write-Host "winget could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
+					}
 				}
-			} Else {
-				Write-Host "winget not available; checking DCU version via Chocolatey." -ForegroundColor Yellow
-				$DCUAvailableVersion = choco search DellCommandUpdate --exact #Gets all results
-				$DCUAvailableVersion = ($DCUAvailableVersion | Select-String -Pattern "DellCommandUpdate " -SimpleMatch).Line #Isolates the desired result
-				$DCUAvailableVersion = $DCUAvailableVersion.split(" ",[System.StringSplitOptions]::RemoveEmptyEntries)[1] #Isolates the version number
+				'choco' {
+					$chocoVersionLine = choco search DellCommandUpdate --exact | Select-String -Pattern "DellCommandUpdate " -SimpleMatch | Select-Object -First 1
+					If ($chocoVersionLine) {
+						$DCUAvailableVersion = $chocoVersionLine.Line.split(" ",[System.StringSplitOptions]::RemoveEmptyEntries)[1]
+					} Else {
+						Write-Host "choco could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
+					}
+				}
 			}
 
 			If (-not $DCUInstalledVersion) {

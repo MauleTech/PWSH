@@ -495,7 +495,10 @@ Function Add-RDPShortcut {
 				}
 			}
 
-			$UserProfiles | Where-Object { $ExcludedUsers -notcontains $_.UserName }
+			# Deduplicate by ProfileImagePath: hybrid AAD-joined machines have both an AzureAD
+			# and a local SID entry in the ProfileList that share the same folder, causing both
+			# pattern passes to return the same profile and generate duplicate shortcut paths.
+			$UserProfiles | Sort-Object -Property Path -Unique | Where-Object { $ExcludedUsers -notcontains $_.UserName }
 		}
 	}
 	process {
@@ -516,7 +519,7 @@ Function Add-RDPShortcut {
 		}
 
 		if ($AllExistingUsers) {
-			$UserProfiles = Get-UserHives
+			$UserProfiles = Get-UserHives -ExcludedUsers $ExcludeUsers
 			# Loop through each user profile, using their actual Desktop path
 			$UserProfiles | ForEach-Object {
 				$ShortcutPath.Add("$($_.DesktopPath)\$File")

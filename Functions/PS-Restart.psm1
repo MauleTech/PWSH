@@ -42,11 +42,11 @@ Function Restart-ComputerSafely {
     Remove-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ResumeBitLocker' -ErrorAction SilentlyContinue
 
     if ($Volume -and $Volume.ProtectionStatus -eq 'On') {
-        Write-Host "BitLocker is enabled. Suspending for 1 reboot..."
+        Write-Host "BitLocker is enabled. Suspending for 2 reboots..."
 
-        # Suspend BitLocker for 1 reboot only - the scheduled task will re-suspend if updates need more reboots
+        # Suspend BitLocker for 2 reboot only - the scheduled task will re-suspend if updates need more reboots
         try {
-            Suspend-BitLocker -MountPoint C: -RebootCount 1 -ErrorAction Stop
+            Suspend-BitLocker -MountPoint C: -RebootCount 2 -ErrorAction Stop
         } catch {
             Write-Warning "Failed to suspend BitLocker: $_"
             Write-Warning "Aborting restart to avoid BitLocker recovery prompt."

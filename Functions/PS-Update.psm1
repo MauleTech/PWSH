@@ -1913,7 +1913,6 @@ Function Update-WindowsTo11 {
 				Write-Log "wimgapi.dll not found at $WimSrc -- seeding skipped" -Level "WARNING"
 			}
 
-			# Fix: copy wofutil.dll from the sources directory into System32.
 			# wimgapi.dll calls WOF (Windows Overlay Filter) functions via GetProcAddress.
 			# If System32\wofutil.dll is too old those calls fail with 0x8007007F even when
 			# wimgapi.dll itself is correctly seeded.
@@ -1969,7 +1968,7 @@ Function Update-WindowsTo11 {
 			# this immune to WRP/AV immediately restoring our System32 copies.
 			# $LocalDir is cleaned up automatically in the finally block.
 			$EffectiveSetupPath = $SetupPath
-			if ($script:WdscoreSeeded -or $script:WimgapiSeeded) {
+			if ($script:WdscoreSeeded -or $script:WimgapiSeeded -or $script:WofutilSeeded) {
 				try {
 					$LocalDir = Join-Path $env:SystemDrive "IT\Win11Stage_$(Get-Date -Format 'HHmmss')"
 					New-Item -Path $LocalDir -ItemType Directory -Force | Out-Null
@@ -1979,7 +1978,8 @@ Function Update-WindowsTo11 {
 
 					foreach ($entry in @(
 						@{ Name = 'wdscore.dll'; Src = $WdsSrc; Seeded = $script:WdscoreSeeded },
-						@{ Name = 'wimgapi.dll'; Src = $WimSrc; Seeded = $script:WimgapiSeeded }
+						@{ Name = 'wimgapi.dll'; Src = $WimSrc; Seeded = $script:WimgapiSeeded },
+						@{ Name = 'wofutil.dll'; Src = $WofSrc; Seeded = $script:WofutilSeeded }
 					)) {
 						if ($entry.Seeded -and (Test-Path $entry.Src)) {
 							Copy-Item $entry.Src (Join-Path $LocalDir $entry.Name) -Force -ErrorAction Stop

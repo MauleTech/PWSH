@@ -1646,11 +1646,13 @@ Function Update-WindowsTo11 {
 
 	function Get-SetupExitInfo {
 		param([int]$ExitCode)
-		# Convert to unsigned for lookup (PowerShell treats large hex as negative int)
-		$UnsignedCode = [uint32]("0x{0:X8}" -f $ExitCode)
-		$info = $SetupExitCodes[[int]$UnsignedCode]
+		# Hashtable keys were built with [int]0x... casts (same Int32 bit pattern), so look up
+		# directly with the Int32 value. Converting through uint32 then back to [int] overflows
+		# for codes > 0x7FFFFFFF (e.g. 0x8007007F -> uint32 2147942527 > Int32.MaxValue).
+		$info = $SetupExitCodes[$ExitCode]
 		if ($info) { return $info }
 		# Unknown code -- assume not retryable
+		$UnsignedCode = [uint32]("0x{0:X8}" -f $ExitCode)
 		return @{ Message = "Unknown exit code: 0x$("{0:X8}" -f $UnsignedCode)"; Retryable = $false }
 	}
 
@@ -1939,7 +1941,7 @@ Function Update-WindowsTo11 {
 				return $Result
 			}
 
-			Write-Log "Setup exited with code 0x$("{0:X8}" -f ([uint32]$SetupProcess.ExitCode)): $($ExitInfo.Message)" -Level "WARNING"
+			Write-Log "Setup exited with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "WARNING"
 
 			# Only retry with minimal arguments if the exit code is retryable
 			if (-not $ExitInfo.Retryable) {
@@ -1969,7 +1971,7 @@ Function Update-WindowsTo11 {
 				Write-Log "Setup completed successfully (fallback arguments)" -Level "SUCCESS"
 				$Result.Success = $true
 			} else {
-				Write-Log "Setup failed with code 0x$("{0:X8}" -f ([uint32]$SetupProcess.ExitCode)): $($ExitInfo.Message)" -Level "ERROR"
+				Write-Log "Setup failed with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "ERROR"
 			}
 			return $Result
 		} catch {

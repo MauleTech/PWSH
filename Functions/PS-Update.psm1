@@ -1913,7 +1913,6 @@ Function Update-WindowsTo11 {
 				Write-Log "wimgapi.dll not found at $WimSrc -- seeding skipped" -Level "WARNING"
 			}
 
-			# Fix: copy wofutil.dll from the sources directory into System32.
 			# wimgapi.dll calls WOF (Windows Overlay Filter) functions via GetProcAddress.
 			# If System32\wofutil.dll is too old those calls fail with 0x8007007F even when
 			# wimgapi.dll itself is correctly seeded.
@@ -1964,27 +1963,57 @@ Function Update-WindowsTo11 {
 				"/EULA", "Accept"
 			))
 
-			# Re-verify seeded DLLs right before launch. setup.exe restores any System32 files
-			# it detects as modified during a prior failed-attempt rollback. Re-seeding here
-			# ensures each Start-Process sees the correct DLL versions regardless of history.
-			foreach ($dll in @(
-				@{ Name = 'wdscore.dll'; Src = $WdsSrc; Dst = $WdsDst; Seeded = $script:WdscoreSeeded  },
-				@{ Name = 'wimgapi.dll'; Src = $WimSrc; Dst = $WimDst; Seeded = $script:WimgapiSeeded  },
-				@{ Name = 'wofutil.dll'; Src = $WofSrc; Dst = $WofDst; Seeded = $script:WofutilSeeded  }
-			)) {
-				if (-not $dll.Seeded -or -not (Test-Path $dll.Src)) { continue }
-				$curVer = (Get-Item $dll.Dst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
-				$srcVer = (Get-Item $dll.Src).VersionInfo.FileVersion
-				if ($curVer -ne $srcVer) {
-					Write-Log "$($dll.Name) was restored to $curVer -- re-seeding before launch..." -Level "WARNING"
-					Copy-Item $dll.Src $dll.Dst -Force -ErrorAction SilentlyContinue
+			# Stage setup.exe locally so override DLLs sit next to the executable.
+			# Windows DLL search checks the application directory before System32, making
+			# this immune to WRP/AV immediately restoring our System32 copies.
+			# $LocalDir is cleaned up automatically in the finally block.
+			$EffectiveSetupPath = $SetupPath
+			if ($script:WdscoreSeeded -or $script:WimgapiSeeded -or $script:WofutilSeeded) {
+				try {
+					$LocalDir = Join-Path $env:SystemDrive "IT\Win11Stage_$(Get-Date -Format 'HHmmss')"
+					New-Item -Path $LocalDir -ItemType Directory -Force | Out-Null
+
+					$stagedExe = Join-Path $LocalDir "setup.exe"
+					Copy-Item $SetupPath $stagedExe -Force -ErrorAction Stop
+
+					foreach ($entry in @(
+						@{ Name = 'wdscore.dll'; Src = $WdsSrc; Seeded = $script:WdscoreSeeded },
+						@{ Name = 'wimgapi.dll'; Src = $WimSrc; Seeded = $script:WimgapiSeeded },
+						@{ Name = 'wofutil.dll'; Src = $WofSrc; Seeded = $script:WofutilSeeded }
+					)) {
+						if ($entry.Seeded -and (Test-Path $entry.Src)) {
+							Copy-Item $entry.Src (Join-Path $LocalDir $entry.Name) -Force -ErrorAction Stop
+							Write-Log "Staged $($entry.Name) alongside setup.exe (bypasses System32 protection)" -Level "SUCCESS"
+						}
+					}
+
+					# Link sources so staged setup.exe can locate its installation files.
+					# Try junction first (local paths); fall back to symlink (UNC paths).
+					$stageSourcesDir = Join-Path $LocalDir "sources"
+					$jResult = & cmd /c mklink /J $stageSourcesDir $SourcesDir 2>&1
+					if ($LASTEXITCODE -ne 0) {
+						$dResult = & cmd /c mklink /D $stageSourcesDir $SourcesDir 2>&1
+						if ($LASTEXITCODE -ne 0) {
+							throw "Could not link sources directory (/J: $jResult; /D: $dResult)"
+						}
+					}
+
+					Write-Log "Running setup from staged path: $LocalDir" -Level "SUCCESS"
+					$EffectiveSetupPath = $stagedExe
+				} catch {
+					Write-Log "Staging failed ($($_.Exception.Message)) -- running from original path" -Level "WARNING"
+					if ($LocalDir -and (Test-Path $LocalDir)) {
+						Remove-Item $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
+						$LocalDir = $null
+					}
+					$EffectiveSetupPath = $SetupPath
 				}
 			}
 
 			Write-Log "Starting Windows 11 upgrade..."
 			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
 
-			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $SetupArgs -Wait -PassThru
+			$SetupProcess = Start-Process -FilePath $EffectiveSetupPath -ArgumentList $SetupArgs -Wait -PassThru
 			$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
 
 			if ($SetupProcess.ExitCode -eq 0) {
@@ -2017,22 +2046,7 @@ Function Update-WindowsTo11 {
 			))
 			Write-Log "Fallback setup arguments: $($FallbackArgs -join ' ')"
 
-			# Re-seed DLLs again -- prior run's rollback may have restored them
-			foreach ($dll in @(
-				@{ Name = 'wdscore.dll'; Src = $WdsSrc; Dst = $WdsDst; Seeded = $script:WdscoreSeeded  },
-				@{ Name = 'wimgapi.dll'; Src = $WimSrc; Dst = $WimDst; Seeded = $script:WimgapiSeeded  },
-				@{ Name = 'wofutil.dll'; Src = $WofSrc; Dst = $WofDst; Seeded = $script:WofutilSeeded  }
-			)) {
-				if (-not $dll.Seeded -or -not (Test-Path $dll.Src)) { continue }
-				$curVer = (Get-Item $dll.Dst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
-				$srcVer = (Get-Item $dll.Src).VersionInfo.FileVersion
-				if ($curVer -ne $srcVer) {
-					Write-Log "$($dll.Name) was restored to $curVer -- re-seeding before fallback retry..." -Level "WARNING"
-					Copy-Item $dll.Src $dll.Dst -Force -ErrorAction SilentlyContinue
-				}
-			}
-
-			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $FallbackArgs -Wait -PassThru
+			$SetupProcess = Start-Process -FilePath $EffectiveSetupPath -ArgumentList $FallbackArgs -Wait -PassThru
 			$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
 
 			if ($SetupProcess.ExitCode -eq 0) {

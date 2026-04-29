@@ -1913,6 +1913,41 @@ Function Update-WindowsTo11 {
 				Write-Log "wimgapi.dll not found at $WimSrc -- seeding skipped" -Level "WARNING"
 			}
 
+			# Fix: copy wofutil.dll from the sources directory into System32.
+			# wimgapi.dll calls WOF (Windows Overlay Filter) functions via GetProcAddress.
+			# If System32\wofutil.dll is too old those calls fail with 0x8007007F even when
+			# wimgapi.dll itself is correctly seeded.
+			$script:WofutilSeeded     = $false
+			$script:WofutilBackupPath = $null
+			$WofSrc = Join-Path $SourcesDir "wofutil.dll"
+			$WofDst = "$env:SystemRoot\System32\wofutil.dll"
+
+			if (Test-Path $WofSrc) {
+				$wofSrcVer = (Get-Item $WofSrc).VersionInfo.FileVersion
+				$wofDstVer = (Get-Item $WofDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				Write-Log "wofutil.dll: sources=$wofSrcVer, System32=$wofDstVer"
+
+				if ($wofSrcVer -ne $wofDstVer) {
+					try {
+						if (Test-Path $WofDst) {
+							$script:WofutilBackupPath = "$env:SystemRoot\System32\wofutil.dll.win10bak"
+							Copy-Item $WofDst $script:WofutilBackupPath -Force -ErrorAction SilentlyContinue
+						}
+						& takeown /f $WofDst 2>&1 | Out-Null
+						& icacls $WofDst /grant "administrators:F" 2>&1 | Out-Null
+						Copy-Item $WofSrc $WofDst -Force -ErrorAction Stop
+						$script:WofutilSeeded = $true
+						Write-Log "Win11 wofutil.dll ($wofSrcVer) seeded into System32" -Level "SUCCESS"
+					} catch {
+						Write-Log "Failed to seed wofutil.dll into System32: $($_.Exception.Message). Continuing without DLL replacement." -Level "WARNING"
+					}
+				} else {
+					Write-Log "wofutil.dll already matches ISO version -- no seeding needed"
+				}
+			} else {
+				Write-Log "wofutil.dll not found at $WofSrc -- seeding skipped" -Level "WARNING"
+			}
+
 			# Build setup arguments -- /auto Upgrade handles decisions non-interactively.
 			$SetupArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
 			if (-not $ShowProgress) {
@@ -1928,6 +1963,23 @@ Function Update-WindowsTo11 {
 				"/copylogs", "C:\IT",
 				"/EULA", "Accept"
 			))
+
+			# Re-verify seeded DLLs right before launch. setup.exe restores any System32 files
+			# it detects as modified during a prior failed-attempt rollback. Re-seeding here
+			# ensures each Start-Process sees the correct DLL versions regardless of history.
+			foreach ($dll in @(
+				@{ Name = 'wdscore.dll'; Src = $WdsSrc; Dst = $WdsDst; Seeded = $script:WdscoreSeeded  },
+				@{ Name = 'wimgapi.dll'; Src = $WimSrc; Dst = $WimDst; Seeded = $script:WimgapiSeeded  },
+				@{ Name = 'wofutil.dll'; Src = $WofSrc; Dst = $WofDst; Seeded = $script:WofutilSeeded  }
+			)) {
+				if (-not $dll.Seeded -or -not (Test-Path $dll.Src)) { continue }
+				$curVer = (Get-Item $dll.Dst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				$srcVer = (Get-Item $dll.Src).VersionInfo.FileVersion
+				if ($curVer -ne $srcVer) {
+					Write-Log "$($dll.Name) was restored to $curVer -- re-seeding before launch..." -Level "WARNING"
+					Copy-Item $dll.Src $dll.Dst -Force -ErrorAction SilentlyContinue
+				}
+			}
 
 			Write-Log "Starting Windows 11 upgrade..."
 			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
@@ -1964,6 +2016,22 @@ Function Update-WindowsTo11 {
 				"/EULA", "Accept"
 			))
 			Write-Log "Fallback setup arguments: $($FallbackArgs -join ' ')"
+
+			# Re-seed DLLs again -- prior run's rollback may have restored them
+			foreach ($dll in @(
+				@{ Name = 'wdscore.dll'; Src = $WdsSrc; Dst = $WdsDst; Seeded = $script:WdscoreSeeded  },
+				@{ Name = 'wimgapi.dll'; Src = $WimSrc; Dst = $WimDst; Seeded = $script:WimgapiSeeded  },
+				@{ Name = 'wofutil.dll'; Src = $WofSrc; Dst = $WofDst; Seeded = $script:WofutilSeeded  }
+			)) {
+				if (-not $dll.Seeded -or -not (Test-Path $dll.Src)) { continue }
+				$curVer = (Get-Item $dll.Dst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				$srcVer = (Get-Item $dll.Src).VersionInfo.FileVersion
+				if ($curVer -ne $srcVer) {
+					Write-Log "$($dll.Name) was restored to $curVer -- re-seeding before fallback retry..." -Level "WARNING"
+					Copy-Item $dll.Src $dll.Dst -Force -ErrorAction SilentlyContinue
+				}
+			}
+
 			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $FallbackArgs -Wait -PassThru
 			$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
 
@@ -1972,6 +2040,22 @@ Function Update-WindowsTo11 {
 				$Result.Success = $true
 			} else {
 				Write-Log "Setup failed with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "ERROR"
+				# Surface setup error log lines to help identify the specific failing DLL/function
+				$setuperrPaths = @(
+					"C:\IT\Sources\Panther\setuperr.log",
+					"C:\IT\setuperr.log"
+				)
+				foreach ($logPath in $setuperrPaths) {
+					if (Test-Path $logPath) {
+						$hits = Select-String -Path $logPath -Pattern "0x8007007F|GetProcAddress|ERROR_PROC_NOT_FOUND|\.dll" -ErrorAction SilentlyContinue |
+							Select-Object -Last 8
+						if ($hits) {
+							Write-Log "Setup error log excerpts ($logPath):" -Level "WARNING"
+							foreach ($hit in $hits) { Write-Log "  $($hit.Line.Trim())" -Level "WARNING" }
+						}
+						break
+					}
+				}
 			}
 			return $Result
 		} catch {

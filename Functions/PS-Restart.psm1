@@ -65,11 +65,12 @@ Function Restart-ComputerSafely {
         [string]$ScheduledTaskName = "MauleTech-RestartComputerSafely"
     )
 
+    $LoaderCmd = "irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex"
+
     #region Scheduled Execution
     if ($PSBoundParameters.ContainsKey('ScheduleAt')) {
         $now = Get-Date
 
-        # If only a time was given and it has already passed today, push to tomorrow
         if ($ScheduleAt -le $now) {
             if ($ScheduleAt.Date -eq $now.Date) {
                 $ScheduleAt = $ScheduleAt.AddDays(1)
@@ -80,7 +81,6 @@ Function Restart-ComputerSafely {
             }
         }
 
-        # Build forwarded parameter string for the scheduled task command
         $ExcludeParams = @('ScheduleAt', 'ScheduledTaskName')
         $ForwardedParams = @()
         foreach ($key in $PSBoundParameters.Keys) {
@@ -95,22 +95,14 @@ Function Restart-ComputerSafely {
         }
         $ParamString = $ForwardedParams -join ' '
 
-        $TaskCommand = "irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex; Restart-ComputerSafely $ParamString"
-
-        $existingTask = Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue
-        if ($existingTask) {
-            Write-Host "[WARN]  Scheduled task '$ScheduledTaskName' already exists -- replacing it." -ForegroundColor Yellow
-            Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false -ErrorAction Stop
-        }
-
-        $encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($TaskCommand))
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; Restart-ComputerSafely $ParamString"
         $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
         $Trigger   = New-ScheduledTaskTrigger -Once -At $ScheduleAt
         $Settings  = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
         $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
         try {
-            Register-ScheduledTask -TaskName $ScheduledTaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -ErrorAction Stop | Out-Null
+            Register-ScheduledTask -TaskName $ScheduledTaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Force -ErrorAction Stop | Out-Null
             Write-Host "[OK]    Restart scheduled for $($ScheduleAt.ToString('f'))" -ForegroundColor Green
             Write-Host "[INFO]  Task name: $ScheduledTaskName" -ForegroundColor Cyan
             Write-Host "[INFO]  To cancel: Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false" -ForegroundColor Cyan
@@ -123,31 +115,18 @@ Function Restart-ComputerSafely {
     #endregion
 
     #region After-Reboot Script Setup
-    if ($PSBoundParameters.ContainsKey('AfterRebootScript') -and $AfterRebootScript) {
+    if ($AfterRebootScript) {
         $AfterRebootTaskName = "MauleTech-AfterRebootScript"
-        $LoadFunctions = "irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex"
-        $FullCommand   = "$LoadFunctions; $AfterRebootScript"
-
-        # Self-cleanup: remove the task after it runs
-        $SelfCleanup = "; Unregister-ScheduledTask -TaskName '$AfterRebootTaskName' -Confirm:`$false -ErrorAction SilentlyContinue"
-        $FullCommand += $SelfCleanup
-
-        $encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($FullCommand))
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; $AfterRebootScript; Unregister-ScheduledTask -TaskName '$AfterRebootTaskName' -Confirm:`$false -ErrorAction SilentlyContinue"
         $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
         $Trigger   = New-ScheduledTaskTrigger -AtStartup
         $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)
         $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-        $existingTask = Get-ScheduledTask -TaskName $AfterRebootTaskName -ErrorAction SilentlyContinue
-        if ($existingTask) {
-            Write-Host "After-reboot task '$AfterRebootTaskName' already exists -- replacing it." -ForegroundColor Yellow
-            Unregister-ScheduledTask -TaskName $AfterRebootTaskName -Confirm:$false -ErrorAction SilentlyContinue
-        }
-
         try {
-            Register-ScheduledTask -TaskName $AfterRebootTaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "One-time post-reboot script registered by Restart-ComputerSafely" -ErrorAction Stop | Out-Null
-            Write-Host "After-reboot script registered. Will run as SYSTEM on next startup." -ForegroundColor Green
-            Write-Host "Command: $AfterRebootScript" -ForegroundColor Cyan
+            Register-ScheduledTask -TaskName $AfterRebootTaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "One-time post-reboot script registered by Restart-ComputerSafely" -Force -ErrorAction Stop | Out-Null
+            Write-Host "[OK]    After-reboot script registered. Will run as SYSTEM on next startup." -ForegroundColor Green
+            Write-Host "[INFO]  Command: $AfterRebootScript" -ForegroundColor Cyan
         } catch {
             Write-Warning "Failed to register after-reboot script task: $_"
             Write-Warning "Aborting restart to avoid running without the intended post-reboot action."

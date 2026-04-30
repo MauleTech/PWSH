@@ -1,22 +1,50 @@
 Function Restart-ComputerSafely {
 <#
     .SYNOPSIS
-        Restarts the computer immediately with BitLocker protection.
+        Restarts the computer with BitLocker protection, optional after-reboot script, and optional scheduling.
         Suspends BitLocker if enabled to prevent recovery prompts, then resumes after reboot.
-    
+
     .PARAMETER Force
         Forces applications to close without warning.
-    
+
     .PARAMETER Delay
         Seconds to wait before restarting. Defaults to 10 seconds.
-    
+
+    .PARAMETER AfterRebootScript
+        A PowerShell command or script block (as a string) to run as SYSTEM after the next reboot.
+        The MauleTech function library is loaded automatically before the command runs, so you can
+        call any MauleTech function directly (e.g. "Update-Windows" or "Install-WinGet").
+        A one-time scheduled task is created at startup and removed after it completes.
+
+    .PARAMETER ScheduleAt
+        Schedule the restart (and AfterRebootScript setup) to occur at a future date/time instead
+        of immediately. Accepts any valid [datetime] string.
+        If only a time is given and that time has already passed today, it is automatically
+        pushed to the same time tomorrow.
+
+        Examples:
+          -ScheduleAt "11:00 PM"           # Tonight (or tomorrow if past 11 PM)
+          -ScheduleAt "3/28/2026 8:00 PM"  # Specific date and time
+
+    .PARAMETER ScheduledTaskName
+        Name for the scheduled task created by -ScheduleAt.
+        Defaults to "MauleTech-RestartComputerSafely".
+
     .EXAMPLE
         Restart-ComputerSafely
         Restarts the computer after 10 seconds, handling BitLocker automatically.
-    
+
     .EXAMPLE
         Restart-ComputerSafely -Force -Delay 0
         Immediately restarts the computer without delay, forcing apps to close.
+
+    .EXAMPLE
+        Restart-ComputerSafely -Force -AfterRebootScript "Update-Windows"
+        Restart immediately; after the reboot, load MauleTech functions and run Update-Windows as SYSTEM.
+
+    .EXAMPLE
+        Restart-ComputerSafely -Force -AfterRebootScript "Update-Windows" -ScheduleAt "11:00 PM"
+        Schedule the restart for 11 PM tonight; after the reboot, run Update-Windows as SYSTEM.
 #>
     [CmdletBinding()]
     param (
@@ -25,8 +53,87 @@ Function Restart-ComputerSafely {
 
         [Parameter()]
         [ValidateRange(0, 3600)]
-        [int]$Delay = 10
+        [int]$Delay = 10,
+
+        [Parameter()]
+        [string]$AfterRebootScript,
+
+        [Parameter()]
+        [datetime]$ScheduleAt,
+
+        [Parameter()]
+        [string]$ScheduledTaskName = "MauleTech-RestartComputerSafely"
     )
+
+    $LoaderCmd = "irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex"
+
+    #region Scheduled Execution
+    if ($PSBoundParameters.ContainsKey('ScheduleAt')) {
+        $now = Get-Date
+
+        if ($ScheduleAt -le $now) {
+            if ($ScheduleAt.Date -eq $now.Date) {
+                $ScheduleAt = $ScheduleAt.AddDays(1)
+                Write-Host "[WARN]  Specified time already passed today -- scheduling for tomorrow: $($ScheduleAt.ToString('g'))" -ForegroundColor Yellow
+            } else {
+                Write-Host "[ERROR] ScheduleAt value '$($ScheduleAt.ToString('g'))' is in the past." -ForegroundColor Red
+                return
+            }
+        }
+
+        $ExcludeParams = @('ScheduleAt', 'ScheduledTaskName')
+        $ForwardedParams = @()
+        foreach ($key in $PSBoundParameters.Keys) {
+            if ($key -in $ExcludeParams) { continue }
+            $val = $PSBoundParameters[$key]
+            if ($val -is [switch] -or $val -is [bool]) {
+                if ($val) { $ForwardedParams += "-$key" }
+            } else {
+                $escaped = "$val" -replace "'", "''"
+                $ForwardedParams += "-$key '$escaped'"
+            }
+        }
+        $ParamString = $ForwardedParams -join ' '
+
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; Restart-ComputerSafely $ParamString"
+        $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
+        $Trigger   = New-ScheduledTaskTrigger -Once -At $ScheduleAt
+        $Settings  = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+        $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+        try {
+            Register-ScheduledTask -TaskName $ScheduledTaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Force -ErrorAction Stop | Out-Null
+            Write-Host "[OK]    Restart scheduled for $($ScheduleAt.ToString('f'))" -ForegroundColor Green
+            Write-Host "[INFO]  Task name: $ScheduledTaskName" -ForegroundColor Cyan
+            Write-Host "[INFO]  To cancel: Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false" -ForegroundColor Cyan
+            return
+        } catch {
+            Write-Host "[ERROR] Failed to create scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+            return
+        }
+    }
+    #endregion
+
+    #region After-Reboot Script Setup
+    if ($AfterRebootScript) {
+        $AfterRebootTaskName = "MauleTech-AfterRebootScript"
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; $AfterRebootScript; Unregister-ScheduledTask -TaskName '$AfterRebootTaskName' -Confirm:`$false -ErrorAction SilentlyContinue"
+        $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
+        $Trigger   = New-ScheduledTaskTrigger -AtStartup
+        $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+        $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+        try {
+            Register-ScheduledTask -TaskName $AfterRebootTaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "One-time post-reboot script registered by Restart-ComputerSafely" -Force -ErrorAction Stop | Out-Null
+            Write-Host "[OK]    After-reboot script registered. Will run as SYSTEM on next startup." -ForegroundColor Green
+            Write-Host "[INFO]  Command: $AfterRebootScript" -ForegroundColor Cyan
+        } catch {
+            Write-Warning "Failed to register after-reboot script task: $_"
+            Write-Warning "Aborting restart to avoid running without the intended post-reboot action."
+            return
+        }
+    }
+    #endregion
 
     Write-Host "Preparing safe restart with BitLocker handling..."
 

@@ -2164,20 +2164,33 @@ Function Update-WindowsTo11 {
 		SecureBoot      = $false
 	}
 
-	# TPM detection
+	# TPM detection. Win32_Tpm.SpecVersion is the authoritative source for the
+	# TPM 1.2 vs 2.0 distinction (Microsoft's PC Health Check and tpm.msc both
+	# read this field). Get-Tpm.ManufacturerVersion returns the chip *firmware*
+	# version (e.g. "7.85.4555.5" for AMD fTPM, "404.04.0.0" for Intel PTT),
+	# not the spec version, so checking it against ^2\. is unreliable.
+	try {
+		$win32Tpm = Get-CimInstance -Namespace 'root\cimv2\security\microsofttpm' -ClassName Win32_Tpm -ErrorAction Stop
+		if ($win32Tpm) {
+			$elig.TPM_Present = $true
+			if ($win32Tpm.SpecVersion) {
+				# SpecVersion is comma-separated, e.g. "2.0, 0, 1.59" -- first token is the TCG spec
+				$specToken = ($win32Tpm.SpecVersion -split ',')[0].Trim()
+				$elig.TPM_VersionOK = $specToken -match '^2\.'
+			}
+		}
+	} catch {
+		# Win32_Tpm namespace not available -- TPM driver may not be loaded.
+		# Fall through to Get-Tpm below.
+	}
+
+	# Layer Get-Tpm on top for TpmReady status, and as a presence fallback when
+	# the Win32_Tpm WMI query fails.
 	try {
 		$tpm = Get-Tpm -ErrorAction Stop
 		if ($tpm) {
-			$elig.TPM_Present = $true
-			$elig.TPM_Ready   = $tpm.TpmReady
-			if ($tpm.ManufacturerVersion) {
-				$elig.TPM_VersionOK = $tpm.ManufacturerVersion -match '^2\.'
-			} elseif ($tpm.SpecVersion) {
-				$specStr = if ($tpm.SpecVersion -is [array]) { $tpm.SpecVersion[0] } else { $tpm.SpecVersion }
-				$elig.TPM_VersionOK = $specStr -match '^2\.'
-			} else {
-				$elig.TPM_VersionOK = $tpm.TpmReady
-			}
+			if (-not $elig.TPM_Present) { $elig.TPM_Present = [bool]$tpm.TpmPresent }
+			$elig.TPM_Ready = [bool]$tpm.TpmReady
 		}
 	} catch {}
 

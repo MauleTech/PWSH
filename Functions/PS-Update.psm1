@@ -1661,6 +1661,12 @@ Function Update-WindowsTo11 {
 		.DESCRIPTION
 		Runs setup.exe with registry bypasses and returns a result object
 		with .Success (bool) and .BitLockerSuspended (bool).
+
+		First attempt runs setup.exe untouched -- no DLL injection, no staging.
+		If it fails with a DLL-related code (0x8007007F, 0xC06D007F) or an unknown
+		exit code, wdscore.dll and wimgapi.dll are seeded from the install media
+		sources into System32 and the upgrade is retried. If the seeded retry still
+		fails, the original Win10 DLLs are restored from .win10bak backups.
 		#>
 		param(
 			[Parameter(Mandatory)]
@@ -1672,6 +1678,12 @@ Function Update-WindowsTo11 {
 			Success            = $false
 			BitLockerSuspended = $false
 		}
+
+		# Reset DLL seeding state for this invocation
+		$script:WdscoreSeeded     = $false
+		$script:WimgapiSeeded     = $false
+		$script:WdscoreBackupPath = $null
+		$script:WimgapiBackupPath = $null
 
 		Write-Log "Attempting Windows 11 setup with path: $SetupPath"
 
@@ -1688,11 +1700,155 @@ Function Update-WindowsTo11 {
 		}
 		Write-Log "Authenticode signature verified: $($sig.SignerCertificate.Subject)"
 
-		try {
-			# FIX: Remove stale C:\$WINDOWS.~BT before running setup.
-			# A prior failed upgrade leaves behind old DLLs (e.g. SetupCore.dll from a different
-			# build) that setup.exe re-uses on the next run, causing CAutomationManager to load
-			# a mismatched DLL and fail with 0x8007007F (ERROR_PROC_NOT_FOUND).
+		# Helper: take ownership of a System32 file and copy with lock-handling.
+		# Used both for seeding Win11 DLLs and for restoring Win10 backups on revert.
+		function Copy-DllWithLockHandling {
+			param(
+				[Parameter(Mandatory)][string]$Source,
+				[Parameter(Mandatory)][string]$Destination,
+				[Parameter(Mandatory)][string]$DisplayName
+			)
+
+			& takeown /f $Destination 2>&1 | Out-Null
+			& icacls $Destination /grant "administrators:F" 2>&1 | Out-Null
+
+			try {
+				Copy-Item $Source $Destination -Force -ErrorAction Stop
+			} catch {
+				Write-Log "Copy of $DisplayName failed (file likely locked): $($_.Exception.Message) -- attempting to release lock" -Level "WARNING"
+
+				# Stop services holding the file before killing host processes -- avoids
+				# tearing down unrelated services that share the same svchost instance.
+				$DstNorm = [System.IO.Path]::GetFullPath($Destination)
+				$lockers = Get-Process | Where-Object {
+					try {
+						$_.Modules -and ($_.Modules | Where-Object {
+							[System.IO.Path]::GetFullPath($_.FileName) -eq $DstNorm
+						})
+					} catch { $false }
+				}
+
+				$stoppedServices = @()
+				foreach ($proc in $lockers) {
+					$svc = Get-CimInstance Win32_Service -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue |
+						Where-Object { $_.State -eq 'Running' }
+					if ($svc) {
+						foreach ($s in $svc) {
+							Write-Log "Stopping service '$($s.Name)' (PID $($proc.Id)) to release $DisplayName" -Level "WARNING"
+							Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue
+							$stoppedServices += $s.Name
+						}
+					} else {
+						Write-Log "Stopping process $($proc.Name) (PID $($proc.Id)) to release $DisplayName" -Level "WARNING"
+						Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+					}
+				}
+
+				if (-not $lockers) {
+					Write-Log "No process found with $DisplayName loaded as a module -- lock may be held by a file handle (AV, indexer, etc.)" -Level "WARNING"
+				}
+
+				Start-Sleep -Seconds 2
+				Copy-Item $Source $Destination -Force -ErrorAction Stop
+
+				foreach ($svcName in $stoppedServices) {
+					Start-Service -Name $svcName -ErrorAction SilentlyContinue
+				}
+			}
+		}
+
+		# Helper: seed Win11 wdscore.dll and wimgapi.dll into System32 from the
+		# install media sources directory. Sets $script:Wdscore/WimgapiSeeded and
+		# backup paths on success. Only the existing System32 copy is replaced;
+		# the prior version is preserved at .win10bak so it can be restored.
+		function Invoke-DllSeed {
+			$SourcesDir = Join-Path (Split-Path $SetupPath -Parent) "sources"
+
+			# wdscore.dll: CAutomationManager init failure -> 0x8007007F if version differs
+			$WdsSrc = Join-Path $SourcesDir "wdscore.dll"
+			$WdsDst = "$env:SystemRoot\System32\wdscore.dll"
+			if (Test-Path $WdsSrc) {
+				$srcVer = (Get-Item $WdsSrc).VersionInfo.FileVersion
+				$dstVer = (Get-Item $WdsDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				Write-Log "wdscore.dll: sources=$srcVer, System32=$dstVer"
+
+				if ($srcVer -ne $dstVer) {
+					try {
+						if (Test-Path $WdsDst) {
+							$script:WdscoreBackupPath = "$env:SystemRoot\System32\wdscore.dll.win10bak"
+							Copy-Item $WdsDst $script:WdscoreBackupPath -Force -ErrorAction SilentlyContinue
+						}
+						Copy-DllWithLockHandling -Source $WdsSrc -Destination $WdsDst -DisplayName "wdscore.dll"
+						$script:WdscoreSeeded = $true
+						Write-Log "Win11 wdscore.dll ($srcVer) seeded into System32" -Level "SUCCESS"
+					} catch {
+						Write-Log "Failed to seed wdscore.dll into System32: $($_.Exception.Message)." -Level "WARNING"
+					}
+				} else {
+					Write-Log "wdscore.dll already matches sources version -- no seeding needed"
+				}
+			} else {
+				Write-Log "wdscore.dll not found at $WdsSrc -- seeding skipped" -Level "WARNING"
+			}
+
+			# wimgapi.dll: SetupPlatform.dll delay-load failure -> 0xC06D007F if too old
+			$WimSrc = Join-Path $SourcesDir "wimgapi.dll"
+			$WimDst = "$env:SystemRoot\System32\wimgapi.dll"
+			if (Test-Path $WimSrc) {
+				$wimSrcVer = (Get-Item $WimSrc).VersionInfo.FileVersion
+				$wimDstVer = (Get-Item $WimDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+				Write-Log "wimgapi.dll: sources=$wimSrcVer, System32=$wimDstVer"
+
+				if ($wimSrcVer -ne $wimDstVer) {
+					try {
+						if (Test-Path $WimDst) {
+							$script:WimgapiBackupPath = "$env:SystemRoot\System32\wimgapi.dll.win10bak"
+							Copy-Item $WimDst $script:WimgapiBackupPath -Force -ErrorAction SilentlyContinue
+						}
+						Copy-DllWithLockHandling -Source $WimSrc -Destination $WimDst -DisplayName "wimgapi.dll"
+						$script:WimgapiSeeded = $true
+						Write-Log "Win11 wimgapi.dll ($wimSrcVer) seeded into System32" -Level "SUCCESS"
+					} catch {
+						Write-Log "Failed to seed wimgapi.dll into System32: $($_.Exception.Message)." -Level "WARNING"
+					}
+				} else {
+					Write-Log "wimgapi.dll already matches sources version -- no seeding needed"
+				}
+			} else {
+				Write-Log "wimgapi.dll not found at $WimSrc -- seeding skipped" -Level "WARNING"
+			}
+		}
+
+		# Helper: restore Win10 DLLs from .win10bak backups when seeded retries fail.
+		# Leaves the system in the same state as before Start-Win11Setup ran.
+		function Restore-SeededDlls {
+			if ($script:WdscoreSeeded -and $script:WdscoreBackupPath -and (Test-Path $script:WdscoreBackupPath)) {
+				try {
+					Copy-DllWithLockHandling -Source $script:WdscoreBackupPath -Destination "$env:SystemRoot\System32\wdscore.dll" -DisplayName "wdscore.dll (revert)"
+					Remove-Item $script:WdscoreBackupPath -Force -ErrorAction SilentlyContinue
+					$script:WdscoreSeeded = $false
+					Write-Log "wdscore.dll reverted to original Win10 version" -Level "SUCCESS"
+				} catch {
+					Write-Log "Failed to revert wdscore.dll: $($_.Exception.Message). Backup remains at $($script:WdscoreBackupPath)" -Level "ERROR"
+				}
+			}
+
+			if ($script:WimgapiSeeded -and $script:WimgapiBackupPath -and (Test-Path $script:WimgapiBackupPath)) {
+				try {
+					Copy-DllWithLockHandling -Source $script:WimgapiBackupPath -Destination "$env:SystemRoot\System32\wimgapi.dll" -DisplayName "wimgapi.dll (revert)"
+					Remove-Item $script:WimgapiBackupPath -Force -ErrorAction SilentlyContinue
+					$script:WimgapiSeeded = $false
+					Write-Log "wimgapi.dll reverted to original Win10 version" -Level "SUCCESS"
+				} catch {
+					Write-Log "Failed to revert wimgapi.dll: $($_.Exception.Message). Backup remains at $($script:WimgapiBackupPath)" -Level "ERROR"
+				}
+			}
+		}
+
+		# Helper: clear C:\$WINDOWS.~BT so setup doesn't reuse stale DLLs from a
+		# prior failed run. Called before the first attempt and again before any
+		# retry that follows DLL seeding.
+		function Clear-WindowsBT {
 			$BtPath = 'C:\$WINDOWS.~BT'
 			if (Test-Path -LiteralPath $BtPath) {
 				Write-Log "Removing stale $BtPath to prevent DLL version conflicts..." -Level "WARNING"
@@ -1706,6 +1862,10 @@ Function Update-WindowsTo11 {
 					Write-Log "Stale upgrade cache cleared" -Level "SUCCESS"
 				}
 			}
+		}
+
+		try {
+			Clear-WindowsBT
 
 			# Suspend BitLocker if active
 			Write-Log "Checking BitLocker status..."
@@ -1748,206 +1908,9 @@ Function Update-WindowsTo11 {
 
 			Write-Log "Hardware bypass registry keys applied" -Level "SUCCESS"
 
-# Fix: copy wdscore.dll from the sources directory (sibling to setup.exe) into
-			# System32 so that CAutomationManager finds the correct Win11 version at init time.
-			# Uses Split-Path -Parent so this works for both mounted ISOs and UNC network paths.
-			$script:WdscoreSeeded     = $false
-			$script:WdscoreBackupPath = $null
-			$SourcesDir = Join-Path (Split-Path $SetupPath -Parent) "sources"
-			$WdsSrc     = Join-Path $SourcesDir "wdscore.dll"
-			$WdsDst     = "$env:SystemRoot\System32\wdscore.dll"
-
-			if (Test-Path $WdsSrc) {
-				$srcVer = (Get-Item $WdsSrc).VersionInfo.FileVersion
-				$dstVer = (Get-Item $WdsDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
-				Write-Log "wdscore.dll: sources=$srcVer, System32=$dstVer"
-
-				if ($srcVer -ne $dstVer) {
-					try {
-						# Backup the existing System32 copy so we can restore it if setup fails
-						if (Test-Path $WdsDst) {
-							$script:WdscoreBackupPath = "$env:SystemRoot\System32\wdscore.dll.win10bak"
-							Copy-Item $WdsDst $script:WdscoreBackupPath -Force -ErrorAction SilentlyContinue
-						}
-						# Replace with Win11 version -- requires taking ownership of the system file
-						& takeown /f $WdsDst 2>&1 | Out-Null
-						& icacls $WdsDst /grant "administrators:F" 2>&1 | Out-Null
-						try {
-							Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
-						} catch {
-							# File is likely locked by another process -- try to release and retry
-							Write-Log "Copy failed (file likely locked): $($_.Exception.Message) -- attempting to release lock" -Level "WARNING"
-
-							# Stop any Windows services that have wdscore.dll loaded. Stopping
-							# the service (rather than killing the host process) avoids tearing
-							# down unrelated services that share the same svchost instance.
-							$WdsDstNorm = [System.IO.Path]::GetFullPath($WdsDst)
-							$lockers = Get-Process | Where-Object {
-								try {
-									$_.Modules -and ($_.Modules | Where-Object {
-										[System.IO.Path]::GetFullPath($_.FileName) -eq $WdsDstNorm
-									})
-								} catch { $false }
-							}
-
-							$stoppedServices = @()
-							foreach ($proc in $lockers) {
-								# Prefer stopping the owning service over killing the process
-								$svc = Get-CimInstance Win32_Service -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue |
-									Where-Object { $_.State -eq 'Running' }
-								if ($svc) {
-									foreach ($s in $svc) {
-										Write-Log "Stopping service '$($s.Name)' (PID $($proc.Id)) to release wdscore.dll" -Level "WARNING"
-										Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue
-										$stoppedServices += $s.Name
-									}
-								} else {
-									Write-Log "Stopping process $($proc.Name) (PID $($proc.Id)) to release wdscore.dll" -Level "WARNING"
-									Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-								}
-							}
-
-							if (-not $lockers) {
-								Write-Log "No process found with wdscore.dll loaded as a module -- lock may be held by a file handle (AV, indexer, etc.)" -Level "WARNING"
-							}
-
-							# Always wait before retry -- gives time for AV / indexer / transient locks to clear
-							Start-Sleep -Seconds 2
-							Copy-Item $WdsSrc $WdsDst -Force -ErrorAction Stop
-
-							# Restart any services we stopped
-							foreach ($svcName in $stoppedServices) {
-								Start-Service -Name $svcName -ErrorAction SilentlyContinue
-							}
-						}
-						$script:WdscoreSeeded = $true
-						Write-Log "Win11 wdscore.dll ($srcVer) seeded into System32" -Level "SUCCESS"
-					} catch {
-						Write-Log "Failed to seed wdscore.dll into System32: $($_.Exception.Message). Continuing without DLL replacement -- setup may still succeed." -Level "WARNING"
-					}
-				} else {
-					Write-Log "wdscore.dll already matches ISO version -- no seeding needed"
-				}
-			} else {
-				Write-Log "wdscore.dll not found at $WdsSrc -- seeding skipped" -Level "WARNING"
-			}
-
-			# Fix: copy wimgapi.dll from the sources directory into System32.
-			# SetupPlatform.dll delay-loads WIMExtractImagePathByWimHandle from wimgapi.dll.
-			# If the System32 copy is too old (Win10 RTM-era) the procedure isn't exported,
-			# causing 0xC06D007F and a fatal SetupHost.exe crash.
-			$script:WimgapiSeeded     = $false
-			$script:WimgapiBackupPath = $null
-			$WimSrc = Join-Path $SourcesDir "wimgapi.dll"
-			$WimDst = "$env:SystemRoot\System32\wimgapi.dll"
-
-			if (Test-Path $WimSrc) {
-				$wimSrcVer = (Get-Item $WimSrc).VersionInfo.FileVersion
-				$wimDstVer = (Get-Item $WimDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
-				Write-Log "wimgapi.dll: sources=$wimSrcVer, System32=$wimDstVer"
-
-				if ($wimSrcVer -ne $wimDstVer) {
-					try {
-						# Backup the existing System32 copy so we can restore it if setup fails
-						if (Test-Path $WimDst) {
-							$script:WimgapiBackupPath = "$env:SystemRoot\System32\wimgapi.dll.win10bak"
-							Copy-Item $WimDst $script:WimgapiBackupPath -Force -ErrorAction SilentlyContinue
-						}
-						# Replace with Win11 version -- requires taking ownership of the system file
-						& takeown /f $WimDst 2>&1 | Out-Null
-						& icacls $WimDst /grant "administrators:F" 2>&1 | Out-Null
-						try {
-							Copy-Item $WimSrc $WimDst -Force -ErrorAction Stop
-						} catch {
-							# File is likely locked by another process -- try to release and retry
-							Write-Log "Copy failed (file likely locked): $($_.Exception.Message) -- attempting to release lock" -Level "WARNING"
-
-							$WimDstNorm = [System.IO.Path]::GetFullPath($WimDst)
-							$lockers = Get-Process | Where-Object {
-								try {
-									$_.Modules -and ($_.Modules | Where-Object {
-										[System.IO.Path]::GetFullPath($_.FileName) -eq $WimDstNorm
-									})
-								} catch { $false }
-							}
-
-							$stoppedServices = @()
-							foreach ($proc in $lockers) {
-								# Prefer stopping the owning service over killing the process
-								$svc = Get-CimInstance Win32_Service -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue |
-									Where-Object { $_.State -eq 'Running' }
-								if ($svc) {
-									foreach ($s in $svc) {
-										Write-Log "Stopping service '$($s.Name)' (PID $($proc.Id)) to release wimgapi.dll" -Level "WARNING"
-										Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue
-										$stoppedServices += $s.Name
-									}
-								} else {
-									Write-Log "Stopping process $($proc.Name) (PID $($proc.Id)) to release wimgapi.dll" -Level "WARNING"
-									Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-								}
-							}
-
-							if (-not $lockers) {
-								Write-Log "No process found with wimgapi.dll loaded as a module -- lock may be held by a file handle (AV, indexer, etc.)" -Level "WARNING"
-							}
-
-							# Always wait before retry -- gives time for AV / indexer / transient locks to clear
-							Start-Sleep -Seconds 2
-							Copy-Item $WimSrc $WimDst -Force -ErrorAction Stop
-
-							# Restart any services we stopped
-							foreach ($svcName in $stoppedServices) {
-								Start-Service -Name $svcName -ErrorAction SilentlyContinue
-							}
-						}
-						$script:WimgapiSeeded = $true
-						Write-Log "Win11 wimgapi.dll ($wimSrcVer) seeded into System32" -Level "SUCCESS"
-					} catch {
-						Write-Log "Failed to seed wimgapi.dll into System32: $($_.Exception.Message). Continuing without DLL replacement -- setup may still succeed." -Level "WARNING"
-					}
-				} else {
-					Write-Log "wimgapi.dll already matches ISO version -- no seeding needed"
-				}
-			} else {
-				Write-Log "wimgapi.dll not found at $WimSrc -- seeding skipped" -Level "WARNING"
-			}
-
-			# wimgapi.dll calls WOF (Windows Overlay Filter) functions via GetProcAddress.
-			# If System32\wofutil.dll is too old those calls fail with 0x8007007F even when
-			# wimgapi.dll itself is correctly seeded.
-			$script:WofutilSeeded     = $false
-			$script:WofutilBackupPath = $null
-			$WofSrc = Join-Path $SourcesDir "wofutil.dll"
-			$WofDst = "$env:SystemRoot\System32\wofutil.dll"
-
-			if (Test-Path $WofSrc) {
-				$wofSrcVer = (Get-Item $WofSrc).VersionInfo.FileVersion
-				$wofDstVer = (Get-Item $WofDst -ErrorAction SilentlyContinue).VersionInfo.FileVersion
-				Write-Log "wofutil.dll: sources=$wofSrcVer, System32=$wofDstVer"
-
-				if ($wofSrcVer -ne $wofDstVer) {
-					try {
-						if (Test-Path $WofDst) {
-							$script:WofutilBackupPath = "$env:SystemRoot\System32\wofutil.dll.win10bak"
-							Copy-Item $WofDst $script:WofutilBackupPath -Force -ErrorAction SilentlyContinue
-						}
-						& takeown /f $WofDst 2>&1 | Out-Null
-						& icacls $WofDst /grant "administrators:F" 2>&1 | Out-Null
-						Copy-Item $WofSrc $WofDst -Force -ErrorAction Stop
-						$script:WofutilSeeded = $true
-						Write-Log "Win11 wofutil.dll ($wofSrcVer) seeded into System32" -Level "SUCCESS"
-					} catch {
-						Write-Log "Failed to seed wofutil.dll into System32: $($_.Exception.Message). Continuing without DLL replacement." -Level "WARNING"
-					}
-				} else {
-					Write-Log "wofutil.dll already matches ISO version -- no seeding needed"
-				}
-			} else {
-				Write-Log "wofutil.dll not found at $WofSrc -- seeding skipped" -Level "WARNING"
-			}
-
-			# Build setup arguments -- /auto Upgrade handles decisions non-interactively.
+			# Build setup arguments. /product server is a Microsoft-documented switch
+			# that lowers minimum-requirements gating to Windows Server thresholds,
+			# improving acceptance on machines with marginal hardware.
 			$SetupArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
 			if (-not $ShowProgress) {
 				$SetupArgs.Add("/quiet") | Out-Null
@@ -1963,76 +1926,7 @@ Function Update-WindowsTo11 {
 				"/EULA", "Accept"
 			))
 
-			# Stage setup.exe locally so override DLLs sit next to the executable.
-			# Windows DLL search checks the application directory before System32, making
-			# this immune to WRP/AV immediately restoring our System32 copies.
-			# $LocalDir is cleaned up automatically in the finally block.
-			$EffectiveSetupPath = $SetupPath
-			if ($script:WdscoreSeeded -or $script:WimgapiSeeded -or $script:WofutilSeeded) {
-				try {
-					$LocalDir = Join-Path $env:SystemDrive "IT\Win11Stage_$(Get-Date -Format 'HHmmss')"
-					New-Item -Path $LocalDir -ItemType Directory -Force | Out-Null
-
-					$stagedExe = Join-Path $LocalDir "setup.exe"
-					Copy-Item $SetupPath $stagedExe -Force -ErrorAction Stop
-
-					foreach ($entry in @(
-						@{ Name = 'wdscore.dll'; Src = $WdsSrc; Seeded = $script:WdscoreSeeded },
-						@{ Name = 'wimgapi.dll'; Src = $WimSrc; Seeded = $script:WimgapiSeeded },
-						@{ Name = 'wofutil.dll'; Src = $WofSrc; Seeded = $script:WofutilSeeded }
-					)) {
-						if ($entry.Seeded -and (Test-Path $entry.Src)) {
-							Copy-Item $entry.Src (Join-Path $LocalDir $entry.Name) -Force -ErrorAction Stop
-							Write-Log "Staged $($entry.Name) alongside setup.exe (bypasses System32 protection)" -Level "SUCCESS"
-						}
-					}
-
-					# Link sources so staged setup.exe can locate its installation files.
-					# Try junction first (local paths); fall back to symlink (UNC paths).
-					$stageSourcesDir = Join-Path $LocalDir "sources"
-					$jResult = & cmd /c mklink /J $stageSourcesDir $SourcesDir 2>&1
-					if ($LASTEXITCODE -ne 0) {
-						$dResult = & cmd /c mklink /D $stageSourcesDir $SourcesDir 2>&1
-						if ($LASTEXITCODE -ne 0) {
-							throw "Could not link sources directory (/J: $jResult; /D: $dResult)"
-						}
-					}
-
-					Write-Log "Running setup from staged path: $LocalDir" -Level "SUCCESS"
-					$EffectiveSetupPath = $stagedExe
-				} catch {
-					Write-Log "Staging failed ($($_.Exception.Message)) -- running from original path" -Level "WARNING"
-					if ($LocalDir -and (Test-Path $LocalDir)) {
-						Remove-Item $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
-						$LocalDir = $null
-					}
-					$EffectiveSetupPath = $SetupPath
-				}
-			}
-
-			Write-Log "Starting Windows 11 upgrade..."
-			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
-
-			$SetupProcess = Start-Process -FilePath $EffectiveSetupPath -ArgumentList $SetupArgs -Wait -PassThru
-			$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
-
-			if ($SetupProcess.ExitCode -eq 0) {
-				Write-Log "Setup completed successfully" -Level "SUCCESS"
-				$Result.Success = $true
-				return $Result
-			}
-
-			Write-Log "Setup exited with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "WARNING"
-
-			# Only retry with minimal arguments if the exit code is retryable
-			if (-not $ExitInfo.Retryable) {
-				Write-Log "Exit code is terminal -- skipping fallback retry." -Level "ERROR"
-				return $Result
-			}
-
-			# FIX: Retry with minimal validated argument set.
-			# Some builds reject unrecognized switches like /product, /Telemetry, /MigrateDrivers.
-			Write-Log "Retrying with minimal arguments..." -Level "WARNING"
+			# Fallback args drop switches some builds reject (used as a last-ditch retry).
 			$FallbackArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
 			if (-not $ShowProgress) {
 				$FallbackArgs.Add("/quiet") | Out-Null
@@ -2044,42 +1938,111 @@ Function Update-WindowsTo11 {
 				"/copylogs", "C:\IT",
 				"/EULA", "Accept"
 			))
-			Write-Log "Fallback setup arguments: $($FallbackArgs -join ' ')"
 
-			$SetupProcess = Start-Process -FilePath $EffectiveSetupPath -ArgumentList $FallbackArgs -Wait -PassThru
+			# Attempt 1: run setup.exe untouched. No DLL injection on the first try
+			# so a clean install path stays unbroken when DLLs are not actually the issue.
+			Write-Log "Starting Windows 11 upgrade..."
+			Write-Log "Setup arguments: $($SetupArgs -join ' ')"
+			$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $SetupArgs -Wait -PassThru
 			$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
 
 			if ($SetupProcess.ExitCode -eq 0) {
-				Write-Log "Setup completed successfully (fallback arguments)" -Level "SUCCESS"
+				Write-Log "Setup completed successfully" -Level "SUCCESS"
 				$Result.Success = $true
-			} else {
-				Write-Log "Setup failed with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "ERROR"
-				# Surface setup error log lines to help identify the specific failing DLL/function
-				$setuperrPaths = @(
-					"C:\IT\Sources\Panther\setuperr.log",
-					"C:\IT\setuperr.log"
-				)
-				foreach ($logPath in $setuperrPaths) {
-					if (Test-Path $logPath) {
-						$hits = Select-String -Path $logPath -Pattern "0x8007007F|GetProcAddress|ERROR_PROC_NOT_FOUND|\.dll" -ErrorAction SilentlyContinue |
-							Select-Object -Last 8
-						if ($hits) {
-							Write-Log "Setup error log excerpts ($logPath):" -Level "WARNING"
-							foreach ($hit in $hits) { Write-Log "  $($hit.Line.Trim())" -Level "WARNING" }
-						}
-						break
+				return $Result
+			}
+
+			Write-Log "Setup exited with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "WARNING"
+
+			$IsKnownDllError = ($SetupProcess.ExitCode -eq [int]0x8007007F) -or ($SetupProcess.ExitCode -eq [int]0xC06D007F)
+			$IsUnknownCode   = -not $SetupExitCodes.ContainsKey($SetupProcess.ExitCode)
+
+			if ($IsKnownDllError -or $IsUnknownCode) {
+				if ($IsKnownDllError) {
+					Write-Log "Exit code matches a known DLL version mismatch -- attempting DLL seeding retry." -Level "WARNING"
+				} else {
+					Write-Log "Unknown exit code -- attempting DLL seeding retry as a precaution." -Level "WARNING"
+				}
+
+				Invoke-DllSeed
+
+				if ($script:WdscoreSeeded -or $script:WimgapiSeeded) {
+					# Drop stale $WINDOWS.~BT cache so setup picks up the seeded DLLs.
+					Clear-WindowsBT
+
+					# Attempt 2: same args, with seeded DLLs
+					Write-Log "Retrying setup with seeded DLLs..."
+					$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $SetupArgs -Wait -PassThru
+					$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
+
+					if ($SetupProcess.ExitCode -eq 0) {
+						Write-Log "Setup completed successfully (after DLL seeding)" -Level "SUCCESS"
+						$Result.Success = $true
+						return $Result
 					}
+
+					Write-Log "Setup exited with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "WARNING"
+
+					# Attempt 3: fallback args, still with seeded DLLs
+					Write-Log "Retrying with minimal arguments..." -Level "WARNING"
+					Write-Log "Fallback setup arguments: $($FallbackArgs -join ' ')"
+					$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $FallbackArgs -Wait -PassThru
+					$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
+
+					if ($SetupProcess.ExitCode -eq 0) {
+						Write-Log "Setup completed successfully (fallback arguments)" -Level "SUCCESS"
+						$Result.Success = $true
+						return $Result
+					}
+
+					Write-Log "Setup failed with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "ERROR"
+					Write-Log "DLL seeding retries failed -- reverting Win10 DLLs from backup." -Level "WARNING"
+					Restore-SeededDlls
+				} else {
+					Write-Log "No DLLs were seeded (sources missing or already matching) -- skipping retry." -Level "WARNING"
+				}
+			} elseif ($ExitInfo.Retryable) {
+				# Retryable but not DLL-related: retry with fallback args, no seeding.
+				Write-Log "Retrying with minimal arguments..." -Level "WARNING"
+				Write-Log "Fallback setup arguments: $($FallbackArgs -join ' ')"
+				$SetupProcess = Start-Process -FilePath $SetupPath -ArgumentList $FallbackArgs -Wait -PassThru
+				$ExitInfo = Get-SetupExitInfo -ExitCode $SetupProcess.ExitCode
+
+				if ($SetupProcess.ExitCode -eq 0) {
+					Write-Log "Setup completed successfully (fallback arguments)" -Level "SUCCESS"
+					$Result.Success = $true
+					return $Result
+				}
+
+				Write-Log "Setup failed with code 0x$("{0:X8}" -f $SetupProcess.ExitCode): $($ExitInfo.Message)" -Level "ERROR"
+			} else {
+				Write-Log "Exit code is terminal -- skipping retry." -Level "ERROR"
+			}
+
+			# Surface setup error log lines to help identify the specific failing DLL/function
+			$setuperrPaths = @(
+				"C:\IT\Sources\Panther\setuperr.log",
+				"C:\IT\setuperr.log"
+			)
+			foreach ($logPath in $setuperrPaths) {
+				if (Test-Path $logPath) {
+					$hits = Select-String -Path $logPath -Pattern "0x8007007F|GetProcAddress|ERROR_PROC_NOT_FOUND|\.dll" -ErrorAction SilentlyContinue |
+						Select-Object -Last 8
+					if ($hits) {
+						Write-Log "Setup error log excerpts ($logPath):" -Level "WARNING"
+						foreach ($hit in $hits) { Write-Log "  $($hit.Line.Trim())" -Level "WARNING" }
+					}
+					break
 				}
 			}
+
 			return $Result
 		} catch {
 			Write-Log "Setup execution failed: $($_.Exception.Message)" -Level "ERROR"
-			return $Result
-		} finally {
-			# Clean up .local redirection directory if created
-			if ($LocalDir -and (Test-Path $LocalDir)) {
-				Remove-Item $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
+			if ($script:WdscoreSeeded -or $script:WimgapiSeeded) {
+				Restore-SeededDlls
 			}
+			return $Result
 		}
 	}
 	#endregion
@@ -2114,8 +2077,8 @@ Function Update-WindowsTo11 {
 	$buildNumber = [int]$os.BuildNumber
 	$osCaption = $os.Caption
 
-	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 26100) {
-		Write-Log "Already running Windows 11 24H2+ (Build $buildNumber) -- no upgrade needed." -Level "SUCCESS"
+	if (-not $Force -and $osCaption -match 'Windows 11' -and $buildNumber -ge 26200) {
+		Write-Log "Already running Windows 11 25H2+ (Build $buildNumber) -- no upgrade needed." -Level "SUCCESS"
 		return
 	}
 

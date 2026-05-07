@@ -1339,11 +1339,25 @@ Function Repair-ExchangeDAGCopies {
 		Seconds to wait after a Resume attempt before checking if replication recovered. Default: 60.
 	.PARAMETER StaggerSeconds
 		Seconds to wait between initiating operations on different databases. Default: 10.
+	.PARAMETER Parallel
+		If specified, all reseeds are kicked off in rapid succession (separated only by
+		-StaggerSeconds). Use with caution on WAN links: 9 simultaneous reseeds across a
+		shared link will saturate it and slow every copy to a crawl.
+		Default behavior (when -Parallel is omitted) is serial: after each reseed is initiated,
+		the function waits for the copy's status to return to Healthy/Mounted before moving
+		on to the next copy. This is the safe choice for WAN-connected DAG members.
+	.PARAMETER ReseedTimeoutHours
+		In serial mode (default), the maximum time to wait for a single reseed to complete
+		before giving up and moving to the next copy. Default: 24 hours. Range: 1-168.
+	.PARAMETER ReseedPollMinutes
+		In serial mode (default), how often to poll Get-MailboxDatabaseCopyStatus while
+		waiting for a reseed to complete. Default: 5 minutes. Range: 1-60.
 	.PARAMETER RegisterScheduledTask
 		Registers a Windows scheduled task ('MauleTech-RepairExchangeDAGCopies') that runs this
-		repair once a week at the configured day/time. The supplied -ServerFilter, -DatabaseFilter,
-		-ResumeWaitSeconds, and -StaggerSeconds are captured into the wrapper script so the
-		scheduled run uses the same scope.
+		repair once a week at the configured day/time. All repair-mode parameters
+		(-ServerFilter, -DatabaseFilter, -ResumeWaitSeconds, -StaggerSeconds, -Parallel,
+		-ReseedTimeoutHours, -ReseedPollMinutes) are captured into the wrapper script so the
+		scheduled run uses the same scope and behavior.
 	.PARAMETER UnregisterScheduledTask
 		Removes the MauleTech-RepairExchangeDAGCopies scheduled task if it exists.
 	.PARAMETER ScheduledDay
@@ -1357,9 +1371,14 @@ Function Repair-ExchangeDAGCopies {
 		Repair-ExchangeDAGCopies -ServerFilter 'EX2016-3' -DatabaseFilter '2016-MailStoreDBAttorneys-*' -WhatIf
 		Previews the repair actions for matching copies without making changes.
 	.EXAMPLE
+		Repair-ExchangeDAGCopies -ServerFilter 'EX2016-3' -Parallel
+		Kicks off reseeds in parallel for all failed copies on EX2016-3 (faster on a LAN, but
+		don't use over a WAN with multiple copies - it will saturate the link).
+	.EXAMPLE
 		Repair-ExchangeDAGCopies -RegisterScheduledTask
 		Schedules a weekly repair at the default day/time (Saturday 11:00 PM) covering all servers
-		and databases.
+		and databases. Runs serial by default (waits for each reseed to finish before starting
+		the next), suitable for WAN-connected DAG members.
 	.EXAMPLE
 		Repair-ExchangeDAGCopies -RegisterScheduledTask -ScheduledDay Sunday -ScheduledTime '1:00 AM' -ServerFilter 'EX2016-3'
 		Schedules a weekly repair Sunday at 1 AM scoped to EX2016-3.
@@ -1391,6 +1410,20 @@ Function Repair-ExchangeDAGCopies {
 		[Parameter(ParameterSetName = 'Register')]
 		[ValidateRange(0, 3600)]
 		[int]$StaggerSeconds = 10,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[switch]$Parallel,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateRange(1, 168)]
+		[int]$ReseedTimeoutHours = 24,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateRange(1, 60)]
+		[int]$ReseedPollMinutes = 5,
 
 		[Parameter(Mandatory, ParameterSetName = 'Register')]
 		[switch]$RegisterScheduledTask,
@@ -1455,12 +1488,16 @@ Function Repair-ExchangeDAGCopies {
 
 		# Wrapper script body. Single-quoted here-string keeps the body literal; the parameter
 		# header above it is interpolated and validated. Filter values are validated above.
+		$parallelLiteral = if ($Parallel) { '$true' } else { '$false' }
 		$WrapperHeader = @"
-`$LogPath           = '$LogPath'
-`$ServerFilter      = '$ServerFilter'
-`$DatabaseFilter    = '$DatabaseFilter'
-`$ResumeWaitSeconds = $ResumeWaitSeconds
-`$StaggerSeconds    = $StaggerSeconds
+`$LogPath            = '$LogPath'
+`$ServerFilter       = '$ServerFilter'
+`$DatabaseFilter     = '$DatabaseFilter'
+`$ResumeWaitSeconds  = $ResumeWaitSeconds
+`$StaggerSeconds     = $StaggerSeconds
+`$Parallel           = $parallelLiteral
+`$ReseedTimeoutHours = $ReseedTimeoutHours
+`$ReseedPollMinutes  = $ReseedPollMinutes
 "@
 
 		$WrapperBody = @'
@@ -1489,7 +1526,10 @@ try {
 		-ServerFilter $ServerFilter `
 		-DatabaseFilter $DatabaseFilter `
 		-ResumeWaitSeconds $ResumeWaitSeconds `
-		-StaggerSeconds $StaggerSeconds *>&1 |
+		-StaggerSeconds $StaggerSeconds `
+		-Parallel:$Parallel `
+		-ReseedTimeoutHours $ReseedTimeoutHours `
+		-ReseedPollMinutes $ReseedPollMinutes *>&1 |
 		Tee-Object -FilePath $LogPath -Append
 } catch {
 	"[ERROR] $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding ASCII
@@ -1519,11 +1559,14 @@ try {
 		$Action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
 			-Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
 		$Trigger   = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $ScheduledDay -At $ScheduledTime
+		# 72h gives serial mode enough headroom to step through several large reseeds back-to-back
+		# (default 24h per-copy timeout x worst-case stuck copies). Tasks that exceed this are killed
+		# by the scheduler; the remaining copies will be retried on the next weekly run.
 		$Settings  = New-ScheduledTaskSettingsSet `
 			-AllowStartIfOnBatteries `
 			-DontStopIfGoingOnBatteries `
 			-StartWhenAvailable `
-			-ExecutionTimeLimit (New-TimeSpan -Hours 8)
+			-ExecutionTimeLimit (New-TimeSpan -Hours 72)
 		$Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
 		$timeStr = $ScheduledTime.ToString('h:mm tt')
@@ -1537,8 +1580,10 @@ try {
 					-Description "MauleTech: Repairs failed/suspended Exchange DAG database copies weekly. Filters: Server='$ServerFilter' Database='$DatabaseFilter'." `
 					-ErrorAction Stop | Out-Null
 
+				$modeStr = if ($Parallel) { 'Parallel (no wait between reseeds)' } else { "Serial (wait per copy, ${ReseedTimeoutHours}h timeout, ${ReseedPollMinutes}min poll)" }
 				Write-Host "Scheduled task '$TaskName' created successfully." -ForegroundColor Green
 				Write-Host "  Schedule:       Weekly on $ScheduledDay at $timeStr" -ForegroundColor Cyan
+				Write-Host "  Mode:           $modeStr" -ForegroundColor Cyan
 				Write-Host "  ServerFilter:   $ServerFilter"   -ForegroundColor Cyan
 				Write-Host "  DatabaseFilter: $DatabaseFilter" -ForegroundColor Cyan
 				Write-Host "  Wrapper script: $ScriptPath"     -ForegroundColor Cyan
@@ -1558,6 +1603,56 @@ try {
 		Write-Host "Run from EMS, or load the snap-in first:" -ForegroundColor Red
 		Write-Host "  Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn" -ForegroundColor Red
 		return
+	}
+
+	# Polls Get-MailboxDatabaseCopyStatus until the copy is Healthy/Mounted, the timeout fires,
+	# or the status is stuck in a failure state across multiple polls. Used in serial mode to
+	# avoid kicking off concurrent reseeds across a WAN link. Terminates without throwing so
+	# the outer loop can move on to the next copy regardless of outcome.
+	$waitForReseed = {
+		param([string]$Id, [int]$TimeoutHours, [int]$PollMinutes)
+
+		$start    = Get-Date
+		$deadline = $start.AddHours($TimeoutHours)
+		$badStates       = @('Failed','FailedAndSuspended','Suspended','ServiceDown','Disconnected')
+		$consecutiveBads = 0
+
+		Write-Host "    Waiting for $Id (poll every $PollMinutes min, timeout $TimeoutHours h)..." -ForegroundColor Cyan
+
+		do {
+			Start-Sleep -Seconds ($PollMinutes * 60)
+
+			$cur = Get-MailboxDatabaseCopyStatus -Identity $Id -ErrorAction SilentlyContinue
+			if (-not $cur) {
+				Write-Host "    [!] Could not query status for $Id. Continuing to next copy." -ForegroundColor Yellow
+				return
+			}
+
+			$elapsed = '{0:hh\:mm\:ss}' -f ((Get-Date) - $start)
+			Write-Host "    [+$elapsed] Status: $($cur.Status), CopyQueue: $($cur.CopyQueueLength)"
+
+			if ($cur.Status -in @('Healthy','Mounted')) {
+				Write-Host "    [OK] Reseed complete for $Id (elapsed $elapsed)." -ForegroundColor Green
+				return
+			}
+
+			if ($cur.Status -in $badStates) {
+				$consecutiveBads++
+				# 3 consecutive bad polls = ~$($PollMinutes * 3) min stuck. Bail out so the outer
+				# loop can move on rather than waiting the full timeout on a copy that isn't moving.
+				if ($consecutiveBads -ge 3) {
+					Write-Host "    [!!] Status stuck at $($cur.Status) over $consecutiveBads polls. Continuing to next copy." -ForegroundColor Red
+					return
+				}
+			} else {
+				$consecutiveBads = 0
+			}
+
+			if ((Get-Date) -gt $deadline) {
+				Write-Host "    [!] Timeout after $TimeoutHours hours for $Id. Continuing to next copy." -ForegroundColor Yellow
+				return
+			}
+		} while ($true)
 	}
 
 	# Resolve target copies. Wrapping in @(...) ensures .Count works correctly when only
@@ -1611,6 +1706,9 @@ try {
 			try {
 				Update-MailboxDatabaseCopy -Identity $identity -DeleteExistingFiles -Confirm:$false -ErrorAction Stop
 				Write-Host "  [OK] Reseed initiated for $identity." -ForegroundColor Green
+				if (-not $Parallel) {
+					& $waitForReseed -Id $identity -TimeoutHours $ReseedTimeoutHours -PollMinutes $ReseedPollMinutes
+				}
 				Start-Sleep -Seconds $StaggerSeconds
 				continue
 			} catch {
@@ -1671,6 +1769,9 @@ try {
 				if ($PSCmdlet.ShouldProcess($identity, 'Update-MailboxDatabaseCopy after manual cleanup')) {
 					Update-MailboxDatabaseCopy -Identity $identity -DeleteExistingFiles -Confirm:$false -ErrorAction Stop
 					Write-Host "  [OK] Reseed initiated after manual cleanup." -ForegroundColor Green
+					if (-not $Parallel) {
+						& $waitForReseed -Id $identity -TimeoutHours $ReseedTimeoutHours -PollMinutes $ReseedPollMinutes
+					}
 				}
 			} catch {
 				Write-Host ("  [!!] Manual cleanup or reseed failed for {0}: {1}" -f $identity, $_.Exception.Message) -ForegroundColor Red

@@ -1311,6 +1311,481 @@ Function Repair-NTPConfiguration {
     #endregion
 }
 
+Function Repair-ExchangeDAGCopies {
+	<#
+	.SYNOPSIS
+		Attempts to repair failed or suspended Exchange DAG database copies using an escalating strategy.
+	.DESCRIPTION
+		For each failed/suspended copy matching the filters, tries in order:
+		  1. Resume (gentle - for transient failures or manual suspensions)
+		  2. Reseed with -DeleteExistingFiles (standard reseed)
+		  3. Manual temp-seeding folder cleanup + reseed (handles filesystem/locked file errors)
+		Waits between each step to allow replication to stabilize before checking if further
+		action is needed.
+
+		Optionally registers a Windows scheduled task to run this repair once a week at a
+		specified after-hours time. The scheduled task runs as SYSTEM, which on an Exchange
+		server is a member of the Exchange Trusted Subsystem and has the rights needed for
+		these operations.
+
+		Must be run from a server with the Exchange Management Tools installed.
+	.PARAMETER ServerFilter
+		Wildcard filter for the server name portion of the copy identity. Default: '*' (all servers).
+		Example: 'EX2016-3' to target only copies on EX2016-3.
+	.PARAMETER DatabaseFilter
+		Wildcard filter for the database name portion of the copy identity. Default: '*' (all databases).
+		Example: '2016-MailStoreDBAttorneys-*'
+	.PARAMETER ResumeWaitSeconds
+		Seconds to wait after a Resume attempt before checking if replication recovered. Default: 60.
+	.PARAMETER StaggerSeconds
+		Seconds to wait between initiating operations on different databases. Default: 10.
+	.PARAMETER Parallel
+		If specified, all reseeds are kicked off in rapid succession (separated only by
+		-StaggerSeconds). Use with caution on WAN links: 9 simultaneous reseeds across a
+		shared link will saturate it and slow every copy to a crawl.
+		Default behavior (when -Parallel is omitted) is serial: after each reseed is initiated,
+		the function waits for the copy's status to return to Healthy/Mounted before moving
+		on to the next copy. This is the safe choice for WAN-connected DAG members.
+	.PARAMETER ReseedTimeoutHours
+		In serial mode (default), the maximum time to wait for a single reseed to complete
+		before giving up and moving to the next copy. Default: 24 hours. Range: 1-168.
+	.PARAMETER ReseedPollMinutes
+		In serial mode (default), how often to poll Get-MailboxDatabaseCopyStatus while
+		waiting for a reseed to complete. Default: 5 minutes. Range: 1-60.
+	.PARAMETER RegisterScheduledTask
+		Registers a Windows scheduled task ('MauleTech-RepairExchangeDAGCopies') that runs this
+		repair once a week at the configured day/time. All repair-mode parameters
+		(-ServerFilter, -DatabaseFilter, -ResumeWaitSeconds, -StaggerSeconds, -Parallel,
+		-ReseedTimeoutHours, -ReseedPollMinutes) are captured into the wrapper script so the
+		scheduled run uses the same scope and behavior.
+	.PARAMETER UnregisterScheduledTask
+		Removes the MauleTech-RepairExchangeDAGCopies scheduled task if it exists.
+	.PARAMETER ScheduledDay
+		Day of the week for the scheduled task to run. Default: Saturday.
+	.PARAMETER ScheduledTime
+		Time of day for the scheduled task to run. Default: 11:00 PM (after hours).
+	.EXAMPLE
+		Repair-ExchangeDAGCopies -ServerFilter 'EX2016-3'
+		Repairs every failed/suspended copy on server EX2016-3.
+	.EXAMPLE
+		Repair-ExchangeDAGCopies -ServerFilter 'EX2016-3' -DatabaseFilter '2016-MailStoreDBAttorneys-*' -WhatIf
+		Previews the repair actions for matching copies without making changes.
+	.EXAMPLE
+		Repair-ExchangeDAGCopies -ServerFilter 'EX2016-3' -Parallel
+		Kicks off reseeds in parallel for all failed copies on EX2016-3 (faster on a LAN, but
+		don't use over a WAN with multiple copies - it will saturate the link).
+	.EXAMPLE
+		Repair-ExchangeDAGCopies -RegisterScheduledTask
+		Schedules a weekly repair at the default day/time (Saturday 11:00 PM) covering all servers
+		and databases. Runs serial by default (waits for each reseed to finish before starting
+		the next), suitable for WAN-connected DAG members.
+	.EXAMPLE
+		Repair-ExchangeDAGCopies -RegisterScheduledTask -ScheduledDay Sunday -ScheduledTime '1:00 AM' -ServerFilter 'EX2016-3'
+		Schedules a weekly repair Sunday at 1 AM scoped to EX2016-3.
+	.EXAMPLE
+		Repair-ExchangeDAGCopies -UnregisterScheduledTask
+		Removes the scheduled task.
+	.NOTES
+		Output from the scheduled run is appended to:
+		  $env:ProgramData\MauleTech\Logs\Repair-ExchangeDAGCopies.log
+		The wrapper script lives at:
+		  $env:ProgramData\MauleTech\Repair-ExchangeDAGCopies.ps1
+	#>
+	[CmdletBinding(DefaultParameterSetName = 'Repair', SupportsShouldProcess)]
+	param(
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[string]$ServerFilter = '*',
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[string]$DatabaseFilter = '*',
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateRange(0, 3600)]
+		[int]$ResumeWaitSeconds = 60,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateRange(0, 3600)]
+		[int]$StaggerSeconds = 10,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[switch]$Parallel,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateRange(1, 168)]
+		[int]$ReseedTimeoutHours = 24,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateRange(1, 60)]
+		[int]$ReseedPollMinutes = 5,
+
+		[Parameter(Mandatory, ParameterSetName = 'Register')]
+		[switch]$RegisterScheduledTask,
+
+		[Parameter(Mandatory, ParameterSetName = 'Unregister')]
+		[switch]$UnregisterScheduledTask,
+
+		[Parameter(ParameterSetName = 'Register')]
+		[ValidateSet('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')]
+		[string]$ScheduledDay = 'Saturday',
+
+		[Parameter(ParameterSetName = 'Register')]
+		[DateTime]$ScheduledTime = '11:00 PM'
+	)
+
+	$TaskName = 'MauleTech-RepairExchangeDAGCopies'
+
+	#region Unregister Scheduled Task
+	if ($PSCmdlet.ParameterSetName -eq 'Unregister') {
+		$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+		if (-not $existingTask) {
+			Write-Host "Scheduled task '$TaskName' does not exist." -ForegroundColor Yellow
+			return
+		}
+		if ($PSCmdlet.ShouldProcess($TaskName, 'Unregister-ScheduledTask')) {
+			try {
+				Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+				Write-Host "Scheduled task '$TaskName' has been removed." -ForegroundColor Green
+			} catch {
+				Write-Host "Failed to remove scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+			}
+		}
+		return
+	}
+	#endregion
+
+	#region Register Scheduled Task
+	if ($PSCmdlet.ParameterSetName -eq 'Register') {
+		$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+			[Security.Principal.WindowsBuiltInRole]::Administrator)
+		if (-not $isAdmin) {
+			Write-Host "Administrator privileges are required to register a scheduled task." -ForegroundColor Red
+			return
+		}
+
+		# Validate filter inputs - allow PowerShell wildcards plus standard identifier chars,
+		# and reject anything else so the values are safe to embed in the wrapper script string.
+		foreach ($pair in @(
+			@{ Name = 'ServerFilter';   Value = $ServerFilter   },
+			@{ Name = 'DatabaseFilter'; Value = $DatabaseFilter }
+		)) {
+			if ($pair.Value -notmatch '^[A-Za-z0-9._\-*?]+$') {
+				Write-Host "Invalid $($pair.Name) value: '$($pair.Value)'. Allowed: letters, digits, dot, dash, underscore, * and ?." -ForegroundColor Red
+				return
+			}
+		}
+
+		$ScriptDir  = Join-Path $env:ProgramData 'MauleTech'
+		$LogDir     = Join-Path $ScriptDir       'Logs'
+		$ScriptPath = Join-Path $ScriptDir       'Repair-ExchangeDAGCopies.ps1'
+		$LogPath    = Join-Path $LogDir          'Repair-ExchangeDAGCopies.log'
+
+		# Wrapper script body. Single-quoted here-string keeps the body literal; the parameter
+		# header above it is interpolated and validated. Filter values are validated above.
+		$parallelLiteral = if ($Parallel) { '$true' } else { '$false' }
+		$WrapperHeader = @"
+`$LogPath            = '$LogPath'
+`$ServerFilter       = '$ServerFilter'
+`$DatabaseFilter     = '$DatabaseFilter'
+`$ResumeWaitSeconds  = $ResumeWaitSeconds
+`$StaggerSeconds     = $StaggerSeconds
+`$Parallel           = $parallelLiteral
+`$ReseedTimeoutHours = $ReseedTimeoutHours
+`$ReseedPollMinutes  = $ReseedPollMinutes
+"@
+
+		$WrapperBody = @'
+$ErrorActionPreference = 'Continue'
+New-Item -Path (Split-Path $LogPath -Parent) -ItemType Directory -Force | Out-Null
+
+$Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+"=== Repair-ExchangeDAGCopies run at $Stamp ===" | Out-File -FilePath $LogPath -Append -Encoding ASCII
+
+try {
+	if (-not (Get-PSSnapin -Registered -Name 'Microsoft.Exchange.Management.PowerShell.SnapIn' -ErrorAction SilentlyContinue)) {
+		throw 'Exchange Management Shell snap-in is not registered on this server.'
+	}
+	if (-not (Get-PSSnapin -Name 'Microsoft.Exchange.Management.PowerShell.SnapIn' -ErrorAction SilentlyContinue)) {
+		Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction Stop
+	}
+
+	[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+	try {
+		Invoke-RestMethod -Uri 'https://ps.mauletech.com' | Invoke-Expression
+	} catch {
+		Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt' | Invoke-Expression
+	}
+
+	Repair-ExchangeDAGCopies `
+		-ServerFilter $ServerFilter `
+		-DatabaseFilter $DatabaseFilter `
+		-ResumeWaitSeconds $ResumeWaitSeconds `
+		-StaggerSeconds $StaggerSeconds `
+		-Parallel:$Parallel `
+		-ReseedTimeoutHours $ReseedTimeoutHours `
+		-ReseedPollMinutes $ReseedPollMinutes *>&1 |
+		Tee-Object -FilePath $LogPath -Append
+} catch {
+	"[ERROR] $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding ASCII
+}
+'@
+
+		$Wrapper = $WrapperHeader + "`r`n" + $WrapperBody
+
+		if ($PSCmdlet.ShouldProcess($ScriptPath, 'Write wrapper script')) {
+			New-Item -Path $ScriptDir -ItemType Directory -Force | Out-Null
+			$Wrapper | Out-File -FilePath $ScriptPath -Encoding ASCII -Force
+		}
+
+		$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+		if ($existingTask) {
+			Write-Host "Scheduled task '$TaskName' already exists -- replacing." -ForegroundColor Yellow
+			if ($PSCmdlet.ShouldProcess($TaskName, 'Unregister existing task before replacing')) {
+				try {
+					Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+				} catch {
+					Write-Host "Failed to remove existing task: $($_.Exception.Message)" -ForegroundColor Red
+					return
+				}
+			}
+		}
+
+		$Action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+			-Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
+		$Trigger   = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $ScheduledDay -At $ScheduledTime
+		# 72h gives serial mode enough headroom to step through several large reseeds back-to-back
+		# (default 24h per-copy timeout x worst-case stuck copies). Tasks that exceed this are killed
+		# by the scheduler; the remaining copies will be retried on the next weekly run.
+		$Settings  = New-ScheduledTaskSettingsSet `
+			-AllowStartIfOnBatteries `
+			-DontStopIfGoingOnBatteries `
+			-StartWhenAvailable `
+			-ExecutionTimeLimit (New-TimeSpan -Hours 72)
+		$Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+
+		$timeStr = $ScheduledTime.ToString('h:mm tt')
+		if ($PSCmdlet.ShouldProcess($TaskName, "Register-ScheduledTask weekly $ScheduledDay $timeStr")) {
+			try {
+				Register-ScheduledTask -TaskName $TaskName `
+					-Action $Action `
+					-Trigger $Trigger `
+					-Settings $Settings `
+					-Principal $Principal `
+					-Description "MauleTech: Repairs failed/suspended Exchange DAG database copies weekly. Filters: Server='$ServerFilter' Database='$DatabaseFilter'." `
+					-ErrorAction Stop | Out-Null
+
+				$modeStr = if ($Parallel) { 'Parallel (no wait between reseeds)' } else { "Serial (wait per copy, ${ReseedTimeoutHours}h timeout, ${ReseedPollMinutes}min poll)" }
+				Write-Host "Scheduled task '$TaskName' created successfully." -ForegroundColor Green
+				Write-Host "  Schedule:       Weekly on $ScheduledDay at $timeStr" -ForegroundColor Cyan
+				Write-Host "  Mode:           $modeStr" -ForegroundColor Cyan
+				Write-Host "  ServerFilter:   $ServerFilter"   -ForegroundColor Cyan
+				Write-Host "  DatabaseFilter: $DatabaseFilter" -ForegroundColor Cyan
+				Write-Host "  Wrapper script: $ScriptPath"     -ForegroundColor Cyan
+				Write-Host "  Log file:       $LogPath"        -ForegroundColor Cyan
+				Write-Host "  To remove:      Repair-ExchangeDAGCopies -UnregisterScheduledTask" -ForegroundColor Cyan
+			} catch {
+				Write-Host "Failed to create scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+			}
+		}
+		return
+	}
+	#endregion
+
+	#region Repair pass
+	if (-not (Get-Command Get-MailboxDatabaseCopyStatus -ErrorAction SilentlyContinue)) {
+		Write-Host "Exchange Management Shell cmdlets are not loaded." -ForegroundColor Red
+		Write-Host "Run from EMS, or load the snap-in first:" -ForegroundColor Red
+		Write-Host "  Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn" -ForegroundColor Red
+		return
+	}
+
+	# Polls Get-MailboxDatabaseCopyStatus until the copy is Healthy/Mounted, the timeout fires,
+	# or the status is stuck in a failure state across multiple polls. Used in serial mode to
+	# avoid kicking off concurrent reseeds across a WAN link. Terminates without throwing so
+	# the outer loop can move on to the next copy regardless of outcome.
+	$waitForReseed = {
+		param([string]$Id, [int]$TimeoutHours, [int]$PollMinutes)
+
+		$start    = Get-Date
+		$deadline = $start.AddHours($TimeoutHours)
+		$badStates       = @('Failed','FailedAndSuspended','Suspended','ServiceDown','Disconnected')
+		$consecutiveBads = 0
+
+		Write-Host "    Waiting for $Id (poll every $PollMinutes min, timeout $TimeoutHours h)..." -ForegroundColor Cyan
+
+		do {
+			Start-Sleep -Seconds ($PollMinutes * 60)
+
+			$cur = Get-MailboxDatabaseCopyStatus -Identity $Id -ErrorAction SilentlyContinue
+			if (-not $cur) {
+				Write-Host "    [!] Could not query status for $Id. Continuing to next copy." -ForegroundColor Yellow
+				return
+			}
+
+			$elapsed = '{0:hh\:mm\:ss}' -f ((Get-Date) - $start)
+			Write-Host "    [+$elapsed] Status: $($cur.Status), CopyQueue: $($cur.CopyQueueLength)"
+
+			if ($cur.Status -in @('Healthy','Mounted')) {
+				Write-Host "    [OK] Reseed complete for $Id (elapsed $elapsed)." -ForegroundColor Green
+				return
+			}
+
+			if ($cur.Status -in $badStates) {
+				$consecutiveBads++
+				# 3 consecutive bad polls = ~$($PollMinutes * 3) min stuck. Bail out so the outer
+				# loop can move on rather than waiting the full timeout on a copy that isn't moving.
+				if ($consecutiveBads -ge 3) {
+					Write-Host "    [!!] Status stuck at $($cur.Status) over $consecutiveBads polls. Continuing to next copy." -ForegroundColor Red
+					return
+				}
+			} else {
+				$consecutiveBads = 0
+			}
+
+			if ((Get-Date) -gt $deadline) {
+				Write-Host "    [!] Timeout after $TimeoutHours hours for $Id. Continuing to next copy." -ForegroundColor Yellow
+				return
+			}
+		} while ($true)
+	}
+
+	# Resolve target copies. Wrapping in @(...) ensures .Count works correctly when only
+	# one copy matches (PowerShell unwraps single-item collections by default).
+	$failedCopies = @(Get-MailboxDatabaseCopyStatus * |
+		Where-Object {
+			$_.Status -match 'Failed|Suspended' -and
+			$_.Name -like "*\$ServerFilter" -and
+			($_.Name -split '\\')[0] -like $DatabaseFilter
+		})
+
+	if ($failedCopies.Count -eq 0) {
+		Write-Host "No failed/suspended copies found matching filters." -ForegroundColor Green
+		return
+	}
+
+	Write-Host "Found $($failedCopies.Count) failed/suspended copy(s) to process." -ForegroundColor Cyan
+
+	foreach ($copy in $failedCopies) {
+		$identity = $copy.Name
+		$dbName   = ($identity -split '\\')[0]
+		$server   = ($identity -split '\\')[1]
+
+		Write-Host "`n[$identity] Status: $($copy.Status) | CopyQueue: $($copy.CopyQueueLength)" -ForegroundColor Yellow
+
+		# --- Step 1: Resume ---
+		Write-Host "  [1/3] Attempting Resume..." -ForegroundColor Cyan
+		if ($PSCmdlet.ShouldProcess($identity, 'Resume-MailboxDatabaseCopy')) {
+			try {
+				Resume-MailboxDatabaseCopy -Identity $identity -ErrorAction Stop
+				Write-Verbose "Resume command issued for $identity. Waiting $ResumeWaitSeconds seconds..."
+				Start-Sleep -Seconds $ResumeWaitSeconds
+
+				$status = (Get-MailboxDatabaseCopyStatus -Identity $identity).Status
+				if ($status -in @('Healthy','Mounted')) {
+					Write-Host "  [OK] Resume succeeded. Status: $status" -ForegroundColor Green
+					Start-Sleep -Seconds $StaggerSeconds
+					continue
+				} else {
+					Write-Host "  [--] Resume did not recover copy. Status: $status. Escalating..." -ForegroundColor Yellow
+				}
+			} catch {
+				Write-Host "  [--] Resume failed: $($_.Exception.Message)" -ForegroundColor Yellow
+			}
+		}
+
+		# --- Step 2: Standard Reseed ---
+		Write-Host "  [2/3] Attempting standard reseed (-DeleteExistingFiles)..." -ForegroundColor Cyan
+		$needsManualCleanup = $false
+		if ($PSCmdlet.ShouldProcess($identity, 'Update-MailboxDatabaseCopy -DeleteExistingFiles')) {
+			try {
+				Update-MailboxDatabaseCopy -Identity $identity -DeleteExistingFiles -Confirm:$false -ErrorAction Stop
+				Write-Host "  [OK] Reseed initiated for $identity." -ForegroundColor Green
+				if (-not $Parallel) {
+					& $waitForReseed -Id $identity -TimeoutHours $ReseedTimeoutHours -PollMinutes $ReseedPollMinutes
+				}
+				Start-Sleep -Seconds $StaggerSeconds
+				continue
+			} catch {
+				$errMsg = $_.Exception.Message
+				Write-Host "  [--] Standard reseed failed: $errMsg" -ForegroundColor Yellow
+
+				# Escalate to manual cleanup when the error suggests stale temp-seeding files
+				# or related filesystem issues. 'JET_errFileAccessDenied' covers locked-file
+				# scenarios; '1392' is ERROR_FILE_CORRUPT.
+				if ($errMsg -match '1392|temp-seeding|JET_errFileAccessDenied|prerequisite check') {
+					Write-Host "  [!] Detected temp-seeding or filesystem error. Escalating to manual cleanup..." -ForegroundColor Magenta
+					$needsManualCleanup = $true
+				} else {
+					Write-Host "  [!!] Unrecognized reseed error on $identity. Skipping to avoid further damage. Review manually." -ForegroundColor Red
+					continue
+				}
+			}
+		}
+
+		if (-not $needsManualCleanup) {
+			# Either ShouldProcess was false (-WhatIf) or the reseed succeeded/skipped.
+			# Don't proceed to destructive cleanup unless the prior step explicitly asked for it.
+			continue
+		}
+
+		# --- Step 3: Manual temp-seeding cleanup + reseed ---
+		Write-Host "  [3/3] Attempting manual temp-seeding folder cleanup on $server..." -ForegroundColor Cyan
+
+		# Resolve temp-seeding path from the database object's EdbFilePath
+		$tempSeedingPath = $null
+		try {
+			$db = Get-MailboxDatabase -Identity $dbName -Status -ErrorAction Stop
+			$dbDir = Split-Path $db.EdbFilePath.ToString() -Parent
+			$tempSeedingPath = Join-Path $dbDir 'temp-seeding'
+		} catch {
+			Write-Host ("  [!!] Could not resolve DB path for {0}: {1}" -f $dbName, $_.Exception.Message) -ForegroundColor Red
+			continue
+		}
+
+		Write-Verbose "Temp-seeding path resolved: $tempSeedingPath on $server"
+
+		$cleanupTarget = "{0}:{1}" -f $server, $tempSeedingPath
+		if ($PSCmdlet.ShouldProcess($cleanupTarget, 'Remove temp-seeding folder')) {
+			try {
+				Invoke-Command -ComputerName $server -ScriptBlock {
+					param($path)
+					if (Test-Path $path) {
+						Write-Host "    Removing: $path"
+						Remove-Item $path -Recurse -Force -ErrorAction Stop
+						Write-Host "    Removed successfully."
+					} else {
+						Write-Host "    Path not found (may already be gone): $path"
+					}
+				} -ArgumentList $tempSeedingPath -ErrorAction Stop
+
+				Write-Host "  [OK] Temp-seeding folder cleared. Retrying reseed..." -ForegroundColor Cyan
+
+				if ($PSCmdlet.ShouldProcess($identity, 'Update-MailboxDatabaseCopy after manual cleanup')) {
+					Update-MailboxDatabaseCopy -Identity $identity -DeleteExistingFiles -Confirm:$false -ErrorAction Stop
+					Write-Host "  [OK] Reseed initiated after manual cleanup." -ForegroundColor Green
+					if (-not $Parallel) {
+						& $waitForReseed -Id $identity -TimeoutHours $ReseedTimeoutHours -PollMinutes $ReseedPollMinutes
+					}
+				}
+			} catch {
+				Write-Host ("  [!!] Manual cleanup or reseed failed for {0}: {1}" -f $identity, $_.Exception.Message) -ForegroundColor Red
+				Write-Host "       This copy likely has filesystem corruption on $server. Investigate chkdsk on the hosting volume." -ForegroundColor Red
+			}
+		}
+
+		Start-Sleep -Seconds $StaggerSeconds
+	}
+
+	Write-Host "`nRepair pass complete. Run Get-MailboxDatabaseCopyStatus to review current state." -ForegroundColor Cyan
+	#endregion
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

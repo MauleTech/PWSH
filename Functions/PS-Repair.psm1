@@ -1352,12 +1352,21 @@ Function Repair-ExchangeDAGCopies {
 	.PARAMETER ReseedPollMinutes
 		In serial mode (default), how often to poll Get-MailboxDatabaseCopyStatus while
 		waiting for a reseed to complete. Default: 5 minutes. Range: 1-60.
+	.PARAMETER AutoFilesystemRepair
+		If specified, when a reseed fails with NTFS corruption symptoms (error 1392 or
+		'Corruption in the filesystem has been detected'), the function extracts the
+		affected drive letter from the error message, runs Repair-Volume -Scan on the
+		target server, and (if the scan reports errors) Repair-Volume -SpotFix. Each
+		volume is repaired at most once per session and the OS volume is always skipped.
+		Note: -SpotFix briefly dismounts the volume, which momentarily disrupts any
+		other databases hosted on it. After a successful repair the reseed is retried.
+		Off by default; opt in explicitly when you understand the dismount tradeoff.
 	.PARAMETER RegisterScheduledTask
 		Registers a Windows scheduled task ('MauleTech-RepairExchangeDAGCopies') that runs this
 		repair once a week at the configured day/time. All repair-mode parameters
 		(-ServerFilter, -DatabaseFilter, -ResumeWaitSeconds, -StaggerSeconds, -Parallel,
-		-ReseedTimeoutHours, -ReseedPollMinutes) are captured into the wrapper script so the
-		scheduled run uses the same scope and behavior.
+		-ReseedTimeoutHours, -ReseedPollMinutes, -AutoFilesystemRepair) are captured into
+		the wrapper script so the scheduled run uses the same scope and behavior.
 	.PARAMETER UnregisterScheduledTask
 		Removes the MauleTech-RepairExchangeDAGCopies scheduled task if it exists.
 	.PARAMETER ScheduledDay
@@ -1374,6 +1383,11 @@ Function Repair-ExchangeDAGCopies {
 		Repair-ExchangeDAGCopies -ServerFilter 'EX2016-3' -Parallel
 		Kicks off reseeds in parallel for all failed copies on EX2016-3 (faster on a LAN, but
 		don't use over a WAN with multiple copies - it will saturate the link).
+	.EXAMPLE
+		Repair-ExchangeDAGCopies -ServerFilter 'EX2016-3' -AutoFilesystemRepair
+		If a reseed fails because of NTFS corruption (error 1392 or 'Corruption in the
+		filesystem...'), runs Repair-Volume -Scan and -SpotFix on the affected volume and
+		retries the reseed. Skips the OS volume.
 	.EXAMPLE
 		Repair-ExchangeDAGCopies -RegisterScheduledTask
 		Schedules a weekly repair at the default day/time (Saturday 11:00 PM) covering all servers
@@ -1424,6 +1438,10 @@ Function Repair-ExchangeDAGCopies {
 		[Parameter(ParameterSetName = 'Register')]
 		[ValidateRange(1, 60)]
 		[int]$ReseedPollMinutes = 5,
+
+		[Parameter(ParameterSetName = 'Repair')]
+		[Parameter(ParameterSetName = 'Register')]
+		[switch]$AutoFilesystemRepair,
 
 		[Parameter(Mandatory, ParameterSetName = 'Register')]
 		[switch]$RegisterScheduledTask,
@@ -1489,15 +1507,17 @@ Function Repair-ExchangeDAGCopies {
 		# Wrapper script body. Single-quoted here-string keeps the body literal; the parameter
 		# header above it is interpolated and validated. Filter values are validated above.
 		$parallelLiteral = if ($Parallel) { '$true' } else { '$false' }
+		$autoFsLiteral   = if ($AutoFilesystemRepair) { '$true' } else { '$false' }
 		$WrapperHeader = @"
-`$LogPath            = '$LogPath'
-`$ServerFilter       = '$ServerFilter'
-`$DatabaseFilter     = '$DatabaseFilter'
-`$ResumeWaitSeconds  = $ResumeWaitSeconds
-`$StaggerSeconds     = $StaggerSeconds
-`$Parallel           = $parallelLiteral
-`$ReseedTimeoutHours = $ReseedTimeoutHours
-`$ReseedPollMinutes  = $ReseedPollMinutes
+`$LogPath              = '$LogPath'
+`$ServerFilter         = '$ServerFilter'
+`$DatabaseFilter       = '$DatabaseFilter'
+`$ResumeWaitSeconds    = $ResumeWaitSeconds
+`$StaggerSeconds       = $StaggerSeconds
+`$Parallel             = $parallelLiteral
+`$ReseedTimeoutHours   = $ReseedTimeoutHours
+`$ReseedPollMinutes    = $ReseedPollMinutes
+`$AutoFilesystemRepair = $autoFsLiteral
 "@
 
 		$WrapperBody = @'
@@ -1529,7 +1549,8 @@ try {
 		-StaggerSeconds $StaggerSeconds `
 		-Parallel:$Parallel `
 		-ReseedTimeoutHours $ReseedTimeoutHours `
-		-ReseedPollMinutes $ReseedPollMinutes *>&1 |
+		-ReseedPollMinutes $ReseedPollMinutes `
+		-AutoFilesystemRepair:$AutoFilesystemRepair *>&1 |
 		Tee-Object -FilePath $LogPath -Append
 } catch {
 	"[ERROR] $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding ASCII
@@ -1581,9 +1602,11 @@ try {
 					-ErrorAction Stop | Out-Null
 
 				$modeStr = if ($Parallel) { 'Parallel (no wait between reseeds)' } else { "Serial (wait per copy, ${ReseedTimeoutHours}h timeout, ${ReseedPollMinutes}min poll)" }
+				$fsStr   = if ($AutoFilesystemRepair) { 'Enabled (will run Repair-Volume on corrupt non-OS volumes)' } else { 'Disabled' }
 				Write-Host "Scheduled task '$TaskName' created successfully." -ForegroundColor Green
 				Write-Host "  Schedule:       Weekly on $ScheduledDay at $timeStr" -ForegroundColor Cyan
 				Write-Host "  Mode:           $modeStr" -ForegroundColor Cyan
+				Write-Host "  AutoFsRepair:   $fsStr" -ForegroundColor Cyan
 				Write-Host "  ServerFilter:   $ServerFilter"   -ForegroundColor Cyan
 				Write-Host "  DatabaseFilter: $DatabaseFilter" -ForegroundColor Cyan
 				Write-Host "  Wrapper script: $ScriptPath"     -ForegroundColor Cyan
@@ -1655,6 +1678,57 @@ try {
 		} while ($true)
 	}
 
+	# Tracks volumes already repaired during this session keyed by "<server>|<DriveLetter>"
+	# so 9 failing copies on the same I: drive only trigger one chkdsk pass.
+	$repairedVolumes = @{}
+
+	# Runs Repair-Volume -Scan on the target server, then -SpotFix only if the scan reports
+	# anything other than NoErrorsFound. Refuses to touch the OS volume. Returns the string
+	# 'Repaired' if a SpotFix completed, 'Clean' if scan reported no errors, 'Skipped' if
+	# the volume is the OS volume, or 'Failed' on any error path.
+	$runFilesystemRepair = {
+		param([string]$Server, [string]$Volume)
+
+		Write-Host "    Running Repair-Volume scan on $Server volume ${Volume}:..." -ForegroundColor Magenta
+		try {
+			$result = Invoke-Command -ComputerName $Server -ScriptBlock {
+				param([string]$v)
+				$osLetter = $env:SystemDrive.TrimEnd(':')
+				if ($v -ieq $osLetter) {
+					return [pscustomobject]@{ Outcome = 'Skipped'; Detail = "Refusing to chkdsk OS volume ${v}: on $env:COMPUTERNAME" }
+				}
+				try {
+					$scan = Repair-Volume -DriveLetter $v -Scan -ErrorAction Stop
+				} catch {
+					return [pscustomobject]@{ Outcome = 'Failed'; Detail = "Scan threw: $($_.Exception.Message)" }
+				}
+				if ($scan -eq 'NoErrorsFound') {
+					return [pscustomobject]@{ Outcome = 'Clean'; Detail = "Scan: $scan" }
+				}
+				try {
+					# -SpotFix dismounts the volume briefly; this affects every database
+					# whose files live on it. Only acceptable because the caller opted in
+					# via -AutoFilesystemRepair.
+					$fix = Repair-Volume -DriveLetter $v -SpotFix -ErrorAction Stop
+					return [pscustomobject]@{ Outcome = 'Repaired'; Detail = "Scan: $scan; SpotFix: $fix" }
+				} catch {
+					return [pscustomobject]@{ Outcome = 'Failed'; Detail = "Scan: $scan; SpotFix threw: $($_.Exception.Message)" }
+				}
+			} -ArgumentList $Volume -ErrorAction Stop
+
+			switch ($result.Outcome) {
+				'Clean'    { Write-Host "    [OK] Volume ${Volume}: scan clean. $($result.Detail)" -ForegroundColor Green }
+				'Repaired' { Write-Host "    [OK] Volume ${Volume}: $($result.Detail)" -ForegroundColor Green }
+				'Skipped'  { Write-Host "    [!!] $($result.Detail)" -ForegroundColor Red }
+				'Failed'   { Write-Host "    [!!] Volume ${Volume}: $($result.Detail)" -ForegroundColor Red }
+			}
+			return $result.Outcome
+		} catch {
+			Write-Host "    [!!] Filesystem repair invocation failed: $($_.Exception.Message)" -ForegroundColor Red
+			return 'Failed'
+		}
+	}
+
 	# Resolve target copies. Wrapping in @(...) ensures .Count works correctly when only
 	# one copy matches (PowerShell unwraps single-item collections by default).
 	$failedCopies = @(Get-MailboxDatabaseCopyStatus * |
@@ -1715,10 +1789,12 @@ try {
 				$errMsg = $_.Exception.Message
 				Write-Host "  [--] Standard reseed failed: $errMsg" -ForegroundColor Yellow
 
-				# Escalate to manual cleanup when the error suggests stale temp-seeding files
-				# or related filesystem issues. 'JET_errFileAccessDenied' covers locked-file
-				# scenarios; '1392' is ERROR_FILE_CORRUPT.
-				if ($errMsg -match '1392|temp-seeding|JET_errFileAccessDenied|prerequisite check') {
+				# Escalate to manual cleanup when the error suggests stale temp-seeding
+				# files, locked files, or filesystem corruption. '1392' is
+				# ERROR_FILE_CORRUPT; 'Corruption in the filesystem' / 'consistent with
+				# corruption of the filesystem' are the strings Exchange surfaces when
+				# NTFS reports trouble; 'JET_errFileAccessDenied' covers locked files.
+				if ($errMsg -match '1392|temp-seeding|JET_errFileAccessDenied|prerequisite check|Corruption in the filesystem|consistent with corruption of the filesystem') {
 					Write-Host "  [!] Detected temp-seeding or filesystem error. Escalating to manual cleanup..." -ForegroundColor Magenta
 					$needsManualCleanup = $true
 				} else {
@@ -1774,8 +1850,66 @@ try {
 					}
 				}
 			} catch {
-				Write-Host ("  [!!] Manual cleanup or reseed failed for {0}: {1}" -f $identity, $_.Exception.Message) -ForegroundColor Red
-				Write-Host "       This copy likely has filesystem corruption on $server. Investigate chkdsk on the hosting volume." -ForegroundColor Red
+				$step3Err = $_.Exception.Message
+				Write-Host ("  [!!] Manual cleanup or reseed failed for {0}: {1}" -f $identity, $step3Err) -ForegroundColor Red
+
+				$looksLikeFsCorruption = $step3Err -match '1392|Corruption in the filesystem|consistent with corruption of the filesystem'
+
+				if (-not $AutoFilesystemRepair) {
+					if ($looksLikeFsCorruption) {
+						Write-Host "       Filesystem corruption suspected on $server. Re-run with -AutoFilesystemRepair, or investigate chkdsk on the hosting volume manually." -ForegroundColor Red
+					}
+					Start-Sleep -Seconds $StaggerSeconds
+					continue
+				}
+
+				if (-not $looksLikeFsCorruption) {
+					Write-Host "       Error does not match a known filesystem-corruption pattern; skipping chkdsk to be safe." -ForegroundColor Red
+					Start-Sleep -Seconds $StaggerSeconds
+					continue
+				}
+
+				# Extract drive letter from the first absolute path mentioned in the error
+				$driveLetter = $null
+				if ($step3Err -match '\b([A-Za-z]):\\') {
+					$driveLetter = $Matches[1].ToUpper()
+				}
+				if (-not $driveLetter) {
+					Write-Host "       Could not extract a drive letter from the error message; skipping chkdsk." -ForegroundColor Red
+					Start-Sleep -Seconds $StaggerSeconds
+					continue
+				}
+
+				$volKey = "{0}|{1}" -f $server, $driveLetter
+				if ($repairedVolumes.ContainsKey($volKey)) {
+					Write-Host "       Volume ${driveLetter}: on $server already repaired this run; retrying reseed without rescanning." -ForegroundColor Cyan
+				} else {
+					if (-not $PSCmdlet.ShouldProcess("$server volume ${driveLetter}:", 'Repair-Volume -Scan/-SpotFix')) {
+						Start-Sleep -Seconds $StaggerSeconds
+						continue
+					}
+					$outcome = & $runFilesystemRepair -Server $server -Volume $driveLetter
+					$repairedVolumes[$volKey] = $outcome
+					if ($outcome -notin @('Clean','Repaired')) {
+						Write-Host "       Filesystem repair did not complete cleanly (outcome: $outcome). Skipping further retries on this copy." -ForegroundColor Red
+						Start-Sleep -Seconds $StaggerSeconds
+						continue
+					}
+				}
+
+				if ($PSCmdlet.ShouldProcess($identity, 'Update-MailboxDatabaseCopy after filesystem repair')) {
+					try {
+						Write-Host "       Retrying reseed after filesystem repair..." -ForegroundColor Cyan
+						Update-MailboxDatabaseCopy -Identity $identity -DeleteExistingFiles -Confirm:$false -ErrorAction Stop
+						Write-Host "  [OK] Reseed initiated after filesystem repair." -ForegroundColor Green
+						if (-not $Parallel) {
+							& $waitForReseed -Id $identity -TimeoutHours $ReseedTimeoutHours -PollMinutes $ReseedPollMinutes
+						}
+					} catch {
+						Write-Host "       Reseed still fails after filesystem repair: $($_.Exception.Message)" -ForegroundColor Red
+						Write-Host "       This copy may need manual intervention beyond chkdsk (e.g. chkdsk /F offline, or a full reseed from a different source server)." -ForegroundColor Red
+					}
+				}
 			}
 		}
 

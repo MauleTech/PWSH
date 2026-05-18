@@ -527,28 +527,17 @@ Function Add-RDPShortcut {
 		}
 
 		if ($User) {
-			# First check if we're targeting the current user (easier detection)
-			if ($env:USERNAME -like $User -or $env:USERNAME -eq $User) {
-				$currentUserDesktop = [Environment]::GetFolderPath('Desktop')
-				if ($currentUserDesktop -and (Test-Path $currentUserDesktop)) {
-					Write-Verbose "Using current user's Desktop: $currentUserDesktop"
-					$ShortcutPath.Add("$currentUserDesktop\$File")
-				}
-				else {
-					Write-Error "Could not determine current user's Desktop path"
-					return
-				}
+			# Always look up via the user's profile rather than GetFolderPath('Desktop').
+			# GetFolderPath resolves against the running process's token, so when this
+			# runs as SYSTEM (or any account that inherited $env:USERNAME from a user
+			# shell) it would write to the wrong desktop.
+			$UserProfiles = @(Get-UserHives | Where-Object { $_.Username -like $User })
+			if ($UserProfiles.Count -eq 0) {
+				Write-Error "User profile for '$User' not found"
+				return
 			}
-			else {
-				# For other users, use the profile lookup
-				$UserProfile = Get-UserHives | Where-Object { $_.Username -like $User }
-				if ($UserProfile) {
-					$ShortcutPath.Add("$($UserProfile.DesktopPath)\$File")
-				}
-				else {
-					Write-Error "User profile for '$User' not found"
-					return
-				}
+			foreach ($UserProfile in $UserProfiles) {
+				$ShortcutPath.Add("$($UserProfile.DesktopPath)\$File")
 			}
 		}
 

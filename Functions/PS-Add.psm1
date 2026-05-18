@@ -219,8 +219,17 @@ Function Add-RDPShortcut {
 
 	[CmdletBinding()]
 	param (
+		# Code + a destination switch are by far the most common invocation,
+		# so they come first to make tab cycling through parameters land
+		# on the placement options right after -Code.
 		[Parameter()]
 		[String]$Code,
+		[Parameter()]
+		[String]$User,
+		[Parameter()]
+		[Switch]$AllExistingUsers,
+		[Parameter()]
+		[Switch]$AllUsers,
 		[Parameter()]
 		[String]$Name,
 		[Parameter()]
@@ -251,12 +260,6 @@ Function Add-RDPShortcut {
 		[Switch]$EnableVideoCapture = $true,
 		[Parameter()]
 		[Switch]$EnablePnPDevices = $true,
-		[Parameter()]
-		[Switch]$AllExistingUsers,
-		[Parameter()]
-		[Switch]$AllUsers,
-		[Parameter()]
-		[String]$User,
 		[Parameter()]
 		[Switch]$PassThru,
 		[Parameter()]
@@ -403,6 +406,21 @@ Function Add-RDPShortcut {
 		if (!(Test-IsElevated)) {
 			Write-Error -Message "Access Denied. Please run with Administrator privileges."
 			return
+		}
+
+		# Revert to the previous RDP redirection warning dialog. Setting
+		# RedirectionWarningDialogVersion=1 suppresses the new (post-April-2024)
+		# security dialog. Documented at learn.microsoft.com under
+		# "Understanding security warnings when opening Remote Desktop (RDP) files".
+		try {
+			$rdpClientRegPath = "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services\Client"
+			if (-not (Test-Path -LiteralPath $rdpClientRegPath)) {
+				New-Item -Path $rdpClientRegPath -Force | Out-Null
+			}
+			Set-ItemProperty -LiteralPath $rdpClientRegPath -Name "RedirectionWarningDialogVersion" -Value 1 -Type DWord -Force
+		}
+		catch {
+			Write-Warning "Failed to set RedirectionWarningDialogVersion: $_"
 		}
 
 		# Get the actual Desktop folder path for a user (handles OneDrive redirection)

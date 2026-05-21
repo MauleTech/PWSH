@@ -1879,6 +1879,7 @@ Function Invoke-OneDriveFreeUpSpace {
 		[string]$Path,
 
 		[Parameter()]
+		[ValidateNotNullOrEmpty()]
 		[string[]]$FolderFilter = @('OneDrive*')
 	)
 

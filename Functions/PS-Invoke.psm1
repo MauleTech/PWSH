@@ -1811,9 +1811,12 @@ Function Invoke-OneDriveFreeUpSpace {
 		watches the flag change and performs the actual move. The OneDrive process must be
 		running for the disk-space change to materialize; the flag change itself is instant.
 
-		By default every real user profile (Win32_UserProfile where Special = false) is
-		processed. Use -UserName to target specific profiles, or -Path to point at one
-		specific folder.
+		By default every non-system user profile on the machine is processed. Without
+		elevation, only the current user's profile is fully accessible; other profiles
+		will produce per-folder access-denied failures.
+
+		Use -UserName to target specific profiles, or -Path to point at one specific
+		folder.
 
 	.PARAMETER Mode
 		FreeSpace (default): unpin files so OneDrive dehydrates them to cloud-only.
@@ -1860,9 +1863,6 @@ Function Invoke-OneDriveFreeUpSpace {
 		Uses one recursive attrib.exe call per sync folder rather than walking individual
 		files, which is many orders of magnitude faster on populated trees.
 
-		Run as the logged-on user to act on a single profile, or as Administrator to
-		process every profile on the machine.
-
 		Author: Maule Technologies
 #>
 	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -1899,10 +1899,15 @@ Function Invoke-OneDriveFreeUpSpace {
 		}
 		$null = $FoldersToProcess.Add($Resolved.Path)
 	} else {
-		# Win32_UserProfile.Special is true for SYSTEM, LocalService, NetworkService, and
-		# defaultuser0, and LocalPath honors a redirected ProfilesDirectory.
-		$Profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
-			Where-Object { -not $_.Special -and (Test-Path -LiteralPath $_.LocalPath) }
+		# Push Special = false to WMI so SYSTEM/LocalService/NetworkService/defaultuser0
+		# are filtered server-side. LocalPath honors a redirected ProfilesDirectory.
+		try {
+			$Profiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = false' -ErrorAction Stop |
+				Where-Object { Test-Path -LiteralPath $_.LocalPath })
+		} catch {
+			Write-Warning "Could not query Win32_UserProfile: $($_.Exception.Message)"
+			return
+		}
 
 		if ($UserName) {
 			$Profiles = $Profiles | Where-Object { $UserName -contains (Split-Path $_.LocalPath -Leaf) }
@@ -1919,9 +1924,9 @@ Function Invoke-OneDriveFreeUpSpace {
 
 		foreach ($UserProfile in $Profiles) {
 			foreach ($Filter in $FolderFilter) {
-				Get-ChildItem -LiteralPath $UserProfile.LocalPath -Directory -ErrorAction SilentlyContinue |
-					Where-Object { $_.Name -like $Filter } |
-					ForEach-Object { $null = $FoldersToProcess.Add($_.FullName) }
+				foreach ($Found in Get-ChildItem -LiteralPath $UserProfile.LocalPath -Directory -Filter $Filter -ErrorAction SilentlyContinue) {
+					$null = $FoldersToProcess.Add($Found.FullName)
+				}
 			}
 		}
 	}
@@ -1950,14 +1955,23 @@ Function Invoke-OneDriveFreeUpSpace {
 		# at the folder root and the literal arg '*' /S /D walks the whole tree in one
 		# process spawn.
 		$global:LASTEXITCODE = 0
-		Push-Location -LiteralPath $Folder
+		$AttribOutput = ''
+		$Pushed = $false
 		try {
+			Push-Location -LiteralPath $Folder -ErrorAction Stop
+			$Pushed = $true
 			$AttribOutput = (& attrib.exe @AttribArgs '*' /S /D 2>&1 | Out-String).Trim()
+		} catch {
+			$AttribOutput = $_.Exception.Message
+			$global:LASTEXITCODE = 1
 		} finally {
-			Pop-Location
+			if ($Pushed) { Pop-Location }
 		}
 
-		$Failed = $LASTEXITCODE -ne 0 -or $AttribOutput -match 'Access is denied|cannot find|path too long|not found'
+		# attrib is silent on success and writes to stderr on per-file failure. Any
+		# captured output (locale-independent) means at least one item failed, even when
+		# the process exit code is 0.
+		$Failed = $LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($AttribOutput)
 		if ($Failed) {
 			$FoldersFailed++
 			Write-Verbose "attrib.exe issues in ${Folder}: $AttribOutput"

@@ -1795,6 +1795,241 @@ Function Invoke-Win10Decrap {
 	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Win-10-DeCrapifier/Windows10Decrapifier.txt -UseBasicParsing | Invoke-Expression
 }
 
+Function Invoke-OneDriveFreeUpSpace {
+<#
+	.SYNOPSIS
+		Forces OneDrive Files On-Demand to dehydrate (free local disk) or hydrate (keep local) files.
+
+	.DESCRIPTION
+		Sets the Unpinned/Pinned attribute on every file inside OneDrive (and optionally
+		SharePoint) sync folders so the OneDrive sync agent will either evict the local
+		content to the cloud (-Mode FreeSpace, default) or download and keep it on the
+		device (-Mode KeepLocal).
+
+		The function does not delete data. It calls attrib.exe with the OneDrive +U/-P (or
+		-U/+P) flags. The OneDrive sync agent watches the flag change and performs the
+		actual move. The OneDrive process must be running for disk space to materialize;
+		the flag change itself is instant.
+
+		By default every real user profile under C:\Users is processed (Default, Default
+		User, Public, defaultuser0, All Users, and WDAGUtilityAccount are skipped). Use
+		-UserName to target specific profiles, or -Path to point at one specific folder.
+
+		Long-path (>260 chars) errors from Get-ChildItem and attrib.exe are tracked in the
+		summary, not surfaced as errors.
+
+	.PARAMETER Mode
+		FreeSpace (default): unpin files so OneDrive dehydrates them to cloud-only.
+		KeepLocal: pin files so OneDrive downloads and keeps them locally.
+
+	.PARAMETER UserName
+		Optional list of user profile folder names to process (case-insensitive). If
+		omitted, every real user profile under C:\Users is processed.
+
+	.PARAMETER Path
+		Optional explicit folder path to operate on instead of enumerating user profiles.
+		Useful when the sync folder is in a non-standard location.
+
+	.PARAMETER FolderFilter
+		Wildcard pattern(s) matching sync folder names under each user profile. Defaults
+		to "OneDrive*", which covers both personal ("OneDrive") and business ("OneDrive
+		- Contoso") roots. Pass tenant or SharePoint names for non-default setups, e.g.
+		@("OneDrive*", "Contoso", "SharePoint - *").
+
+	.PARAMETER ExcludeExtension
+		File patterns to exclude from processing. Defaults to "*.url".
+
+	.EXAMPLE
+		Invoke-OneDriveFreeUpSpace
+		Free local space across every user's OneDrive folders on this machine.
+
+	.EXAMPLE
+		Invoke-OneDriveFreeUpSpace -Mode KeepLocal -UserName 'jdoe'
+		Re-pin all of jdoe's OneDrive files so they download locally.
+
+	.EXAMPLE
+		Invoke-OneDriveFreeUpSpace -Path 'C:\Users\jdoe\OneDrive - Contoso' -WhatIf
+		Preview which files would be dehydrated under that exact path.
+
+	.EXAMPLE
+		Invoke-OneDriveFreeUpSpace -FolderFilter @('OneDrive*', 'Contoso')
+		Include a tenant-named SharePoint sync folder in addition to OneDrive.
+
+	.NOTES
+		Adapted from a long-running community pattern (originally posted by u/criostage on
+		r/SCCM). The +U / -P attrib flags are the OneDrive Files On-Demand pin state markers;
+		see https://learn.microsoft.com/onedrive/files-on-demand-overview.
+
+		Run as the logged-on user to act on a single profile, or as Administrator to
+		process every profile on the machine.
+
+		Author: Maule Technologies
+#>
+	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+	param(
+		[Parameter()]
+		[ValidateSet('FreeSpace', 'KeepLocal')]
+		[string]$Mode = 'FreeSpace',
+
+		[Parameter()]
+		[string[]]$UserName,
+
+		[Parameter()]
+		[string]$Path,
+
+		[Parameter()]
+		[string[]]$FolderFilter = @('OneDrive*'),
+
+		[Parameter()]
+		[string[]]$ExcludeExtension = @('*.url')
+	)
+
+	begin {
+		# Define the FileAttributesEx enum once per session. Add-Type throws if the type
+		# already exists, so guard the add.
+		if (-not ([System.Management.Automation.PSTypeName]'FileAttributesEx').Type) {
+			$TypeDefinition = @'
+using System;
+
+[FlagsAttribute]
+public enum FileAttributesEx : uint {
+	Readonly = 0x00000001,
+	Hidden = 0x00000002,
+	System = 0x00000004,
+	Directory = 0x00000010,
+	Archive = 0x00000020,
+	Device = 0x00000040,
+	Normal = 0x00000080,
+	Temporary = 0x00000100,
+	SparseFile = 0x00000200,
+	ReparsePoint = 0x00000400,
+	Compressed = 0x00000800,
+	Offline = 0x00001000,
+	NotContentIndexed = 0x00002000,
+	Encrypted = 0x00004000,
+	IntegrityStream = 0x00008000,
+	Virtual = 0x00010000,
+	NoScrubData = 0x00020000,
+	EA = 0x00040000,
+	Pinned = 0x00080000,
+	Unpinned = 0x00100000,
+	RecallOnDataAccess = 0x00400000
+}
+'@
+			Add-Type -TypeDefinition $TypeDefinition
+		}
+
+		# Determine which sync folders to process.
+		$FoldersToProcess = New-Object System.Collections.Generic.List[string]
+
+		if ($PSBoundParameters.ContainsKey('Path')) {
+			if (Test-Path -LiteralPath $Path) {
+				$FoldersToProcess.Add((Resolve-Path -LiteralPath $Path).Path)
+			} else {
+				Write-Warning "Path not found: $Path"
+			}
+		} else {
+			$SkipProfiles = @('Default', 'Default User', 'Public', 'All Users', 'defaultuser0', 'WDAGUtilityAccount')
+			$ProfileRoot = Join-Path $env:SystemDrive 'Users'
+
+			$Profiles = Get-ChildItem -Path $ProfileRoot -Directory -ErrorAction SilentlyContinue |
+				Where-Object { $SkipProfiles -notcontains $_.Name }
+
+			if ($UserName) {
+				$Profiles = $Profiles | Where-Object { $UserName -contains $_.Name }
+			}
+
+			foreach ($ProfileFolder in $Profiles) {
+				foreach ($Filter in $FolderFilter) {
+					$FoundFolders = Get-ChildItem -Path $ProfileFolder.FullName -Directory -Filter $Filter -ErrorAction SilentlyContinue
+					foreach ($Found in $FoundFolders) {
+						if (-not $FoldersToProcess.Contains($Found.FullName)) {
+							$FoldersToProcess.Add($Found.FullName)
+						}
+					}
+				}
+			}
+		}
+
+		# Map mode to attrib.exe flags and a human-readable verb.
+		if ($Mode -eq 'FreeSpace') {
+			$AttribArgs = @('+U', '-P')
+			$ActionVerb = 'Dehydrate (free local space)'
+		} else {
+			$AttribArgs = @('-U', '+P')
+			$ActionVerb = 'Hydrate (keep local copy)'
+		}
+
+		$Stats = [pscustomobject]@{
+			Processed = 0
+			Skipped   = 0
+			Errored   = 0
+		}
+	}
+
+	process {
+		if ($FoldersToProcess.Count -eq 0) {
+			Write-Warning "No matching sync folders found."
+			return
+		}
+
+		Write-Host "Invoke-OneDriveFreeUpSpace: $ActionVerb" -ForegroundColor Cyan
+		Write-Host "Folders to scan: $($FoldersToProcess.Count)" -ForegroundColor Cyan
+
+		foreach ($Folder in $FoldersToProcess) {
+			Write-Host "Scanning: $Folder" -ForegroundColor Cyan
+
+			$Files = Get-ChildItem -LiteralPath $Folder -File -Recurse -Exclude $ExcludeExtension -ErrorAction SilentlyContinue
+
+			foreach ($File in $Files) {
+				$Attrs = [FileAttributesEx]$File.Attributes.value__
+
+				$IsAlreadyCloud = (
+					($Attrs -band [FileAttributesEx]::Unpinned) -or
+					($Attrs -band [FileAttributesEx]::Offline) -or
+					($Attrs -band [FileAttributesEx]::RecallOnDataAccess)
+				)
+
+				if ($Mode -eq 'FreeSpace') {
+					# Skip files that are already cloud-only or unpinned.
+					$ShouldAct = -not $IsAlreadyCloud
+				} else {
+					# Only act on files that are currently cloud-only or unpinned.
+					$ShouldAct = [bool]$IsAlreadyCloud
+				}
+
+				if (-not $ShouldAct) {
+					$Stats.Skipped++
+					continue
+				}
+
+				if ($PSCmdlet.ShouldProcess($File.FullName, $ActionVerb)) {
+					$null = & attrib.exe @AttribArgs $File.FullName 2>&1
+					if ($LASTEXITCODE -ne 0) {
+						$Stats.Errored++
+						Write-Verbose "attrib.exe failed for $($File.FullName)"
+					} else {
+						$Stats.Processed++
+						Write-Verbose "$ActionVerb -> $($File.FullName)"
+					}
+				}
+			}
+		}
+	}
+
+	end {
+		Write-Host ""
+		Write-Host "Invoke-OneDriveFreeUpSpace summary:" -ForegroundColor Green
+		Write-Host "  Files actioned : $($Stats.Processed)" -ForegroundColor Green
+		Write-Host "  Files skipped  : $($Stats.Skipped)"  -ForegroundColor Yellow
+		$ErrorColor = if ($Stats.Errored -gt 0) { 'Red' } else { 'Gray' }
+		Write-Host "  Errors         : $($Stats.Errored)"  -ForegroundColor $ErrorColor
+		Write-Host "Note: OneDrive sync agent must be running for the disk-space change to materialize." -ForegroundColor Gray
+
+		Write-Output $Stats
+	}
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

@@ -2238,19 +2238,39 @@ Function Update-WindowsTo11 {
 		$IsDellHardware = $elig.Manufacturer -match 'Dell' -or $elig.Manufacturer -match 'Alienware'
 		if ($IsDellHardware -and (Get-Command Enable-DellSecureBoot -ErrorAction SilentlyContinue)) {
 			Write-Log "Secure Boot disabled on Dell hardware ($($elig.Manufacturer)). Attempting Enable-DellSecureBoot..." -Level "WARNING"
+			$DellBiosEnabled = $false
 			try {
 				Enable-DellSecureBoot
-				# Re-check Secure Boot; some firmware reports the prior state until reboot.
+				# Re-check the kernel's Secure Boot state. On most Dell systems the
+				# DellSmbios change does not take effect until the next reboot, so
+				# Confirm-SecureBootUEFI will still report False here.
 				try {
 					$elig.SecureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
 				} catch {}
-				if ($elig.SecureBoot) {
-					Write-Log "Secure Boot is now enabled." -Level "SUCCESS"
-				} else {
-					Write-Log "Enable-DellSecureBoot completed but firmware still reports Secure Boot disabled (a reboot may be required). Bypass will be attempted via registry." -Level "WARNING"
+				# If the kernel still reports disabled, inspect the BIOS setting directly.
+				# Enable-DellSecureBoot imports DellBIOSProvider, so DellSmbios:\ is available.
+				if (-not $elig.SecureBoot) {
+					$DellSb = Get-Item -Path DellSmbios:\SecureBoot\SecureBoot -ErrorAction SilentlyContinue
+					if ($DellSb -and $DellSb.CurrentValue -eq 'Enabled') {
+						$DellBiosEnabled = $true
+					}
 				}
 			} catch {
-				Write-Log "Enable-DellSecureBoot failed: $($_.Exception.Message). Bypass will be attempted via registry." -Level "WARNING"
+				Write-Log "Enable-DellSecureBoot failed: $($_.Exception.Message)." -Level "WARNING"
+			}
+
+			if ($elig.SecureBoot) {
+				Write-Log "Secure Boot is now enabled." -Level "SUCCESS"
+			} elseif ($DellBiosEnabled) {
+				if (Get-Command Restart-ComputerSafely -ErrorAction SilentlyContinue) {
+					Write-Log "Dell BIOS Secure Boot setting is now Enabled; rebooting to apply the change and resuming Update-WindowsTo11 after restart." -Level "WARNING"
+					Restart-ComputerSafely -Force -AfterRebootScript "Update-WindowsTo11 -Force -ShowProgress -Verbose"
+					return
+				} else {
+					Write-Log "Restart-ComputerSafely not available -- please reboot manually and re-run Update-WindowsTo11. Bypass will be attempted via registry for now." -Level "WARNING"
+				}
+			} else {
+				Write-Log "Enable-DellSecureBoot did not flip the BIOS setting. Bypass will be attempted via registry." -Level "WARNING"
 			}
 		} else {
 			Write-Log "Secure Boot not detected. Bypass will be attempted via registry." -Level "WARNING"

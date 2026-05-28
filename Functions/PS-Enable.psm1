@@ -74,6 +74,13 @@ Function Enable-DellTPM {
 			falls back to Intel PTT (DellSmbios:\AdvancedBootOptions\PttSwitch) for
 			firmware-TPM systems. Never touches TpmClear (destructive: wipes keys).
 
+			When a TPM enable is actually being performed, this function also flips
+			the PPI bypass settings (TpmPpiBypassEnable / TpmPpiAcpiOptOut) so the
+			firmware does NOT prompt the operator to press F10/F12 at next boot to
+			confirm the TPM change. This is necessary for fully-unattended remote
+			runs where no one is physically at the machine. Only the Enable prompt
+			is bypassed; Clear and Disable prompts are left at their default state.
+
 			BIOS changes typically take effect on next reboot, so callers should
 			reboot to actually activate TPM. On Dells with a BIOS Setup admin
 			password, DellBIOSProvider requires a -Password argument that this
@@ -99,6 +106,13 @@ Function Enable-DellTPM {
 		If ($TpmSetting) {
 			if ($TpmSetting.CurrentValue -eq "Disabled") {
 				Write-Output "Dell TPM is currently disabled. Enabling it now..."
+				# Suppress the BIOS PPI prompt that would otherwise require a
+				# keypress at next boot to confirm the TPM enable. Setting names
+				# vary across Dell BIOS versions; missing paths are no-ops.
+				# Only the enable-prompt bypass is flipped -- TpmClear/Disable
+				# prompts are left at their default state.
+				Set-Item -Path DellSmbios:\TpmSecurity\TpmPpiBypassEnable -Value Enabled -ErrorAction SilentlyContinue
+				Set-Item -Path DellSmbios:\TpmSecurity\TpmPpiAcpiOptOut   -Value Enabled -ErrorAction SilentlyContinue
 				Set-Item -Path DellSmbios:\TpmSecurity\Tpm -Value Enabled -ErrorAction Stop
 
 				# Some Dells expose TpmActivation separately; activate if present and not already.
@@ -125,6 +139,9 @@ Function Enable-DellTPM {
 		If ($PttSetting) {
 			if ($PttSetting.CurrentValue -ne "On" -and $PttSetting.CurrentValue -ne "Enabled") {
 				Write-Output "Intel PTT (firmware TPM) is currently disabled. Enabling it now..."
+				# Suppress the BIOS PPI prompt at next boot (see notes on the discrete-TPM path above).
+				Set-Item -Path DellSmbios:\TpmSecurity\TpmPpiBypassEnable -Value Enabled -ErrorAction SilentlyContinue
+				Set-Item -Path DellSmbios:\TpmSecurity\TpmPpiAcpiOptOut   -Value Enabled -ErrorAction SilentlyContinue
 				Set-Item -Path DellSmbios:\AdvancedBootOptions\PttSwitch -Value On -ErrorAction Stop
 
 				$PttSetting = Get-Item -Path DellSmbios:\AdvancedBootOptions\PttSwitch -ErrorAction SilentlyContinue

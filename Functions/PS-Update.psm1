@@ -2231,28 +2231,68 @@ Function Update-WindowsTo11 {
 		}
 	}
 
-	if (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK) {
-		Write-Log "TPM 2.0 not detected. Bypass will be attempted via registry." -Level "WARNING"
-	}
-	if (-not $elig.SecureBoot) {
-		$IsDellHardware = $elig.Manufacturer -match 'Dell' -or $elig.Manufacturer -match 'Alienware'
-		if ($IsDellHardware -and (Get-Command Enable-DellSecureBoot -ErrorAction SilentlyContinue)) {
+	# Dell BIOS remediation: when TPM and/or Secure Boot are missing on Dell hardware,
+	# try to flip them in BIOS via DellBIOSProvider. Both Set-Item calls only queue the
+	# change; the kernel won't reflect it until reboot, so we reboot ONCE after attempting
+	# both and resume the upgrade via AfterRebootScript.
+	$NeedsTpmFix        = (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK)
+	$NeedsSecureBootFix = (-not $elig.SecureBoot)
+	$IsDellHardware     = $elig.Manufacturer -match 'Dell|Alienware'
+
+	if (($NeedsTpmFix -or $NeedsSecureBootFix) -and $IsDellHardware) {
+		$DellBiosChanged = $false
+
+		# TPM remediation
+		if ($NeedsTpmFix -and (Get-Command Enable-DellTPM -ErrorAction SilentlyContinue)) {
+			Write-Log "TPM 2.0 not detected on Dell hardware ($($elig.Manufacturer)). Attempting Enable-DellTPM..." -Level "WARNING"
+			try {
+				Enable-DellTPM
+				# Re-check kernel TPM state. The BIOS change may not take effect until reboot.
+				try {
+					$tpm = Get-Tpm -ErrorAction Stop
+					if ($tpm) {
+						$elig.TPM_Present = [bool]$tpm.TpmPresent
+						$elig.TPM_Ready   = [bool]$tpm.TpmReady
+					}
+					$w32 = Get-CimInstance -Namespace 'root\cimv2\security\microsofttpm' -ClassName Win32_Tpm -ErrorAction Stop
+					if ($w32 -and $w32.SpecVersion) {
+						$specToken = ($w32.SpecVersion -split ',')[0].Trim()
+						$elig.TPM_VersionOK = $specToken -match '^2\.'
+					}
+				} catch {}
+
+				# If still not detected by the kernel, check whether the BIOS-level setting
+				# is now Enabled (queued for next boot). Try discrete TPM first, then PTT.
+				if (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK) {
+					$DellTpm = Get-Item -Path DellSmbios:\TpmSecurity\Tpm -ErrorAction SilentlyContinue
+					if (-not $DellTpm) {
+						$DellTpm = Get-Item -Path DellSmbios:\AdvancedBootOptions\PttSwitch -ErrorAction SilentlyContinue
+					}
+					if ($DellTpm -and ($DellTpm.CurrentValue -eq 'Enabled' -or $DellTpm.CurrentValue -eq 'On')) {
+						$DellBiosChanged = $true
+					}
+				}
+			} catch {
+				Write-Log "Enable-DellTPM failed: $($_.Exception.Message)." -Level "WARNING"
+			}
+
+			if ($elig.TPM_Present -and $elig.TPM_VersionOK) {
+				Write-Log "TPM 2.0 is now detected." -Level "SUCCESS"
+			}
+		}
+
+		# Secure Boot remediation
+		if ($NeedsSecureBootFix -and (Get-Command Enable-DellSecureBoot -ErrorAction SilentlyContinue)) {
 			Write-Log "Secure Boot disabled on Dell hardware ($($elig.Manufacturer)). Attempting Enable-DellSecureBoot..." -Level "WARNING"
-			$DellBiosEnabled = $false
 			try {
 				Enable-DellSecureBoot
-				# Re-check the kernel's Secure Boot state. On most Dell systems the
-				# DellSmbios change does not take effect until the next reboot, so
-				# Confirm-SecureBootUEFI will still report False here.
 				try {
 					$elig.SecureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
 				} catch {}
-				# If the kernel still reports disabled, inspect the BIOS setting directly.
-				# Enable-DellSecureBoot imports DellBIOSProvider, so DellSmbios:\ is available.
 				if (-not $elig.SecureBoot) {
 					$DellSb = Get-Item -Path DellSmbios:\SecureBoot\SecureBoot -ErrorAction SilentlyContinue
 					if ($DellSb -and $DellSb.CurrentValue -eq 'Enabled') {
-						$DellBiosEnabled = $true
+						$DellBiosChanged = $true
 					}
 				}
 			} catch {
@@ -2261,20 +2301,27 @@ Function Update-WindowsTo11 {
 
 			if ($elig.SecureBoot) {
 				Write-Log "Secure Boot is now enabled." -Level "SUCCESS"
-			} elseif ($DellBiosEnabled) {
-				if (Get-Command Restart-ComputerSafely -ErrorAction SilentlyContinue) {
-					Write-Log "Dell BIOS Secure Boot setting is now Enabled; rebooting to apply the change and resuming Update-WindowsTo11 after restart." -Level "WARNING"
-					Restart-ComputerSafely -Force -AfterRebootScript "Update-WindowsTo11 -Force -ShowProgress -Verbose"
-					return
-				} else {
-					Write-Log "Restart-ComputerSafely not available -- please reboot manually and re-run Update-WindowsTo11. Bypass will be attempted via registry for now." -Level "WARNING"
-				}
-			} else {
-				Write-Log "Enable-DellSecureBoot did not flip the BIOS setting. Bypass will be attempted via registry." -Level "WARNING"
 			}
-		} else {
-			Write-Log "Secure Boot not detected. Bypass will be attempted via registry." -Level "WARNING"
 		}
+
+		# Single reboot if either BIOS setting was flipped and a reboot is needed.
+		if ($DellBiosChanged) {
+			if (Get-Command Restart-ComputerSafely -ErrorAction SilentlyContinue) {
+				Write-Log "Dell BIOS prerequisites updated; rebooting to apply and resuming Update-WindowsTo11 after restart." -Level "WARNING"
+				Restart-ComputerSafely -Force -AfterRebootScript "Update-WindowsTo11 -Force -ShowProgress -Verbose"
+				return
+			} else {
+				Write-Log "Restart-ComputerSafely not available -- please reboot manually and re-run Update-WindowsTo11. Bypass will be attempted via registry for now." -Level "WARNING"
+			}
+		}
+	}
+
+	# Fallback warnings: log only what is still missing after any remediation attempt.
+	if (-not $elig.TPM_Present -or -not $elig.TPM_VersionOK) {
+		Write-Log "TPM 2.0 not detected. Bypass will be attempted via registry." -Level "WARNING"
+	}
+	if (-not $elig.SecureBoot) {
+		Write-Log "Secure Boot not detected. Bypass will be attempted via registry." -Level "WARNING"
 	}
 	#endregion
 

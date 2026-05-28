@@ -64,6 +64,86 @@ Function Enable-DellSecureBoot {
 	} Else { Write-Host "This is not a Dell Computer" }
 }
 
+Function Enable-DellTPM {
+	<#
+		.SYNOPSIS
+			On Dell/Alienware systems, attempts to enable TPM via DellBIOSProvider.
+
+		.DESCRIPTION
+			Tries the discrete TPM path (DellSmbios:\TpmSecurity\Tpm) first, then
+			falls back to Intel PTT (DellSmbios:\AdvancedBootOptions\PttSwitch) for
+			firmware-TPM systems. Never touches TpmClear (destructive: wipes keys).
+
+			BIOS changes typically take effect on next reboot, so callers should
+			reboot to actually activate TPM. On Dells with a BIOS Setup admin
+			password, DellBIOSProvider requires a -Password argument that this
+			function does not currently provide; Set-Item will throw and the
+			caller will see the exception.
+
+		.EXAMPLE
+			Enable-DellTPM
+	#>
+	[CmdletBinding()]
+	param()
+
+	$Manufact = (Get-CimInstance -Class Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer
+	If ( $Manufact -match "Dell" -or $Manufact -match "Alienware") {
+		If (-not (Get-Module -Name DellBIOSProvider -ErrorAction SilentlyContinue) ) {
+			Import-Module PowerShellGet -Force
+			Install-Module DellBIOSProvider -Force -ErrorAction SilentlyContinue
+			Import-Module DellBIOSProvider -Force
+		}
+
+		# Discrete TPM first (DellSmbios:\TpmSecurity\Tpm)
+		$TpmSetting = Get-Item -Path DellSmbios:\TpmSecurity\Tpm -ErrorAction SilentlyContinue
+		If ($TpmSetting) {
+			if ($TpmSetting.CurrentValue -eq "Disabled") {
+				Write-Output "Dell TPM is currently disabled. Enabling it now..."
+				Set-Item -Path DellSmbios:\TpmSecurity\Tpm -Value Enabled -ErrorAction Stop
+
+				# Some Dells expose TpmActivation separately; activate if present and not already.
+				$TpmActivation = Get-Item -Path DellSmbios:\TpmSecurity\TpmActivation -ErrorAction SilentlyContinue
+				If ($TpmActivation -and $TpmActivation.CurrentValue -ne "Enabled" -and $TpmActivation.CurrentValue -ne "Activate") {
+					Set-Item -Path DellSmbios:\TpmSecurity\TpmActivation -Value Enabled -ErrorAction SilentlyContinue
+				}
+
+				$TpmSetting = Get-Item -Path DellSmbios:\TpmSecurity\Tpm -ErrorAction SilentlyContinue
+				$TpmSetting
+				if ($TpmSetting.CurrentValue -eq "Enabled") {
+					Write-Output "Dell TPM has been successfully enabled (reboot required to take effect)."
+				} else {
+					Write-Output "Failed to enable Dell TPM."
+				}
+			} else {
+				Write-Output "Dell TPM is already enabled."
+			}
+			Return
+		}
+
+		# Fall back to Intel PTT (firmware TPM) -- common on Dells without discrete TPM
+		$PttSetting = Get-Item -Path DellSmbios:\AdvancedBootOptions\PttSwitch -ErrorAction SilentlyContinue
+		If ($PttSetting) {
+			if ($PttSetting.CurrentValue -ne "On" -and $PttSetting.CurrentValue -ne "Enabled") {
+				Write-Output "Intel PTT (firmware TPM) is currently disabled. Enabling it now..."
+				Set-Item -Path DellSmbios:\AdvancedBootOptions\PttSwitch -Value On -ErrorAction Stop
+
+				$PttSetting = Get-Item -Path DellSmbios:\AdvancedBootOptions\PttSwitch -ErrorAction SilentlyContinue
+				$PttSetting
+				if ($PttSetting.CurrentValue -eq "On" -or $PttSetting.CurrentValue -eq "Enabled") {
+					Write-Output "Intel PTT has been successfully enabled (reboot required to take effect)."
+				} else {
+					Write-Output "Failed to enable Intel PTT."
+				}
+			} else {
+				Write-Output "Intel PTT is already enabled."
+			}
+			Return
+		}
+
+		Write-Output "TPM is not able to be set via PowerShell on this computer (no TpmSecurity\Tpm or AdvancedBootOptions\PttSwitch path)."
+	} Else { Write-Host "This is not a Dell Computer" }
+}
+
 # Function to check and enable Wake Up
 
 Function Enable-DellWakeUpInMorning {

@@ -2152,11 +2152,13 @@ Function Update-WindowsTo11 {
 	#endregion
 
 	#region Eligibility Checks
+	$cs = Get-CimInstance Win32_ComputerSystem
 	$elig = [ordered]@{
 		OS              = $osCaption
 		OSVersion       = $os.Version
 		Architecture    = $os.OSArchitecture
-		RAM_GB          = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+		Manufacturer    = $cs.Manufacturer
+		RAM_GB          = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
 		FreeSysDrive_GB = [math]::Round((Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free / 1GB, 1)
 		TPM_Present     = $false
 		TPM_Ready       = $false
@@ -2233,7 +2235,26 @@ Function Update-WindowsTo11 {
 		Write-Log "TPM 2.0 not detected. Bypass will be attempted via registry." -Level "WARNING"
 	}
 	if (-not $elig.SecureBoot) {
-		Write-Log "Secure Boot not detected. Bypass will be attempted via registry." -Level "WARNING"
+		$IsDellHardware = $elig.Manufacturer -match 'Dell' -or $elig.Manufacturer -match 'Alienware'
+		if ($IsDellHardware -and (Get-Command Enable-DellSecureBoot -ErrorAction SilentlyContinue)) {
+			Write-Log "Secure Boot disabled on Dell hardware ($($elig.Manufacturer)). Attempting Enable-DellSecureBoot..." -Level "WARNING"
+			try {
+				Enable-DellSecureBoot
+				# Re-check Secure Boot; some firmware reports the prior state until reboot.
+				try {
+					$elig.SecureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
+				} catch {}
+				if ($elig.SecureBoot) {
+					Write-Log "Secure Boot is now enabled." -Level "SUCCESS"
+				} else {
+					Write-Log "Enable-DellSecureBoot completed but firmware still reports Secure Boot disabled (a reboot may be required). Bypass will be attempted via registry." -Level "WARNING"
+				}
+			} catch {
+				Write-Log "Enable-DellSecureBoot failed: $($_.Exception.Message). Bypass will be attempted via registry." -Level "WARNING"
+			}
+		} else {
+			Write-Log "Secure Boot not detected. Bypass will be attempted via registry." -Level "WARNING"
+		}
 	}
 	#endregion
 

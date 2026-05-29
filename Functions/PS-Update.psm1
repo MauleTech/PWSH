@@ -1974,8 +1974,9 @@ Function Update-WindowsTo11 {
 
 			$IsKnownDllError = ($SetupProcess.ExitCode -eq [int]0x8007007F) -or ($SetupProcess.ExitCode -eq [int]0xC06D007F)
 			$IsUnknownCode   = -not $SetupExitCodes.ContainsKey($SetupProcess.ExitCode)
+			$IsDllOrUnknown  = $IsKnownDllError -or $IsUnknownCode
 
-			if (($IsKnownDllError -or $IsUnknownCode) -and -not $NoDllSeeding) {
+			if ($IsDllOrUnknown -and -not $NoDllSeeding) {
 				if ($IsKnownDllError) {
 					Write-Log "Exit code matches a known DLL version mismatch -- attempting DLL seeding retry." -Level "WARNING"
 				} else {
@@ -2019,7 +2020,7 @@ Function Update-WindowsTo11 {
 				} else {
 					Write-Log "No DLLs were seeded (sources missing or already matching) -- skipping retry." -Level "WARNING"
 				}
-			} elseif ($IsKnownDllError -or $IsUnknownCode) {
+			} elseif ($IsDllOrUnknown) {
 				# Reached only when -NoDllSeeding suppressed the seeding branch above.
 				Write-Log "Exit code suggests a DLL version mismatch, but -NoDllSeeding was specified -- skipping DLL seeding and System32 modification." -Level "WARNING"
 			} elseif ($ExitInfo.Retryable) {
@@ -2130,9 +2131,9 @@ Function Update-WindowsTo11 {
 		foreach ($key in $PSBoundParameters.Keys) {
 			if ($key -in $ExcludeParams) { continue }
 			$val = $PSBoundParameters[$key]
-			# Switches arrive as [SwitchParameter] (not [bool]) in $PSBoundParameters; emit the
-			# bare -Name only, never "-Name 'True'" which would misbind as a positional value.
-			if ($val -is [System.Management.Automation.SwitchParameter] -or $val -is [bool]) {
+			# A bound switch is a [switch] (SwitchParameter), not a [bool], in $PSBoundParameters;
+			# emit the bare -Name only -- "-Name 'True'" would misbind as a positional value.
+			if ($val -is [switch] -or $val -is [bool]) {
 				if ($val) { $ForwardedParams += "-$key" }
 			} elseif ($val -is [array]) {
 				$escaped = ($val | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
@@ -2192,7 +2193,7 @@ Function Update-WindowsTo11 {
 					else { $WtState = "index $WakeAcIndex" }
 					Write-Log "Allow wake timers is '$WtState' on AC; enabling it so the task can wake the machine." -Level "WARNING"
 					& powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP $WakeTimerGuid 1 2>$null
-					$WtScheme = ((& powercfg /getactivescheme 2>$null) | Out-String)
+					$WtScheme = ((& powercfg /getactivescheme 2>$null) -join ' ')
 					if ($WtScheme -match '([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})') {
 						& powercfg /setactive $Matches[1] 2>$null
 					}
@@ -2497,7 +2498,6 @@ Function Update-WindowsTo11 {
 					} catch {
 						Write-Log "Fido invocation failed: $($_.Exception.Message)" -Level "WARNING"
 					}
-					$UsedMirrorFallback = $false
 
 					if (-not $Win11URL) {
 						Write-Log "Fido failed to generate URL. Using MauleTech mirror as fallback." -Level "WARNING"

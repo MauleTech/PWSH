@@ -1551,6 +1551,14 @@ Function Update-WindowsTo11 {
 	.PARAMETER ShowProgress
 	Run setup.exe with visible progress UI instead of quiet mode (/quiet flag omitted).
 
+	.PARAMETER NoDllSeeding
+	Forcefully disable all DLL seeding. By default, when setup.exe fails with a DLL
+	version-mismatch exit code (0x8007007F / 0xC06D007F) or an unknown exit code, the
+	function seeds the Win11 wdscore.dll and wimgapi.dll from the install media into
+	System32 (backing up the originals to .win10bak) and retries. With this switch
+	set, that seeding step is skipped entirely: System32 is never modified and no
+	services or processes are stopped to release locked DLLs.
+
 	.PARAMETER DownloadUrl
 	A manually-provided direct download URL for the Windows 11 ISO. When specified,
 	the Fido URL-generation step is skipped entirely and this URL is used instead.
@@ -1561,6 +1569,9 @@ Function Update-WindowsTo11 {
 	Accepts any valid [datetime] value. Creates a one-time Windows Scheduled Task
 	that runs as SYSTEM with highest privileges, surviving logoffs and reboots.
 	All other parameters (Force, ShowProgress, etc.) are forwarded to the scheduled run.
+	The task is registered with WakeToRun and the active power plan's AC "Allow
+	wake timers" setting is enabled, so a sleeping or hibernating machine wakes
+	to run it. It starts on AC power only, but is not stopped once it is running.
 
 	Examples:
 	  -ScheduleAt "11:00 PM"           # Tonight (or tomorrow if past 11pm)
@@ -1596,6 +1607,7 @@ Function Update-WindowsTo11 {
 		[switch]$Force,
 		[switch]$DownloadOnly,
 		[switch]$ShowProgress,
+		[switch]$NoDllSeeding,
 		[string]$DownloadUrl,
 		[datetime]$ScheduleAt,
 		[string]$ScheduledTaskName = "MauleTech-UpdateWindowsTo11",
@@ -1667,11 +1679,15 @@ Function Update-WindowsTo11 {
 		exit code, wdscore.dll and wimgapi.dll are seeded from the install media
 		sources into System32 and the upgrade is retried. If the seeded retry still
 		fails, the original Win10 DLLs are restored from .win10bak backups.
+
+		When -NoDllSeeding is set, the seeding step is skipped entirely and System32
+		is never modified, even on DLL-related exit codes.
 		#>
 		param(
 			[Parameter(Mandatory)]
 			[string]$SetupPath,
-			[switch]$ShowProgress
+			[switch]$ShowProgress,
+			[switch]$NoDllSeeding
 		)
 
 		$Result = [PSCustomObject]@{
@@ -1908,9 +1924,11 @@ Function Update-WindowsTo11 {
 
 			Write-Log "Hardware bypass registry keys applied" -Level "SUCCESS"
 
-			# Build setup arguments. /product server is a Microsoft-documented switch
-			# that lowers minimum-requirements gating to Windows Server thresholds,
-			# improving acceptance on machines with marginal hardware.
+			# Build setup arguments. /product server is an undocumented best-effort
+			# workaround that lowers minimum-requirements gating to Windows Server
+			# thresholds. Microsoft has been patching it (blocked in newer 24H2/25H2
+			# builds), so the registry bypass applied above is what reliably does the
+			# work; /product server is kept only as a harmless extra nudge.
 			$SetupArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
 			if (-not $ShowProgress) {
 				$SetupArgs.Add("/quiet") | Out-Null
@@ -1956,8 +1974,9 @@ Function Update-WindowsTo11 {
 
 			$IsKnownDllError = ($SetupProcess.ExitCode -eq [int]0x8007007F) -or ($SetupProcess.ExitCode -eq [int]0xC06D007F)
 			$IsUnknownCode   = -not $SetupExitCodes.ContainsKey($SetupProcess.ExitCode)
+			$IsDllOrUnknown  = $IsKnownDllError -or $IsUnknownCode
 
-			if ($IsKnownDllError -or $IsUnknownCode) {
+			if ($IsDllOrUnknown -and -not $NoDllSeeding) {
 				if ($IsKnownDllError) {
 					Write-Log "Exit code matches a known DLL version mismatch -- attempting DLL seeding retry." -Level "WARNING"
 				} else {
@@ -2001,6 +2020,9 @@ Function Update-WindowsTo11 {
 				} else {
 					Write-Log "No DLLs were seeded (sources missing or already matching) -- skipping retry." -Level "WARNING"
 				}
+			} elseif ($IsDllOrUnknown) {
+				# Reached only when -NoDllSeeding suppressed the seeding branch above.
+				Write-Log "Exit code suggests a DLL version mismatch, but -NoDllSeeding was specified -- skipping DLL seeding and System32 modification." -Level "WARNING"
 			} elseif ($ExitInfo.Retryable) {
 				# Retryable but not DLL-related: retry with fallback args, no seeding.
 				Write-Log "Retrying with minimal arguments..." -Level "WARNING"
@@ -2024,12 +2046,12 @@ Function Update-WindowsTo11 {
 				"C:\IT\Sources\Panther\setuperr.log",
 				"C:\IT\setuperr.log"
 			)
-			foreach ($logPath in $setuperrPaths) {
-				if (Test-Path $logPath) {
-					$hits = Select-String -Path $logPath -Pattern "0x8007007F|GetProcAddress|ERROR_PROC_NOT_FOUND|\.dll" -ErrorAction SilentlyContinue |
+			foreach ($ErrLogPath in $setuperrPaths) {
+				if (Test-Path $ErrLogPath) {
+					$hits = Select-String -Path $ErrLogPath -Pattern "0x8007007F|GetProcAddress|ERROR_PROC_NOT_FOUND|\.dll" -ErrorAction SilentlyContinue |
 						Select-Object -Last 8
 					if ($hits) {
-						Write-Log "Setup error log excerpts ($logPath):" -Level "WARNING"
+						Write-Log "Setup error log excerpts ($ErrLogPath):" -Level "WARNING"
 						foreach ($hit in $hits) { Write-Log "  $($hit.Line.Trim())" -Level "WARNING" }
 					}
 					break
@@ -2109,7 +2131,9 @@ Function Update-WindowsTo11 {
 		foreach ($key in $PSBoundParameters.Keys) {
 			if ($key -in $ExcludeParams) { continue }
 			$val = $PSBoundParameters[$key]
-			if ($val -is [bool]) {
+			# A bound switch is a [switch] (SwitchParameter), not a [bool], in $PSBoundParameters;
+			# emit the bare -Name only -- "-Name 'True'" would misbind as a positional value.
+			if ($val -is [switch] -or $val -is [bool]) {
 				if ($val) { $ForwardedParams += "-$key" }
 			} elseif ($val -is [array]) {
 				$escaped = ($val | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
@@ -2134,8 +2158,13 @@ Function Update-WindowsTo11 {
 		$encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($TaskCommand))
 		$Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
 		$Trigger = New-ScheduledTaskTrigger -Once -At $ScheduleAt
-		# 10-hour execution time limit as a safety cap; task only runs at scheduled time
-		$Settings = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 10)
+		# WakeToRun wakes the machine from sleep/hibernate at the scheduled time. The
+		# task starts on AC power only (DisallowStartIfOnBatteries stays True, since
+		# -AllowStartIfOnBatteries is not passed), but -DontStopIfGoingOnBatteries keeps
+		# a long upgrade running once started even if the machine is later unplugged.
+		# 10-hour ExecutionTimeLimit is a safety cap. WakeToRun needs the active power
+		# plan's "Allow wake timers" enabled to fire, and cannot power on a shut-down PC.
+		$Settings = New-ScheduledTaskSettingsSet -WakeToRun -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 10)
 		$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 		try {
@@ -2143,6 +2172,37 @@ Function Update-WindowsTo11 {
 			Write-Log "Windows 11 upgrade scheduled for $($ScheduleAt.ToString('f'))" -Level "SUCCESS"
 			Write-Log "Task name: $ScheduledTaskName -- visible in Task Scheduler"
 			Write-Log "To cancel: Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false"
+			# WakeToRun only fires if the active power plan allows wake timers, so ensure
+			# the AC (plugged-in) "Allow wake timers" value is Enabled (1). "Important Wake
+			# Timers Only" (2) does NOT wake the machine for a normal scheduled task. The
+			# task starts on AC only, so set just the AC value and leave DC untouched.
+			try {
+				$WakeTimerGuid = 'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d'  # Allow wake timers (under SUB_SLEEP)
+				$WakeAcIndex = $null
+				$WtAcLine = (& powercfg /query SCHEME_CURRENT SUB_SLEEP $WakeTimerGuid 2>$null) |
+					Where-Object { $_ -match 'Current AC Power Setting Index' } | Select-Object -First 1
+				if ($WtAcLine -and ($WtAcLine -match '0x([0-9a-fA-F]+)')) {
+					$WakeAcIndex = [Convert]::ToInt32($Matches[1], 16)
+				}
+				if ($WakeAcIndex -eq 1) {
+					Write-Log "Allow wake timers already enabled (AC); the machine can wake for this task."
+				} else {
+					if ($null -eq $WakeAcIndex) { $WtState = 'unreadable' }
+					elseif ($WakeAcIndex -eq 0) { $WtState = 'Disabled' }
+					elseif ($WakeAcIndex -eq 2) { $WtState = 'Important Wake Timers Only' }
+					else { $WtState = "index $WakeAcIndex" }
+					Write-Log "Allow wake timers is '$WtState' on AC; enabling it so the task can wake the machine." -Level "WARNING"
+					& powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP $WakeTimerGuid 1 2>$null
+					$WtScheme = ((& powercfg /getactivescheme 2>$null) -join ' ')
+					if ($WtScheme -match '([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})') {
+						& powercfg /setactive $Matches[1] 2>$null
+					}
+					Write-Log "Allow wake timers enabled on AC power for the active plan." -Level "SUCCESS"
+				}
+				Write-Log "Reminder: the BIOS/UEFI must also permit wake timers; check pending wakes with 'powercfg /waketimers'."
+			} catch {
+				Write-Log "Could not verify or enable wake timers: $($_.Exception.Message). The task may not wake the machine from sleep." -Level "WARNING"
+			}
 			return
 		} catch {
 			Write-Log "Failed to create scheduled task: $($_.Exception.Message)" -Level "ERROR"
@@ -2308,7 +2368,9 @@ Function Update-WindowsTo11 {
 		if ($DellBiosChanged) {
 			if (Get-Command Restart-ComputerSafely -ErrorAction SilentlyContinue) {
 				Write-Log "Dell BIOS prerequisites updated; rebooting to apply and resuming Update-WindowsTo11 after restart." -Level "WARNING"
-				Restart-ComputerSafely -Force -AfterRebootScript "Update-WindowsTo11 -Force -ShowProgress -Verbose"
+				$ResumeArgs = "-Force -ShowProgress -Verbose"
+				if ($NoDllSeeding) { $ResumeArgs += " -NoDllSeeding" }
+				Restart-ComputerSafely -Force -AfterRebootScript "Update-WindowsTo11 $ResumeArgs"
 				return
 			} else {
 				Write-Log "Restart-ComputerSafely not available -- please reboot manually and re-run Update-WindowsTo11. Bypass will be attempted via registry for now." -Level "WARNING"
@@ -2371,7 +2433,7 @@ Function Update-WindowsTo11 {
 
 			if ($NetworkSetupPath -and -not $DownloadOnly) {
 				Write-Log "Using network installation" -Level "SUCCESS"
-				$SetupResult = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
+				$SetupResult = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress -NoDllSeeding:$NoDllSeeding
 				$SetupSuccessful = $SetupResult.Success
 				if ($SetupResult.BitLockerSuspended) { $BitLockerWasSuspended = $true }
 			}
@@ -2426,10 +2488,16 @@ Function Update-WindowsTo11 {
 					}
 
 					Write-Log "Generating Windows 11 download URL via Fido..."
-					$FidoOutput = & $TempFidoScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $true -Locale "en-US"
-					# Fido may emit multiple lines; extract the last one as the URL
-					$Win11URL = if ($FidoOutput -is [array]) { $FidoOutput[-1] } else { $FidoOutput }
-					$UsedMirrorFallback = $false
+					# Wrap Fido so any failure (param binding, network, GitHub layout change)
+					# falls through to the mirror below instead of aborting the whole upgrade.
+					$Win11URL = $null
+					try {
+						$FidoOutput = & $TempFidoScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl -Locale "en-US"
+						# Fido may emit multiple lines; extract the last one as the URL
+						$Win11URL = if ($FidoOutput -is [array]) { $FidoOutput[-1] } else { $FidoOutput }
+					} catch {
+						Write-Log "Fido invocation failed: $($_.Exception.Message)" -Level "WARNING"
+					}
 
 					if (-not $Win11URL) {
 						Write-Log "Fido failed to generate URL. Using MauleTech mirror as fallback." -Level "WARNING"
@@ -2489,7 +2557,7 @@ Function Update-WindowsTo11 {
 				Write-Log "ISO mounted to ${DriveLetter}:" -Level "SUCCESS"
 				$SetupPath = "${DriveLetter}:\setup.exe"
 
-				$SetupResult = Start-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress
+				$SetupResult = Start-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress -NoDllSeeding:$NoDllSeeding
 				$SetupSuccessful = $SetupResult.Success
 				if ($SetupResult.BitLockerSuspended) { $BitLockerWasSuspended = $true }
 

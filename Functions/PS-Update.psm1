@@ -2154,8 +2154,12 @@ Function Update-WindowsTo11 {
 		$encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($TaskCommand))
 		$Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
 		$Trigger = New-ScheduledTaskTrigger -Once -At $ScheduleAt
-		# 10-hour execution time limit as a safety cap; task only runs at scheduled time
-		$Settings = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 10)
+		# WakeToRun wakes the machine from sleep/hibernate at the scheduled time. The
+		# upgrade is long, so it runs on AC power only: DisallowStartIfOnBatteries stays
+		# True (won't start on battery) and StopIfGoingOnBatteries stays True (stops it
+		# if unplugged mid-run). The 10-hour ExecutionTimeLimit is a safety cap. Note:
+		# WakeToRun needs "Allow wake timers" enabled in the active power plan to fire.
+		$Settings = New-ScheduledTaskSettingsSet -WakeToRun -ExecutionTimeLimit (New-TimeSpan -Hours 10)
 		$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 		try {

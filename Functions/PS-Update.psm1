@@ -1569,6 +1569,9 @@ Function Update-WindowsTo11 {
 	Accepts any valid [datetime] value. Creates a one-time Windows Scheduled Task
 	that runs as SYSTEM with highest privileges, surviving logoffs and reboots.
 	All other parameters (Force, ShowProgress, etc.) are forwarded to the scheduled run.
+	The task is registered with WakeToRun and the active power plan's AC "Allow
+	wake timers" setting is enabled, so a sleeping or hibernating machine wakes
+	to run it. It starts on AC power only, but is not stopped once it is running.
 
 	Examples:
 	  -ScheduleAt "11:00 PM"           # Tonight (or tomorrow if past 11pm)
@@ -2168,6 +2171,37 @@ Function Update-WindowsTo11 {
 			Write-Log "Windows 11 upgrade scheduled for $($ScheduleAt.ToString('f'))" -Level "SUCCESS"
 			Write-Log "Task name: $ScheduledTaskName -- visible in Task Scheduler"
 			Write-Log "To cancel: Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false"
+			# WakeToRun only fires if the active power plan allows wake timers, so ensure
+			# the AC (plugged-in) "Allow wake timers" value is Enabled (1). "Important Wake
+			# Timers Only" (2) does NOT wake the machine for a normal scheduled task. The
+			# task starts on AC only, so set just the AC value and leave DC untouched.
+			try {
+				$WakeTimerGuid = 'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d'  # Allow wake timers (under SUB_SLEEP)
+				$WakeAcIndex = $null
+				$WtAcLine = (& powercfg /query SCHEME_CURRENT SUB_SLEEP $WakeTimerGuid 2>$null) |
+					Where-Object { $_ -match 'Current AC Power Setting Index' } | Select-Object -First 1
+				if ($WtAcLine -and ($WtAcLine -match '0x([0-9a-fA-F]+)')) {
+					$WakeAcIndex = [Convert]::ToInt32($Matches[1], 16)
+				}
+				if ($WakeAcIndex -eq 1) {
+					Write-Log "Allow wake timers already enabled (AC); the machine can wake for this task."
+				} else {
+					if ($null -eq $WakeAcIndex) { $WtState = 'unreadable' }
+					elseif ($WakeAcIndex -eq 0) { $WtState = 'Disabled' }
+					elseif ($WakeAcIndex -eq 2) { $WtState = 'Important Wake Timers Only' }
+					else { $WtState = "index $WakeAcIndex" }
+					Write-Log "Allow wake timers is '$WtState' on AC; enabling it so the task can wake the machine." -Level "WARNING"
+					& powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP $WakeTimerGuid 1 2>$null
+					$WtScheme = ((& powercfg /getactivescheme 2>$null) | Out-String)
+					if ($WtScheme -match '([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})') {
+						& powercfg /setactive $Matches[1] 2>$null
+					}
+					Write-Log "Allow wake timers enabled on AC power for the active plan." -Level "SUCCESS"
+				}
+				Write-Log "Reminder: the BIOS/UEFI must also permit wake timers; check pending wakes with 'powercfg /waketimers'."
+			} catch {
+				Write-Log "Could not verify or enable wake timers: $($_.Exception.Message). The task may not wake the machine from sleep." -Level "WARNING"
+			}
 			return
 		} catch {
 			Write-Log "Failed to create scheduled task: $($_.Exception.Message)" -Level "ERROR"

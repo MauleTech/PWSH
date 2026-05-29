@@ -1921,9 +1921,11 @@ Function Update-WindowsTo11 {
 
 			Write-Log "Hardware bypass registry keys applied" -Level "SUCCESS"
 
-			# Build setup arguments. /product server is a Microsoft-documented switch
-			# that lowers minimum-requirements gating to Windows Server thresholds,
-			# improving acceptance on machines with marginal hardware.
+			# Build setup arguments. /product server is an undocumented best-effort
+			# workaround that lowers minimum-requirements gating to Windows Server
+			# thresholds. Microsoft has been patching it (blocked in newer 24H2/25H2
+			# builds), so the registry bypass applied above is what reliably does the
+			# work; /product server is kept only as a harmless extra nudge.
 			$SetupArgs = [System.Collections.ArrayList]@("/auto", "Upgrade")
 			if (-not $ShowProgress) {
 				$SetupArgs.Add("/quiet") | Out-Null
@@ -2040,12 +2042,12 @@ Function Update-WindowsTo11 {
 				"C:\IT\Sources\Panther\setuperr.log",
 				"C:\IT\setuperr.log"
 			)
-			foreach ($logPath in $setuperrPaths) {
-				if (Test-Path $logPath) {
-					$hits = Select-String -Path $logPath -Pattern "0x8007007F|GetProcAddress|ERROR_PROC_NOT_FOUND|\.dll" -ErrorAction SilentlyContinue |
+			foreach ($ErrLogPath in $setuperrPaths) {
+				if (Test-Path $ErrLogPath) {
+					$hits = Select-String -Path $ErrLogPath -Pattern "0x8007007F|GetProcAddress|ERROR_PROC_NOT_FOUND|\.dll" -ErrorAction SilentlyContinue |
 						Select-Object -Last 8
 					if ($hits) {
-						Write-Log "Setup error log excerpts ($logPath):" -Level "WARNING"
+						Write-Log "Setup error log excerpts ($ErrLogPath):" -Level "WARNING"
 						foreach ($hit in $hits) { Write-Log "  $($hit.Line.Trim())" -Level "WARNING" }
 					}
 					break
@@ -2446,9 +2448,16 @@ Function Update-WindowsTo11 {
 					}
 
 					Write-Log "Generating Windows 11 download URL via Fido..."
-					$FidoOutput = & $TempFidoScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl $true -Locale "en-US"
-					# Fido may emit multiple lines; extract the last one as the URL
-					$Win11URL = if ($FidoOutput -is [array]) { $FidoOutput[-1] } else { $FidoOutput }
+					# Wrap Fido so any failure (param binding, network, GitHub layout change)
+					# falls through to the mirror below instead of aborting the whole upgrade.
+					$Win11URL = $null
+					try {
+						$FidoOutput = & $TempFidoScript -Win "Windows 11" -Rel "25H2" -Ed "Pro" -Lang "English" -Arch "x64" -PlatformArch "x64" -GetUrl -Locale "en-US"
+						# Fido may emit multiple lines; extract the last one as the URL
+						$Win11URL = if ($FidoOutput -is [array]) { $FidoOutput[-1] } else { $FidoOutput }
+					} catch {
+						Write-Log "Fido invocation failed: $($_.Exception.Message)" -Level "WARNING"
+					}
 					$UsedMirrorFallback = $false
 
 					if (-not $Win11URL) {

@@ -1551,6 +1551,14 @@ Function Update-WindowsTo11 {
 	.PARAMETER ShowProgress
 	Run setup.exe with visible progress UI instead of quiet mode (/quiet flag omitted).
 
+	.PARAMETER NoDllSeeding
+	Forcefully disable all DLL seeding. By default, when setup.exe fails with a DLL
+	version-mismatch exit code (0x8007007F / 0xC06D007F) or an unknown exit code, the
+	function seeds the Win11 wdscore.dll and wimgapi.dll from the install media into
+	System32 (backing up the originals to .win10bak) and retries. With this switch
+	set, that seeding step is skipped entirely: System32 is never modified and no
+	services or processes are stopped to release locked DLLs.
+
 	.PARAMETER DownloadUrl
 	A manually-provided direct download URL for the Windows 11 ISO. When specified,
 	the Fido URL-generation step is skipped entirely and this URL is used instead.
@@ -1596,6 +1604,7 @@ Function Update-WindowsTo11 {
 		[switch]$Force,
 		[switch]$DownloadOnly,
 		[switch]$ShowProgress,
+		[switch]$NoDllSeeding,
 		[string]$DownloadUrl,
 		[datetime]$ScheduleAt,
 		[string]$ScheduledTaskName = "MauleTech-UpdateWindowsTo11",
@@ -1667,11 +1676,15 @@ Function Update-WindowsTo11 {
 		exit code, wdscore.dll and wimgapi.dll are seeded from the install media
 		sources into System32 and the upgrade is retried. If the seeded retry still
 		fails, the original Win10 DLLs are restored from .win10bak backups.
+
+		When -NoDllSeeding is set, the seeding step is skipped entirely and System32
+		is never modified, even on DLL-related exit codes.
 		#>
 		param(
 			[Parameter(Mandatory)]
 			[string]$SetupPath,
-			[switch]$ShowProgress
+			[switch]$ShowProgress,
+			[switch]$NoDllSeeding
 		)
 
 		$Result = [PSCustomObject]@{
@@ -1957,7 +1970,7 @@ Function Update-WindowsTo11 {
 			$IsKnownDllError = ($SetupProcess.ExitCode -eq [int]0x8007007F) -or ($SetupProcess.ExitCode -eq [int]0xC06D007F)
 			$IsUnknownCode   = -not $SetupExitCodes.ContainsKey($SetupProcess.ExitCode)
 
-			if ($IsKnownDllError -or $IsUnknownCode) {
+			if (($IsKnownDllError -or $IsUnknownCode) -and -not $NoDllSeeding) {
 				if ($IsKnownDllError) {
 					Write-Log "Exit code matches a known DLL version mismatch -- attempting DLL seeding retry." -Level "WARNING"
 				} else {
@@ -2001,6 +2014,9 @@ Function Update-WindowsTo11 {
 				} else {
 					Write-Log "No DLLs were seeded (sources missing or already matching) -- skipping retry." -Level "WARNING"
 				}
+			} elseif ($IsKnownDllError -or $IsUnknownCode) {
+				# Reached only when -NoDllSeeding suppressed the seeding branch above.
+				Write-Log "Exit code suggests a DLL version mismatch, but -NoDllSeeding was specified -- skipping DLL seeding and System32 modification." -Level "WARNING"
 			} elseif ($ExitInfo.Retryable) {
 				# Retryable but not DLL-related: retry with fallback args, no seeding.
 				Write-Log "Retrying with minimal arguments..." -Level "WARNING"
@@ -2109,7 +2125,9 @@ Function Update-WindowsTo11 {
 		foreach ($key in $PSBoundParameters.Keys) {
 			if ($key -in $ExcludeParams) { continue }
 			$val = $PSBoundParameters[$key]
-			if ($val -is [bool]) {
+			# Switches arrive as [SwitchParameter] (not [bool]) in $PSBoundParameters; emit the
+			# bare -Name only, never "-Name 'True'" which would misbind as a positional value.
+			if ($val -is [System.Management.Automation.SwitchParameter] -or $val -is [bool]) {
 				if ($val) { $ForwardedParams += "-$key" }
 			} elseif ($val -is [array]) {
 				$escaped = ($val | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
@@ -2308,7 +2326,9 @@ Function Update-WindowsTo11 {
 		if ($DellBiosChanged) {
 			if (Get-Command Restart-ComputerSafely -ErrorAction SilentlyContinue) {
 				Write-Log "Dell BIOS prerequisites updated; rebooting to apply and resuming Update-WindowsTo11 after restart." -Level "WARNING"
-				Restart-ComputerSafely -Force -AfterRebootScript "Update-WindowsTo11 -Force -ShowProgress -Verbose"
+				$ResumeArgs = "-Force -ShowProgress -Verbose"
+				if ($NoDllSeeding) { $ResumeArgs += " -NoDllSeeding" }
+				Restart-ComputerSafely -Force -AfterRebootScript "Update-WindowsTo11 $ResumeArgs"
 				return
 			} else {
 				Write-Log "Restart-ComputerSafely not available -- please reboot manually and re-run Update-WindowsTo11. Bypass will be attempted via registry for now." -Level "WARNING"
@@ -2371,7 +2391,7 @@ Function Update-WindowsTo11 {
 
 			if ($NetworkSetupPath -and -not $DownloadOnly) {
 				Write-Log "Using network installation" -Level "SUCCESS"
-				$SetupResult = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress
+				$SetupResult = Start-Win11Setup -SetupPath $NetworkSetupPath -ShowProgress:$ShowProgress -NoDllSeeding:$NoDllSeeding
 				$SetupSuccessful = $SetupResult.Success
 				if ($SetupResult.BitLockerSuspended) { $BitLockerWasSuspended = $true }
 			}
@@ -2489,7 +2509,7 @@ Function Update-WindowsTo11 {
 				Write-Log "ISO mounted to ${DriveLetter}:" -Level "SUCCESS"
 				$SetupPath = "${DriveLetter}:\setup.exe"
 
-				$SetupResult = Start-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress
+				$SetupResult = Start-Win11Setup -SetupPath $SetupPath -ShowProgress:$ShowProgress -NoDllSeeding:$NoDllSeeding
 				$SetupSuccessful = $SetupResult.Success
 				if ($SetupResult.BitLockerSuspended) { $BitLockerWasSuspended = $true }
 

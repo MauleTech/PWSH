@@ -1,6 +1,6 @@
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
-if (-not $ITFolder) { $ITFolder = "$env:SystemDrive\IT" }
+if (-not (Test-Path Variable:ITFolder)) { $ITFolder = "$env:SystemDrive\IT" }
 
 Write-Host "Installing Chocolatey"
 

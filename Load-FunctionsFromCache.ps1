@@ -2,7 +2,10 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 
 $bootTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
-if (-not $ITFolder) {
+# Test-Path Variable:ITFolder avoids reading $ITFolder directly so the bootstrap
+# still works when the caller's session has Set-StrictMode (or Set-PSDebug -Strict)
+# enabled, which would otherwise throw VariableIsUndefined on the bare read.
+if (-not (Test-Path Variable:ITFolder)) {
     $Global:ITFolder = "$Env:SystemDrive\IT"
 }
 

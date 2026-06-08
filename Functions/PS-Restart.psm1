@@ -117,7 +117,10 @@ Function Restart-ComputerSafely {
     #region After-Reboot Script Setup
     if ($AfterRebootScript) {
         $AfterRebootTaskName = "MauleTech-AfterRebootScript"
-        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; $AfterRebootScript; Unregister-ScheduledTask -TaskName '$AfterRebootTaskName' -Confirm:`$false -ErrorAction SilentlyContinue"
+        # Unregister the task FIRST so that if the user's script triggers another reboot
+        # (e.g. Update-WindowsTo11), we don't end up in a reboot loop. Deleting a scheduled
+        # task does not interrupt the running process, so the loader and script still execute.
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "Unregister-ScheduledTask -TaskName '$AfterRebootTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; $LoaderCmd; $AfterRebootScript"
         $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
         $Trigger   = New-ScheduledTaskTrigger -AtStartup
         $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)

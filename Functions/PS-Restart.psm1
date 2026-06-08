@@ -95,7 +95,10 @@ Function Restart-ComputerSafely {
         }
         $ParamString = $ForwardedParams -join ' '
 
-        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; Restart-ComputerSafely $ParamString"
+        # Self-clean by unregistering first so the task does not linger in Task Scheduler.
+        # Deleting a scheduled task does not interrupt the running process, so the loader
+        # and Restart-ComputerSafely call still execute as normal.
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; $LoaderCmd; Restart-ComputerSafely $ParamString"
         $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
         $Trigger   = New-ScheduledTaskTrigger -Once -At $ScheduleAt
         $Settings  = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
@@ -117,7 +120,10 @@ Function Restart-ComputerSafely {
     #region After-Reboot Script Setup
     if ($AfterRebootScript) {
         $AfterRebootTaskName = "MauleTech-AfterRebootScript"
-        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; $AfterRebootScript; Unregister-ScheduledTask -TaskName '$AfterRebootTaskName' -Confirm:`$false -ErrorAction SilentlyContinue"
+        # Unregister the task FIRST so that if the user's script triggers another reboot
+        # (e.g. Update-WindowsTo11), we don't end up in a reboot loop. Deleting a scheduled
+        # task does not interrupt the running process, so the loader and script still execute.
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "Unregister-ScheduledTask -TaskName '$AfterRebootTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; $LoaderCmd; $AfterRebootScript"
         $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
         $Trigger   = New-ScheduledTaskTrigger -AtStartup
         $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)

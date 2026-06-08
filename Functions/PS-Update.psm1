@@ -2145,7 +2145,10 @@ Function Update-WindowsTo11 {
 		}
 		$ParamString = $ForwardedParams -join ' '
 
-		$TaskCommand = "irm ps.mauletech.com | iex; Update-WindowsTo11 $ParamString"
+		# Self-clean by unregistering first so the task does not linger in Task Scheduler.
+		# Deleting a scheduled task does not interrupt the running process, so the loader
+		# and Update-WindowsTo11 call still execute as normal.
+		$TaskCommand = "Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; irm ps.mauletech.com | iex; Update-WindowsTo11 $ParamString"
 
 		# Check for existing task with the same name
 		$existingTask = Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue

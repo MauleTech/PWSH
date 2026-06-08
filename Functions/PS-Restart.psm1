@@ -95,7 +95,10 @@ Function Restart-ComputerSafely {
         }
         $ParamString = $ForwardedParams -join ' '
 
-        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "$LoaderCmd; Restart-ComputerSafely $ParamString"
+        # Self-clean by unregistering first so the task does not linger in Task Scheduler.
+        # Deleting a scheduled task does not interrupt the running process, so the loader
+        # and Restart-ComputerSafely call still execute as normal.
+        $encodedCmd = ConvertTo-EncodedCommand -ScriptBlock "Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; $LoaderCmd; Restart-ComputerSafely $ParamString"
         $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd"
         $Trigger   = New-ScheduledTaskTrigger -Once -At $ScheduleAt
         $Settings  = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)

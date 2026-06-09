@@ -243,43 +243,6 @@ Function Remove-DuplicateDrivers {
 	}
 }
 
-Function Remove-StaleProfiles {
-	$thresholdDays = 731 #Days
-	Write-Host "Checking for stale profiles to clean up"
-	# Get a list of user profiles
-	$profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$thresholdDays) } | Where-Object { $_.Loaded -eq $False } | Where-Object { $_.LocalPath -notmatch 'Remote Support|admin' }
-	If ($profiles) {
-		foreach ($profile in $profiles) {
-			$localPath = $profile.LocalPath
-			Write-Host "Assessing $localPath"
-			$directories = Get-ChildItem -Path $localPath -Directory
-			if ($directories.Count -gt 0) {
-				# Find the most recently modified directory
-				$mostRecentDir = $directories | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-				# Calculate the age in days
-				$ageInDays = (Get-Date) - $mostRecentDir.LastWriteTime
-				Write-Host "$($mostRecentDir.FullName) was most recently updated $([int]$ageInDays.TotalDays) days ago."
-				If ($ageInDays.TotalDays -gt 360) {
-					Write-Host "Deleting $localPath (Last modified: $($mostRecentDir.LastWriteTime))"
-					Write-Host "Deleting inactive profile: $($profile.LocalPath) (SID: $($profile.SID))"
-					$targetSID = $profile.SID
-					$targetPath = $profile.LocalPath
-					# Remove-CimInstance on Win32_UserProfile handles registry + files
-					Remove-CimInstance $profile -Verbose -Confirm:$false
-					Write-Host "Profile $targetSID removed via WMI."
-					# Fallback: force-remove leftover files if WMI didn't fully clean up
-					if (Test-Path $targetPath) {
-						Remove-PathForcefully -Path $targetPath
-						Write-Host "Cleaned up leftover files at $targetPath"
-					}
-				}
-			}
-		}
-	} Else {
-		Write-Host "No profiles older than $thresholdDays days found."
-	}
-}
-
 #endregion Existing Functions
 
 ########################################
@@ -366,7 +329,11 @@ Write-StepStatus -StepName "Disable Reserved Storage"
 # --- Remove stale user profiles (multi-GB per profile) ---
 Write-StepStatus -StepName "Remove stale user profiles" -Start
 If ((Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Caption) -notlike "Microsoft Windows Server*") {
-	Remove-StaleProfiles
+	If (Get-Command -Name Remove-StaleProfiles -ErrorAction SilentlyContinue) {
+		Remove-StaleProfiles -Days 730 -Confirm:$false
+	} Else {
+		Write-Host "Remove-StaleProfiles not found. Load the toolbox first: irm ps.mauletech.com | iex" -ForegroundColor Yellow
+	}
 }
 Write-StepStatus -StepName "Remove stale user profiles"
 
@@ -429,7 +396,7 @@ Write-StepStatus -StepName "Temp folder cleanup" -Start
 }
 Write-StepStatus -StepName "Temp folder cleanup"
 
-# --- Browser caches (Chrome, Edge, Firefox, IE — combined 1-5 GB) ---
+# --- Browser caches (Chrome, Edge, Firefox, IE - combined 1-5 GB) ---
 Write-StepStatus -StepName "Browser cache cleanup" -Start
 
 # Age-based browser cache cleanup
@@ -886,7 +853,7 @@ Enable-NTFSCompression -Path "$Env:SystemRoot\Help"
 Write-StepStatus -StepName "NTFS Compression"
 
 ########################################
-# PHASE 6: EMERGENCY — Windows Search Index (only if <10 GB free)
+# PHASE 6: EMERGENCY - Windows Search Index (only if <10 GB free)
 ########################################
 
 $currentFreeGB = Get-FreeSpaceGB

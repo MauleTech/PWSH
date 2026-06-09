@@ -179,6 +179,7 @@ Enable-SSL #Enables SSL Permanently
   Remove-ITS247InstallFolder
   Remove-PathForcefully
   Remove-StaleObjects
+  Remove-StaleProfiles
 
 [Rename]
 --------

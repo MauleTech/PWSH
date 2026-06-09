@@ -881,6 +881,204 @@ Stop-Transcript | Out-Null
 	}
 }
 
+Function Remove-StaleProfiles {
+<#
+	.SYNOPSIS
+		Removes local user profiles that have had no activity within a given number of days or months.
+
+	.DESCRIPTION
+		Enumerates Win32_UserProfile and removes profiles considered stale. A profile is only
+		removed when ALL of the following are true:
+		  - The profile is not currently loaded.
+		  - The profile is not a special system profile (systemprofile, LocalService, NetworkService).
+		  - The profile path does not match ExcludePattern (default: 'Remote Support|admin').
+		  - The profile was created before the staleness cutoff.
+		  - The most recent activity on the profile is older than the staleness cutoff. Activity is
+		    the newest LastWriteTime found among the profile folder itself, its NTUSER.DAT registry
+		    hive, and its first-level subfolders (hidden folders such as AppData included).
+
+		Win32_UserProfile.LastUseTime is deliberately not used as the activity signal because
+		Windows servicing and antivirus scans update it, making profiles untouched for years
+		appear recently used.
+
+		Removal is performed with Remove-CimInstance, which deletes both the ProfileList registry
+		entry and the profile folder. If files remain afterwards they are force-removed with
+		Remove-PathForcefully. Profile registry entries whose folder no longer exists on disk are
+		treated as orphans and removed. Profiles that cannot be assessed are left alone.
+
+		Deleting a profile permanently destroys any data stored only in that profile. Supports
+		-WhatIf to preview, and prompts for confirmation on each profile when run interactively.
+		Pass -Confirm:$false for unattended use. Requires an elevated (Administrator) session.
+		Use caution on RDS/terminal servers where many profiles are expected.
+
+	.PARAMETER Days
+		Number of days without activity before a profile is considered stale.
+		Defaults to 730 (2 years). Minimum 30 as a safety floor. Cannot be combined with -Months.
+
+	.PARAMETER Months
+		Number of calendar months without activity before a profile is considered stale.
+		Minimum 1. Cannot be combined with -Days.
+
+	.PARAMETER ExcludePattern
+		Case-insensitive regular expression tested against each profile's LocalPath. Matching
+		profiles are never touched. Defaults to 'Remote Support|admin'.
+
+	.PARAMETER PassThru
+		Outputs a result object for each assessed profile (ProfilePath, SID, LastActivity, Action).
+
+	.EXAMPLE
+		Remove-StaleProfiles -WhatIf
+		Previews which profiles would be removed using the default 730-day threshold.
+
+	.EXAMPLE
+		Remove-StaleProfiles -Months 18
+		Interactively removes profiles with no activity in the last 18 months, prompting per profile.
+
+	.EXAMPLE
+		Remove-StaleProfiles -Days 365 -Confirm:$false
+		Removes profiles idle for over a year without prompting. Suitable for RMM deployment.
+
+	.EXAMPLE
+		Remove-StaleProfiles -Days 365 -ExcludePattern 'Remote Support|admin|svc_' -Confirm:$false -PassThru
+		Also protects service account profiles and returns result objects for logging.
+#>
+	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Days')]
+	param (
+		[Parameter(ParameterSetName = 'Days')]
+		[ValidateRange(30, 3650)]
+		[int] $Days = 730,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'Months')]
+		[ValidateRange(1, 120)]
+		[int] $Months,
+
+		[ValidateNotNullOrEmpty()]
+		[string] $ExcludePattern = 'Remote Support|admin',
+
+		[switch] $PassThru
+	)
+
+	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+	If (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Write-Host "Remove-StaleProfiles requires an elevated session. Run as Administrator." -ForegroundColor Red
+		Return
+	}
+
+	# A malformed exclusion regex must fail closed, not fall through to deletions.
+	Try {
+		$null = [regex]::new($ExcludePattern)
+	} Catch {
+		Write-Host "ExcludePattern '$ExcludePattern' is not a valid regular expression: $($_.Exception.Message)" -ForegroundColor Red
+		Return
+	}
+
+	If ($PSCmdlet.ParameterSetName -eq 'Months') {
+		$CutoffDate = (Get-Date).AddMonths(-$Months)
+		$ThresholdText = "$Months month(s)"
+	} Else {
+		$CutoffDate = (Get-Date).AddDays(-$Days)
+		$ThresholdText = "$Days day(s)"
+	}
+
+	Write-Host "Checking for user profiles with no activity since $($CutoffDate.ToString('yyyy-MM-dd')) ($ThresholdText)..." -ForegroundColor Cyan
+
+	Try {
+		# A null CreationTime (seen on damaged profiles) passes the age gate; the activity
+		# check below is still required before anything is removed.
+		$Candidates = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object {
+			($_.Loaded -eq $false) -and
+			($_.Special -ne $true) -and
+			($_.LocalPath) -and
+			($_.LocalPath -notmatch $ExcludePattern) -and
+			((-not $_.CreationTime) -or ($_.CreationTime -lt $CutoffDate))
+		}
+	} Catch {
+		Write-Host "Failed to enumerate user profiles: $($_.Exception.Message)" -ForegroundColor Red
+		Return
+	}
+
+	If (-not $Candidates) {
+		Write-Host "No unloaded user profiles older than $ThresholdText found." -ForegroundColor Green
+		Return
+	}
+
+	$Results = [System.Collections.ArrayList]::new()
+
+	ForEach ($StaleProfile in $Candidates) {
+		$ProfilePath = $StaleProfile.LocalPath
+		$ProfileSID = $StaleProfile.SID
+		Write-Host "Assessing $ProfilePath" -ForegroundColor Cyan
+		$Action = 'Kept'
+		$LastActivity = $null
+
+		If (-not (Test-Path -LiteralPath $ProfilePath)) {
+			If ($PSCmdlet.ShouldProcess("$ProfilePath (SID: $ProfileSID)", "Remove orphaned profile registry entry")) {
+				Try {
+					Remove-CimInstance -InputObject $StaleProfile -ErrorAction Stop
+					Write-Host "Removed orphaned profile entry for $ProfilePath (no folder on disk)." -ForegroundColor Green
+					$Action = 'RemovedOrphan'
+				} Catch {
+					Write-Host "Failed to remove orphaned profile entry for ${ProfilePath}: $($_.Exception.Message)" -ForegroundColor Red
+					$Action = 'Failed'
+				}
+			} Else {
+				$Action = 'Declined'
+			}
+		} Else {
+			$ProfileRoot = Get-Item -LiteralPath $ProfilePath -Force -ErrorAction SilentlyContinue
+			If (-not $ProfileRoot) {
+				Write-Host "Unable to read $ProfilePath. Leaving the profile alone." -ForegroundColor Yellow
+				$Action = 'Unreadable'
+			} Else {
+				$ActivityTimes = @($ProfileRoot.LastWriteTime)
+				$Hive = Get-Item -LiteralPath (Join-Path -Path $ProfilePath -ChildPath 'NTUSER.DAT') -Force -ErrorAction SilentlyContinue
+				If ($Hive) { $ActivityTimes += $Hive.LastWriteTime }
+				$SubDirs = Get-ChildItem -LiteralPath $ProfilePath -Directory -Force -ErrorAction SilentlyContinue
+				If ($SubDirs) { $ActivityTimes += @($SubDirs | ForEach-Object { $_.LastWriteTime }) }
+				$LastActivity = $ActivityTimes | Sort-Object -Descending | Select-Object -First 1
+				$IdleDays = [int][math]::Floor(((Get-Date) - $LastActivity).TotalDays)
+				Write-Host "Most recent activity in $ProfilePath was $IdleDays day(s) ago ($($LastActivity.ToString('yyyy-MM-dd')))."
+
+				If ($LastActivity -ge $CutoffDate) {
+					Write-Host "Keeping $ProfilePath (activity within $ThresholdText)." -ForegroundColor Yellow
+				} ElseIf ($PSCmdlet.ShouldProcess("$ProfilePath (SID: $ProfileSID, idle $IdleDays days)", "Permanently remove user profile and all of its files")) {
+					Try {
+						Remove-CimInstance -InputObject $StaleProfile -ErrorAction Stop
+						Write-Host "Removed profile $ProfilePath (SID: $ProfileSID)." -ForegroundColor Green
+						$Action = 'Removed'
+						If (Test-Path -LiteralPath $ProfilePath) {
+							Write-Host "Folder still present after profile removal. Force-removing leftovers..." -ForegroundColor Yellow
+							Remove-PathForcefully -Path $ProfilePath
+						}
+					} Catch {
+						# Do not force-delete files when profile removal failed; a ProfileList entry
+						# pointing at a gutted folder breaks that user's next logon.
+						Write-Host "Failed to remove profile ${ProfilePath}: $($_.Exception.Message)" -ForegroundColor Red
+						$Action = 'Failed'
+					}
+				} Else {
+					$Action = 'Declined'
+				}
+			}
+		}
+
+		[void]$Results.Add([PSCustomObject]@{
+			ProfilePath  = $ProfilePath
+			SID          = $ProfileSID
+			LastActivity = $LastActivity
+			Action       = $Action
+		})
+	}
+
+	$RemovedCount = @($Results | Where-Object { $_.Action -in @('Removed', 'RemovedOrphan') }).Count
+	$FailedCount = @($Results | Where-Object { $_.Action -eq 'Failed' }).Count
+	Write-Host "Stale profile cleanup complete. Removed: $RemovedCount. Failed: $FailedCount. Assessed: $($Results.Count)." -ForegroundColor Cyan
+	If ($PassThru) {
+		Write-Output $Results
+	}
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

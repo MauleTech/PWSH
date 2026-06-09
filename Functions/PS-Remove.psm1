@@ -893,9 +893,17 @@ Function Remove-StaleProfiles {
 		  - The profile is not a special system profile (systemprofile, LocalService, NetworkService).
 		  - The profile path does not match ExcludePattern (default: 'Remote Support|admin').
 		  - The profile was created before the staleness cutoff.
-		  - The most recent activity on the profile is older than the staleness cutoff. Activity is
-		    the newest LastWriteTime found among the profile folder itself, its NTUSER.DAT registry
-		    hive, and its first-level subfolders (hidden folders such as AppData included).
+		  - The most recent activity on the profile is older than the staleness cutoff.
+
+		Activity is determined the way Windows itself has aged profiles since Windows 10 1809 and
+		Server 2019: from the profile service's load, unload, and cleanup-check timestamps stored
+		under HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID>. These values
+		only change when the profile is genuinely loaded or unloaded (logon/logoff), so Windows
+		Update servicing and antivirus hive scans do not inflate them. On builds where those
+		values are absent, activity falls back to the newest LastWriteTime found among the
+		profile folder itself, its NTUSER.DAT registry hive, and its first-level subfolders
+		(hidden folders such as AppData included). The fallback can be inflated by servicing
+		activity, which errs toward keeping profiles.
 
 		Win32_UserProfile.LastUseTime is deliberately not used as the activity signal because
 		Windows servicing and antivirus scans update it, making profiles untouched for years
@@ -924,7 +932,8 @@ Function Remove-StaleProfiles {
 		profiles are never touched. Defaults to 'Remote Support|admin'.
 
 	.PARAMETER PassThru
-		Outputs a result object for each assessed profile (ProfilePath, SID, LastActivity, Action).
+		Outputs a result object for each assessed profile (ProfilePath, SID, LastActivity,
+		ActivitySource, Action).
 
 	.EXAMPLE
 		Remove-StaleProfiles -WhatIf
@@ -941,6 +950,9 @@ Function Remove-StaleProfiles {
 	.EXAMPLE
 		Remove-StaleProfiles -Days 365 -ExcludePattern 'Remote Support|admin|svc_' -Confirm:$false -PassThru
 		Also protects service account profiles and returns result objects for logging.
+
+	.LINK
+		https://learn.microsoft.com/en-us/troubleshoot/windows-server/support-tools/scripts-to-retrieve-profile-age
 #>
 	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Days')]
 	param (
@@ -957,6 +969,21 @@ Function Remove-StaleProfiles {
 
 		[switch] $PassThru
 	)
+
+	Function Convert-ProfileListTime {
+		# ProfileList stores FILETIMEs as paired DWORDs. PowerShell reads DWORDs back as
+		# signed Int32, so negative values must be restored to their unsigned bit pattern
+		# before the two halves are recombined.
+		param($High, $Low)
+		If ($null -eq $High -or $null -eq $Low) { Return $null }
+		$H = [Int64]$High
+		If ($H -lt 0) { $H += 4294967296 }
+		$L = [Int64]$Low
+		If ($L -lt 0) { $L += 4294967296 }
+		$FileTime = ($H -shl 32) -bor $L
+		If ($FileTime -le 0) { Return $null }
+		Try { Return [datetime]::FromFileTime($FileTime) } Catch { Return $null }
+	}
 
 	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
@@ -1011,6 +1038,7 @@ Function Remove-StaleProfiles {
 		Write-Host "Assessing $ProfilePath" -ForegroundColor Cyan
 		$Action = 'Kept'
 		$LastActivity = $null
+		$ActivitySource = $null
 
 		If (-not (Test-Path -LiteralPath $ProfilePath)) {
 			If ($PSCmdlet.ShouldProcess("$ProfilePath (SID: $ProfileSID)", "Remove orphaned profile registry entry")) {
@@ -1031,14 +1059,35 @@ Function Remove-StaleProfiles {
 				Write-Host "Unable to read $ProfilePath. Leaving the profile alone." -ForegroundColor Yellow
 				$Action = 'Unreadable'
 			} Else {
-				$ActivityTimes = @($ProfileRoot.LastWriteTime)
-				$Hive = Get-Item -LiteralPath (Join-Path -Path $ProfilePath -ChildPath 'NTUSER.DAT') -Force -ErrorAction SilentlyContinue
-				If ($Hive) { $ActivityTimes += $Hive.LastWriteTime }
-				$SubDirs = Get-ChildItem -LiteralPath $ProfilePath -Directory -Force -ErrorAction SilentlyContinue
-				If ($SubDirs) { $ActivityTimes += @($SubDirs | ForEach-Object { $_.LastWriteTime }) }
-				$LastActivity = $ActivityTimes | Sort-Object -Descending | Select-Object -First 1
+				# Primary signal: profile service load/unload/cleanup timestamps. These only
+				# change on a real profile load or unload, unlike file timestamps, which
+				# Windows Update servicing and antivirus hive scans inflate.
+				$RegInfo = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$ProfileSID" -ErrorAction SilentlyContinue
+				If ($RegInfo) {
+					$RegTimes = @()
+					ForEach ($ValueName in 'LocalProfileLoadTime', 'LocalProfileUnLoadTime', 'LocalProfileCleanupCheckTime') {
+						$Converted = Convert-ProfileListTime -High $RegInfo."$($ValueName)High" -Low $RegInfo."$($ValueName)Low"
+						If ($Converted) { $RegTimes += $Converted }
+					}
+					If ($RegTimes) {
+						$LastActivity = $RegTimes | Sort-Object -Descending | Select-Object -First 1
+						$ActivitySource = 'Profile service registry'
+					}
+				}
+
+				If (-not $LastActivity) {
+					# Fallback for builds without profile service timestamps.
+					$ActivityTimes = @($ProfileRoot.LastWriteTime)
+					$Hive = Get-Item -LiteralPath (Join-Path -Path $ProfilePath -ChildPath 'NTUSER.DAT') -Force -ErrorAction SilentlyContinue
+					If ($Hive) { $ActivityTimes += $Hive.LastWriteTime }
+					$SubDirs = Get-ChildItem -LiteralPath $ProfilePath -Directory -Force -ErrorAction SilentlyContinue
+					If ($SubDirs) { $ActivityTimes += @($SubDirs | ForEach-Object { $_.LastWriteTime }) }
+					$LastActivity = $ActivityTimes | Sort-Object -Descending | Select-Object -First 1
+					$ActivitySource = 'File timestamps'
+				}
+
 				$IdleDays = [int][math]::Floor(((Get-Date) - $LastActivity).TotalDays)
-				Write-Host "Most recent activity in $ProfilePath was $IdleDays day(s) ago ($($LastActivity.ToString('yyyy-MM-dd')))."
+				Write-Host "Most recent activity on $ProfilePath was $IdleDays day(s) ago ($($LastActivity.ToString('yyyy-MM-dd'))). Source: $ActivitySource."
 
 				If ($LastActivity -ge $CutoffDate) {
 					Write-Host "Keeping $ProfilePath (activity within $ThresholdText)." -ForegroundColor Yellow
@@ -1064,10 +1113,11 @@ Function Remove-StaleProfiles {
 		}
 
 		[void]$Results.Add([PSCustomObject]@{
-			ProfilePath  = $ProfilePath
-			SID          = $ProfileSID
-			LastActivity = $LastActivity
-			Action       = $Action
+			ProfilePath    = $ProfilePath
+			SID            = $ProfileSID
+			LastActivity   = $LastActivity
+			ActivitySource = $ActivitySource
+			Action         = $Action
 		})
 	}
 

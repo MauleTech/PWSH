@@ -17,7 +17,8 @@
       "Bash(\"C:/IT/GitHub/MinGit/mingw64/bin/git.exe\" --version 2>&1)",
       "Bash(\"C:/IT/GitHub/MinGit/mingw64/bin/git.exe\" --exec-path 2>&1)",
       "mcp__78df2c80-7ced-45e6-8a52-fb615a478d61__microsoft_docs_search",
-      "mcp__Microsoft_Learn__microsoft_docs_search"
+      "mcp__Microsoft_Learn__microsoft_docs_search",
+      "mcp__Microsoft_Learn__microsoft_docs_fetch"
     ]
   }
 }

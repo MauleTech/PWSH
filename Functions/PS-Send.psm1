@@ -119,7 +119,8 @@ Function Send-Item {
     if ($PSCmdlet.ParameterSetName -eq 'Clipboard') {
         $Text = Get-Clipboard -Raw
         if ([string]::IsNullOrWhiteSpace($Text)) {
-            Write-Host "Clipboard contains no text to send." -ForegroundColor Red
+            Write-Host "Text not detected in the clipboard. Nothing to send." -ForegroundColor Red
+            Write-Host "To send a file or folder instead, use: Send-Item -Path <path>" -ForegroundColor Yellow
             return
         }
     }

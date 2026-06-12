@@ -85,6 +85,9 @@ Function Send-Item {
         Path to the file or folder to send.
     .PARAMETER Text
         Text string to send instead of a file.
+    .PARAMETER Clipboard
+        Sends the current text contents of the clipboard. The clipboard is read first, so
+        the text is captured before the receive command replaces it on the clipboard.
     .PARAMETER Code
         Optional custom code phrase. If omitted, one is generated automatically.
     .EXAMPLE
@@ -93,6 +96,9 @@ Function Send-Item {
         Send-Item -Path C:\Projects\MyFolder -Code "secret-phrase"
     .EXAMPLE
         Send-Item -Text "Hello from the other side"
+    .EXAMPLE
+        Send-Item -Clipboard
+        Sends whatever text is currently on the clipboard.
     #>
     [CmdletBinding(DefaultParameterSetName = 'File')]
     param(
@@ -102,9 +108,22 @@ Function Send-Item {
         [Parameter(Mandatory, ParameterSetName = 'Text')]
         [string]$Text,
 
+        [Parameter(Mandatory, ParameterSetName = 'Clipboard')]
+        [switch]$Clipboard,
+
         [Parameter()]
         [string]$Code
     )
+
+    # Capture clipboard text before the receive command overwrites the clipboard below
+    if ($PSCmdlet.ParameterSetName -eq 'Clipboard') {
+        $Text = Get-Clipboard -Raw
+        if ([string]::IsNullOrWhiteSpace($Text)) {
+            Write-Host "Text not detected in the clipboard. Nothing to send." -ForegroundColor Red
+            Write-Host "To send a file or folder instead, use: Send-Item -Path <path>" -ForegroundColor Yellow
+            return
+        }
+    }
 
     $crocExe = Get-CrocPath
 
@@ -120,11 +139,14 @@ Function Send-Item {
     )
     Set-Clipboard -Value ($receiveLines -join "`r`n")
 
-    if ($PSCmdlet.ParameterSetName -eq 'Text') {
-        $displayLabel = "TEXT: $Text"
-    } else {
+    if ($PSCmdlet.ParameterSetName -eq 'File') {
         $resolvedPath = Resolve-Path -Path $Path -ErrorAction Stop
         $displayLabel = $resolvedPath.ProviderPath
+    } elseif ($PSCmdlet.ParameterSetName -eq 'Clipboard') {
+        $lineCount = ($Text -split "`r`n|`r|`n").Count
+        $displayLabel = "CLIPBOARD TEXT ($($Text.Length) chars, $lineCount lines)"
+    } else {
+        $displayLabel = "TEXT: $Text"
     }
 
     Write-Host ""
@@ -140,10 +162,10 @@ Function Send-Item {
     Write-Host "--------------------------------------------" -ForegroundColor Cyan
 
     # --disable-clipboard prevents croc from overwriting the receive command we put on the clipboard
-    if ($PSCmdlet.ParameterSetName -eq 'Text') {
-        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, '--text', $Text)
-    } else {
+    if ($PSCmdlet.ParameterSetName -eq 'File') {
         $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.ProviderPath)
+    } else {
+        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, '--text', $Text)
     }
 
     & $crocExe @crocArgs

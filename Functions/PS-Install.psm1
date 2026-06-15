@@ -538,7 +538,7 @@ Function Install-ScreenConnect {
 
 		# Direct URL to the ScreenConnect MSI
 		$InstallURL = 'https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi'
-		$InstallHash = '4730B072DAB2C93AEC08964D7D293401887936006B9694DCF2DDA51D3CD37757'
+		$InstallHash = 'B681C26C3CFB8764C2F061AECB4FD46428A83994A026F78D4D679B2585B5088A'
 
 		Try {
 			# Download the installer using Get-FileDownload from MauleTech/PWSH

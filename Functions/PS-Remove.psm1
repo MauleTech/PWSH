@@ -1129,6 +1129,229 @@ Function Remove-StaleProfiles {
 	}
 }
 
+Function Remove-SyncroAgent {
+	<#
+	.SYNOPSIS
+		Removes the Syncro RMM agent from a Windows machine without an uninstall authorization code.
+
+	.DESCRIPTION
+		Built for MSP takeover scenarios where the previous provider's Syncro agent must be
+		removed but the Syncro uninstall token is not available (e.g. the prior IT provider
+		ghosted the client). Performs a manual teardown rather than calling the vendor
+		uninstaller: disables and stops services, kills processes, deletes services with
+		sc.exe, removes scheduled tasks, deletes program and data folders, and cleans the
+		registry.
+
+		The vendor uninstaller is deliberately NOT used. Syncro's uninstaller is what prompts
+		for the authorization code, and run as SYSTEM with no interactive desktop it would hang
+		waiting for input. sc.exe delete is used instead of Remove-Service because Remove-Service
+		does not exist in Windows PowerShell 5.1, which is what most RMM deployment shells use.
+
+		Designed to be pushed as SYSTEM from the new RMM. Idempotent and safe to re-run. Honors
+		-WhatIf and -Confirm. Reuses the MauleTech PWSH library (Remove-PathForcefully,
+		Get-InstalledApplication) when it can be loaded.
+
+	.PARAMETER RemoveSplashtop
+		Also removes the Splashtop Streamer that Syncro bundles for remote control. Off by
+		default so an unrelated or legitimate Splashtop install is not touched. Enable only
+		after confirming the Splashtop instance belongs to Syncro.
+
+	.EXAMPLE
+		Remove-SyncroAgent -Verbose
+		Detects and removes Syncro, logging each step.
+
+	.EXAMPLE
+		Remove-SyncroAgent -WhatIf
+		Shows what would be removed without changing anything.
+
+	.EXAMPLE
+		Remove-SyncroAgent -RemoveSplashtop -Verbose
+		Removes Syncro and its bundled Splashtop Streamer.
+
+	.NOTES
+		Run elevated or as SYSTEM. A reboot may be required to finalize deletion of files that
+		were locked at runtime (Remove-PathForcefully schedules those for delete-on-reboot).
+	#>
+	[CmdletBinding(SupportsShouldProcess = $True, ConfirmImpact = 'Medium')]
+	param(
+		[switch] $RemoveSplashtop
+	)
+
+	# --- Load MauleTech PWSH helpers if not already present in the session ---
+	If (-not (Get-Command Remove-PathForcefully -ErrorAction SilentlyContinue)) {
+		Write-Verbose 'Remove-PathForcefully not found. Attempting to load MauleTech PWSH library.'
+		Try {
+			# 3072|768|192 = TLS 1.2|1.1|1.0 as integers. Literal form so it still parses on old .NET where the named enum members are undefined.
+			[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
+			Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt' | Invoke-Expression
+		} Catch {
+			Write-Verbose "Could not load PWSH library: $($_.Exception.Message). Falling back to built-in removal only."
+		}
+	}
+
+	# --- Warn (do not block) if not elevated ---
+	$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+	If (-not $IsAdmin) { Write-Warning 'Not running elevated. Service and registry removal will likely fail. Run as Administrator or SYSTEM.' }
+
+	# --- Known Syncro component identifiers ---
+	# Wildcard patterns catch every version-specific name in one shot:
+	# Syncro, SyncroLive, SyncroOvermind (display "SyncroRecovery", the watchdog), and legacy Kabuto.*
+	$ServicePatterns = @('Syncro*', 'Kabuto*')
+	$ProcessPatterns = @('Syncro*', 'Kabuto*')
+	$FolderPaths = @(
+		"$env:ProgramFiles\RepairTech\Syncro",
+		"${env:ProgramFiles(x86)}\RepairTech\Syncro",
+		"$env:ProgramFiles\RepairTech\Kabuto",
+		"$env:ProgramData\Syncro",
+		"$env:ProgramData\RepairTech"
+	)
+	$RegPaths = @(
+		'HKLM:\SOFTWARE\RepairTech',
+		'HKLM:\SOFTWARE\WOW6432Node\RepairTech'
+	)
+	$TaskMatch    = 'Syncro|RepairTech|Kabuto'
+	$DisplayMatch = 'Syncro|Kabuto'
+
+	If ($RemoveSplashtop) {
+		Write-Verbose 'RemoveSplashtop set. Splashtop Streamer will also be targeted.'
+		$ServicePatterns += 'SplashtopRemoteService'
+		$ProcessPatterns += @('SRService', 'SRManager', 'SRFeature')
+		$FolderPaths  += @(
+			"$env:ProgramFiles\Splashtop\Splashtop Remote\Server",
+			"${env:ProgramFiles(x86)}\Splashtop\Splashtop Remote\Server"
+		)
+		$DisplayMatch  = 'Syncro|Kabuto|Splashtop'
+	}
+
+	# --- Detection: is anything Syncro present? ---
+	$FoundServices = @(Get-Service -Name $ServicePatterns -ErrorAction SilentlyContinue)
+	$FoundFolders  = $FolderPaths | Where-Object { Test-Path -LiteralPath $_ }
+	$FoundReg      = $RegPaths    | Where-Object { Test-Path -LiteralPath $_ }
+	$AppHit        = $False
+	If (Get-Command Get-InstalledApplication -ErrorAction SilentlyContinue) {
+		$AppHit = [bool](Get-InstalledApplication -Name $DisplayMatch)
+	}
+
+	If (-not ($FoundServices -or $FoundFolders -or $FoundReg -or $AppHit)) {
+		Write-Host 'Syncro does not appear to be installed. Nothing to do.' -ForegroundColor Cyan
+		return [PSCustomObject]@{ Computer = $env:COMPUTERNAME; SyncroFound = $False; Removed = $False; RebootRecommended = $False }
+	}
+
+	Write-Host 'Syncro components detected. Beginning removal.' -ForegroundColor Cyan
+	$RebootRecommended = $False
+
+	# --- 1. Disable startup on ALL matched services first, then stop them. ---
+	# --- Disabling before stopping prevents SyncroOvermind (the watchdog) from relaunching siblings. ---
+	ForEach ($svc in $FoundServices) {
+		If ($PSCmdlet.ShouldProcess($svc.Name, 'Disable service startup')) {
+			Write-Verbose "Disabling service: $($svc.Name)"
+			Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction SilentlyContinue
+		}
+	}
+	ForEach ($svc in $FoundServices) {
+		If ($PSCmdlet.ShouldProcess($svc.Name, 'Stop service')) {
+			Write-Verbose "Stopping service: $($svc.Name)"
+			Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	# --- 2. Kill processes ---
+	$ProcNames = @(Get-Process -Name $ProcessPatterns -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique)
+	ForEach ($pn in $ProcNames) {
+		If ($PSCmdlet.ShouldProcess($pn, 'Stop process')) {
+			Write-Verbose "Stopping process: $pn"
+			Stop-Process -Name $pn -Force -ErrorAction SilentlyContinue
+		}
+	}
+	Start-Sleep -Seconds 3
+
+	# --- 3. Delete services (sc.exe for 5.1 compatibility) ---
+	ForEach ($svc in @(Get-Service -Name $ServicePatterns -ErrorAction SilentlyContinue)) {
+		If ($PSCmdlet.ShouldProcess($svc.Name, 'Delete service')) {
+			Write-Verbose "Deleting service: $($svc.Name)"
+			$null = & "$env:SystemRoot\System32\sc.exe" delete "$($svc.Name)"
+		}
+	}
+
+	# --- 4. Remove scheduled tasks ---
+	$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { ($_.TaskName + $_.TaskPath) -match $TaskMatch }
+	ForEach ($task in $tasks) {
+		If ($PSCmdlet.ShouldProcess("$($task.TaskPath)$($task.TaskName)", 'Unregister scheduled task')) {
+			Write-Verbose "Removing scheduled task: $($task.TaskPath)$($task.TaskName)"
+			Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$False -ErrorAction SilentlyContinue
+		}
+	}
+
+	# --- 5. Delete folders ---
+	ForEach ($path in $FolderPaths) {
+		If (Test-Path -LiteralPath $path) {
+			If ($PSCmdlet.ShouldProcess($path, 'Delete folder')) {
+				Write-Verbose "Removing folder: $path"
+				If (Get-Command Remove-PathForcefully -ErrorAction SilentlyContinue) {
+					Remove-PathForcefully -Path $path
+				} Else {
+					Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+				}
+				If (Test-Path -LiteralPath $path) { $RebootRecommended = $True }
+			}
+		}
+	}
+
+	# --- 6. Clean registry: RepairTech keys ---
+	ForEach ($reg in $RegPaths) {
+		If (Test-Path -LiteralPath $reg) {
+			If ($PSCmdlet.ShouldProcess($reg, 'Remove registry key')) {
+				Write-Verbose "Removing registry key: $reg"
+				Remove-Item -LiteralPath $reg -Recurse -Force -ErrorAction SilentlyContinue
+			}
+		}
+	}
+
+	# --- 6b. Clean registry: Uninstall entries whose DisplayName matches ---
+	$UninstallRoots = @(
+		'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+		'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+	)
+	ForEach ($root in $UninstallRoots) {
+		If (Test-Path -LiteralPath $root) {
+			Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+				$dn = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).DisplayName
+				If ($dn -and $dn -match $DisplayMatch) {
+					If ($PSCmdlet.ShouldProcess("$dn ($($_.PSChildName))", 'Remove Uninstall registry entry')) {
+						Write-Verbose "Removing Uninstall entry: $dn"
+						Remove-Item -LiteralPath $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+					}
+				}
+			}
+		}
+	}
+
+	# --- 7. Verify ---
+	$StillServices = @(Get-Service -Name $ServicePatterns -ErrorAction SilentlyContinue)
+	$StillFolders  = $FolderPaths | Where-Object { Test-Path -LiteralPath $_ }
+	$StillReg      = $RegPaths    | Where-Object { Test-Path -LiteralPath $_ }
+	$Clean         = -not ($StillServices -or $StillReg)
+	$FullyClean    = ($Clean -and -not $StillFolders)
+
+	If ($FullyClean) {
+		Write-Host 'Syncro removal complete. No remaining services, folders, or registry keys detected.' -ForegroundColor Green
+	} ElseIf ($Clean -and $RebootRecommended) {
+		Write-Host 'Syncro services and registry removed. Some files are locked and scheduled for delete-on-reboot. Reboot to finalize.' -ForegroundColor Yellow
+	} Else {
+		Write-Warning 'Some Syncro components could not be removed. Review remaining items below.'
+		If ($StillServices) { Write-Warning ("Remaining services: " + ($StillServices.Name -join ', ')) }
+		If ($StillFolders)  { Write-Warning ("Remaining folders: "  + ($StillFolders  -join ', ')) }
+		If ($StillReg)      { Write-Warning ("Remaining reg keys: " + ($StillReg      -join ', ')) }
+	}
+
+	return [PSCustomObject]@{
+		Computer          = $env:COMPUTERNAME
+		SyncroFound       = $True
+		Removed           = $FullyClean
+		RebootRecommended = $RebootRecommended
+	}
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

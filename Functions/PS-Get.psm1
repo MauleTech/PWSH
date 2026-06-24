@@ -383,7 +383,7 @@ function Get-ADLockedAccount {
 		return
 	}
 
-	# Unlock flow — emit post-unlock state so pipeline reflects actual lock state after operation
+	# Unlock flow - emit post-unlock state so pipeline reflects actual lock state after operation
 	foreach ($user in $results) {
 		$sam = $user.SamAccountName
 
@@ -1227,7 +1227,7 @@ Function Get-FileDownload {
 				$ParallelEligible = $false
 			}
 
-			# Check minimum file size (20 MB threshold — below this the overhead isn't worthwhile)
+			# Check minimum file size (20 MB threshold - below this the overhead isn't worthwhile)
 			If ($ParallelEligible -and $ContentLength -lt 20MB) {
 				Write-Verbose ('Method 0: File is {0:N2} MB, below 20 MB threshold. Skipping parallel download.' -f ($ContentLength / 1MB))
 				$ParallelEligible = $false
@@ -1256,7 +1256,7 @@ Function Get-FileDownload {
 				$SegmentPaths = $Segments | ForEach-Object { $_.TempPath }
 
 				# Self-contained scriptblock that runs in each runspace
-				# No access to outer scope — all values passed via parameters
+				# No access to outer scope - all values passed via parameters
 				[System.Management.Automation.ScriptBlock]$SegmentScriptBlock = {
 					Param(
 						[string]$SegmentURL,
@@ -1376,7 +1376,7 @@ Function Get-FileDownload {
 					ForEach ($Job in @($Completed)) {
 						Try {
 							$JobOutput = $Job.Pipe.EndInvoke($Job.Result)
-							# EndInvoke returns a PSDataCollection — unwrap to the single result object
+							# EndInvoke returns a PSDataCollection - unwrap to the single result object
 							If ($JobOutput -and $JobOutput.Count -gt 0) { $SegmentResults.Add($JobOutput[0]) }
 						} Catch {
 							Write-Verbose "Method 0: EndInvoke failed for a segment: $_"
@@ -1394,7 +1394,7 @@ Function Get-FileDownload {
 				$RunspacePool.Dispose()
 				$RunspacePool = $null
 
-				# Evaluate segment results — if any failed, fall through to single-stream methods
+				# Evaluate segment results - if any failed, fall through to single-stream methods
 				$SegmentErrors = [System.Collections.Generic.List[string]]::new()
 				ForEach ($R in $SegmentResults) {
 					If (-not $R.Success) {
@@ -1410,7 +1410,7 @@ Function Get-FileDownload {
 					Write-Verbose "Method 0: Expected $ParallelSegments results, got $($SegmentResults.Count). Aborting merge."
 					$DownloadErrors.Add("ParallelDownload: incomplete segment results ($($SegmentResults.Count)/$ParallelSegments)")
 				} Else {
-					# All segments succeeded — merge temp files into the final file in order
+					# All segments succeeded - merge temp files into the final file in order
 					Write-Verbose 'Method 0: All segments downloaded. Merging...'
 					$MergeStream = $null
 					$MergeSuccess = $false

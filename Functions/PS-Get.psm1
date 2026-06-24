@@ -2119,6 +2119,457 @@ Function Get-NetExtenderStatus {
 	#>
 	}
 
+Function Get-DotNetFrameworkVersion {
+	<#
+	.SYNOPSIS
+		Returns the highest installed .NET Framework 4.x version on the local machine.
+	.DESCRIPTION
+		Reads the Release DWORD from the .NET Framework Setup registry key and maps it to a friendly
+		version number using Microsoft's documented Release thresholds (greater-than-or-equal match).
+	.EXAMPLE
+		Get-DotNetFrameworkVersion
+	.OUTPUTS
+		PSCustomObject with Release (int) and Version (string) properties.
+	#>
+	[CmdletBinding()]
+	Param()
+
+	$RegPath = 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full'
+	$Release = $null
+	If (Test-Path $RegPath) {
+		$Release = (Get-ItemProperty -Path $RegPath -Name Release -ErrorAction SilentlyContinue).Release
+	}
+
+	If ($null -eq $Release) {
+		Return [PSCustomObject]@{ Release = $null; Version = 'Not detected (.NET 4.x missing)' }
+	}
+
+	# Newest first so the first qualifying threshold wins. Values are Microsoft's
+	# documented minimum Release keys for each version.
+	$Map = [ordered]@{
+		533320 = '4.8.1'
+		528040 = '4.8'
+		461808 = '4.7.2'
+		461308 = '4.7.1'
+		460798 = '4.7'
+		394802 = '4.6.2'
+		394254 = '4.6.1'
+		393295 = '4.6'
+		379893 = '4.5.2'
+		378675 = '4.5.1'
+		378389 = '4.5'
+	}
+
+	$Version = "Unknown (Release $Release)"
+	ForEach ($Key in $Map.Keys) {
+		If ($Release -ge $Key) { $Version = $Map[$Key]; break }
+	}
+
+	[PSCustomObject]@{ Release = [int]$Release; Version = $Version }
+}
+
+Function Get-PowerShellHealth {
+	<#
+	.SYNOPSIS
+		Runs a set of health and configuration checks against the local Windows PowerShell 5.1 environment.
+	.DESCRIPTION
+		Get-PowerShellHealth inspects engine version and patch level, .NET Framework version, execution
+		policy (all scopes), language mode, TLS / strong crypto, PSModulePath integrity, PowerShellGet /
+		PackageManagement / NuGet provider state, the PSGallery repository, PSReadLine, PowerShell logging
+		policy, WinRM / remoting, profile scripts, free disk space, console encoding, session errors, and
+		pending reboot.
+
+		Each check is isolated in its own try / catch so one failure never aborts the rest of the report.
+		By default a color coded report is written to the host. Use -PassThru to emit the result objects to
+		the pipeline instead.
+	.PARAMETER PassThru
+		Returns the individual check results as objects on the pipeline instead of the console report.
+	.EXAMPLE
+		Get-PowerShellHealth
+		Runs all checks and prints a color coded report to the console.
+	.EXAMPLE
+		Get-PowerShellHealth -PassThru | Where-Object { $_.Status -eq 'WARN' -or $_.Status -eq 'FAIL' }
+		Returns only the checks that need attention.
+	.EXAMPLE
+		Get-PowerShellHealth -PassThru | Export-Csv C:\IT\Logs\PSHealth.csv -NoTypeInformation
+		Captures the full result set to CSV.
+	.OUTPUTS
+		PSCustomObject (Category, Check, Status, Detail) when -PassThru is used.
+	.NOTES
+		Read only. Safe to run unelevated, though a few checks (WSMan listeners) report more detail when
+		run from an elevated session.
+		Related library functions: Enable-SSL (TLS 1.2 / strong crypto), Update-PowerShellModules,
+		Test-IsElevated, Repair-Windows.
+	#>
+	[CmdletBinding()]
+	Param(
+		[switch]$PassThru
+	)
+
+	# Snapshot the session error count up front. The probing below uses -ErrorAction
+	# SilentlyContinue and try / catch, both of which still append to $Error, so reading
+	# $Error.Count after the checks would mostly reflect this function's own activity.
+	$InitialErrorCount = $Error.Count
+
+	$Results = [System.Collections.Generic.List[object]]::new()
+
+	# Nested helper: record one result row into $Results.
+	Function Add-Result {
+		Param([string]$Category, [string]$Check, [string]$Status, [string]$Detail)
+		$Results.Add([PSCustomObject]@{
+			Category = $Category
+			Check    = $Check
+			Status   = $Status
+			Detail   = $Detail
+		})
+	}
+
+	# Elevation state (a few checks report more detail when elevated).
+	$IsElevated = $false
+	Try {
+		$IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+	} Catch { }
+
+	#region Engine
+	Try {
+		$PSV = $PSVersionTable.PSVersion
+		$Edition = If ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } Else { 'Desktop' }
+		If ($PSV.Major -eq 5 -and $PSV.Minor -eq 1) {
+			Add-Result 'Engine' 'PowerShell version' 'PASS' "$PSV ($Edition edition), host $($Host.Name)"
+		} ElseIf ($PSV.Major -eq 5) {
+			Add-Result 'Engine' 'PowerShell version' 'WARN' "$PSV detected. WMF 5.1 (5.1.x) is recommended on Windows."
+		} Else {
+			Add-Result 'Engine' 'PowerShell version' 'INFO' "$PSV ($Edition). This check targets Windows PowerShell 5.1."
+		}
+		Write-Verbose "Detected PowerShell $PSV ($Edition)"
+		Add-Result 'Engine' 'CLR version' 'INFO' "$($PSVersionTable.CLRVersion)"
+	} Catch {
+		Add-Result 'Engine' 'PowerShell version' 'FAIL' $_.Exception.Message
+	}
+	#endregion
+
+	#region .NET Framework
+	Try {
+		$Net = Get-DotNetFrameworkVersion
+		If ($null -eq $Net.Release) {
+			Add-Result '.NET' '.NET Framework 4.x' 'FAIL' 'No .NET Framework 4.x detected. WMF 5.1 requires at least 4.5.2.'
+		} ElseIf ($Net.Release -lt 379893) {
+			Add-Result '.NET' '.NET Framework 4.x' 'WARN' "Version $($Net.Version) (Release $($Net.Release)). Below the 4.5.2 minimum for WMF 5.1."
+		} ElseIf ($Net.Release -lt 461808) {
+			Add-Result '.NET' '.NET Framework 4.x' 'WARN' "Version $($Net.Version). Meets minimum, but 4.7.2 or newer is recommended."
+		} Else {
+			Add-Result '.NET' '.NET Framework 4.x' 'PASS' "Version $($Net.Version) (Release $($Net.Release))."
+		}
+	} Catch {
+		Add-Result '.NET' '.NET Framework 4.x' 'FAIL' $_.Exception.Message
+	}
+	#endregion
+
+	#region Execution policy
+	Try {
+		ForEach ($P in (Get-ExecutionPolicy -List)) {
+			$St = 'INFO'
+			If (($P.ExecutionPolicy -eq 'Unrestricted' -or $P.ExecutionPolicy -eq 'Bypass') -and ($P.Scope -eq 'LocalMachine' -or $P.Scope -eq 'CurrentUser')) { $St = 'WARN' }
+			Add-Result 'ExecutionPolicy' "Scope $($P.Scope)" $St "$($P.ExecutionPolicy)"
+		}
+		$Effective = Get-ExecutionPolicy
+		If ($Effective -eq 'Restricted') {
+			Add-Result 'ExecutionPolicy' 'Effective policy' 'WARN' "$Effective (scripts blocked; RemoteSigned is typical for managed endpoints)."
+		} Else {
+			Add-Result 'ExecutionPolicy' 'Effective policy' 'PASS' "$Effective"
+		}
+	} Catch {
+		Add-Result 'ExecutionPolicy' 'Execution policy' 'FAIL' $_.Exception.Message
+	}
+	#endregion
+
+	#region Language mode
+	Try {
+		$Lang = $ExecutionContext.SessionState.LanguageMode
+		If ($Lang -eq 'FullLanguage') {
+			Add-Result 'Security' 'Language mode' 'PASS' "$Lang"
+		} Else {
+			Add-Result 'Security' 'Language mode' 'WARN' "$Lang. Constrained or restricted language usually means AppLocker or WDAC is active and may block scripts."
+		}
+	} Catch {
+		Add-Result 'Security' 'Language mode' 'FAIL' $_.Exception.Message
+	}
+	#endregion
+
+	#region TLS / strong crypto
+	Try {
+		$Protocols = [Net.ServicePointManager]::SecurityProtocol
+		If ($Protocols -band [Net.SecurityProtocolType]::Tls12) {
+			Add-Result 'TLS' 'Session security protocol' 'PASS' "Includes TLS 1.2 ($Protocols)."
+		} ElseIf ([int]$Protocols -eq 0) {
+			Add-Result 'TLS' 'Session security protocol' 'INFO' 'SystemDefault. The OS selects the protocol (TLS 1.2 / 1.3 on current Windows).'
+		} Else {
+			Add-Result 'TLS' 'Session security protocol' 'WARN' "$Protocols. TLS 1.2 not enabled in this session. Run Enable-SSL or set [Net.ServicePointManager]::SecurityProtocol."
+		}
+
+		$CryptoPaths = @(
+			'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319',
+			'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319'
+		)
+		$Missing = @()
+		ForEach ($CP in $CryptoPaths) {
+			If (Test-Path $CP) {
+				$Val = (Get-ItemProperty -Path $CP -Name 'SchUseStrongCrypto' -ErrorAction SilentlyContinue).SchUseStrongCrypto
+				If ($Val -ne 1) { $Missing += $CP }
+			}
+		}
+		If ($Missing.Count -eq 0) {
+			Add-Result 'TLS' 'SchUseStrongCrypto (machine)' 'PASS' 'Strong crypto enabled for .NET 4.x.'
+		} Else {
+			Add-Result 'TLS' 'SchUseStrongCrypto (machine)' 'WARN' "Not set on: $($Missing -join '; '). Run Enable-SSL to set this persistently."
+		}
+	} Catch {
+		Add-Result 'TLS' 'TLS / strong crypto' 'FAIL' $_.Exception.Message
+	}
+	#endregion
+
+	#region PSModulePath
+	Try {
+		$Paths = $env:PSModulePath -split ';' | Where-Object { $_ }
+		$Bad = @()
+		ForEach ($Pa in $Paths) {
+			If (-not (Test-Path $Pa)) { $Bad += $Pa }
+		}
+		If ($Bad.Count -eq 0) {
+			Add-Result 'Modules' 'PSModulePath' 'PASS' "$($Paths.Count) path(s), all present."
+		} Else {
+			Add-Result 'Modules' 'PSModulePath' 'WARN' "$($Bad.Count) of $($Paths.Count) path(s) missing: $($Bad -join '; ')"
+		}
+	} Catch {
+		Add-Result 'Modules' 'PSModulePath' 'FAIL' $_.Exception.Message
+	}
+	#endregion
+
+	#region PowerShellGet / PackageManagement
+	Try {
+		$PSGet = Get-Module PowerShellGet -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+		If ($PSGet) {
+			If ($PSGet.Version -lt [version]'2.2.5') {
+				Add-Result 'Modules' 'PowerShellGet' 'WARN' "v$($PSGet.Version). Inbox version is old; v2.2.5+ is recommended for reliable Gallery and TLS support."
+			} Else {
+				Add-Result 'Modules' 'PowerShellGet' 'PASS' "v$($PSGet.Version)"
+			}
+		} Else {
+			Add-Result 'Modules' 'PowerShellGet' 'WARN' 'Not found.'
+		}
+
+		$PkgMgmt = Get-Module PackageManagement -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+		If ($PkgMgmt) {
+			If ($PkgMgmt.Version -lt [version]'1.4.7') {
+				Add-Result 'Modules' 'PackageManagement' 'WARN' "v$($PkgMgmt.Version). v1.4.7+ is recommended."
+			} Else {
+				Add-Result 'Modules' 'PackageManagement' 'PASS' "v$($PkgMgmt.Version)"
+			}
+		} Else {
+			Add-Result 'Modules' 'PackageManagement' 'WARN' 'Not found.'
+		}
+	} Catch {
+		Add-Result 'Modules' 'PowerShellGet / PackageManagement' 'FAIL' $_.Exception.Message
+	}
+	#endregion
+
+	#region NuGet provider
+	Try {
+		$Nuget = Get-PackageProvider -ListAvailable -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'NuGet' } | Sort-Object Version -Descending | Select-Object -First 1
+		If ($Nuget) {
+			Add-Result 'Modules' 'NuGet provider' 'PASS' "v$($Nuget.Version) installed (required for Install-Module)."
+		} Else {
+			Add-Result 'Modules' 'NuGet provider' 'WARN' 'Not installed. Install-Module will prompt to bootstrap it.'
+		}
+	} Catch {
+		Add-Result 'Modules' 'NuGet provider' 'INFO' 'Could not query package providers in this session.'
+	}
+	#endregion
+
+	#region PSGallery
+	Try {
+		$Gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+		If ($Gallery) {
+			If ($Gallery.InstallationPolicy -eq 'Trusted') {
+				Add-Result 'Modules' 'PSGallery repository' 'PASS' 'Registered, InstallationPolicy=Trusted.'
+			} Else {
+				Add-Result 'Modules' 'PSGallery repository' 'INFO' "Registered, InstallationPolicy=$($Gallery.InstallationPolicy)."
+			}
+		} Else {
+			Add-Result 'Modules' 'PSGallery repository' 'WARN' 'PSGallery is not registered.'
+		}
+	} Catch {
+		Add-Result 'Modules' 'PSGallery repository' 'INFO' 'Could not query PSRepository.'
+	}
+	#endregion
+
+	#region PSReadLine
+	Try {
+		$PSRL = Get-Module PSReadLine -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+		If ($PSRL) {
+			If ($PSRL.Version -lt [version]'2.0.0') {
+				Add-Result 'Console' 'PSReadLine' 'WARN' "v$($PSRL.Version). Older 1.x builds have known console rendering bugs; v2.x is recommended."
+			} Else {
+				Add-Result 'Console' 'PSReadLine' 'PASS' "v$($PSRL.Version)"
+			}
+		} Else {
+			Add-Result 'Console' 'PSReadLine' 'INFO' 'Not available.'
+		}
+	} Catch {
+		Add-Result 'Console' 'PSReadLine' 'INFO' $_.Exception.Message
+	}
+	#endregion
+
+	#region Logging policy
+	Try {
+		$Base = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell'
+		$SBL = (Get-ItemProperty -Path "$Base\ScriptBlockLogging" -Name 'EnableScriptBlockLogging' -ErrorAction SilentlyContinue).EnableScriptBlockLogging
+		$Trans = (Get-ItemProperty -Path "$Base\Transcription" -Name 'EnableTranscripting' -ErrorAction SilentlyContinue).EnableTranscripting
+		$ModLog = (Get-ItemProperty -Path "$Base\ModuleLogging" -Name 'EnableModuleLogging' -ErrorAction SilentlyContinue).EnableModuleLogging
+		Add-Result 'Logging' 'Script block logging' 'INFO' $(If ($SBL -eq 1) { 'Enabled' } Else { 'Not enabled' })
+		Add-Result 'Logging' 'Transcription' 'INFO' $(If ($Trans -eq 1) { 'Enabled' } Else { 'Not enabled' })
+		Add-Result 'Logging' 'Module logging' 'INFO' $(If ($ModLog -eq 1) { 'Enabled' } Else { 'Not enabled' })
+	} Catch {
+		Add-Result 'Logging' 'PowerShell logging policy' 'INFO' 'Could not read logging policy.'
+	}
+	#endregion
+
+	#region WinRM / remoting
+	Try {
+		$WinRM = Get-Service -Name WinRM -ErrorAction SilentlyContinue
+		If ($WinRM -and $WinRM.Status -eq 'Running') {
+			$Detail = 'Service running'
+			If ($IsElevated) {
+				$ListenerCount = 0
+				Try { $ListenerCount = @(Get-ChildItem WSMan:\localhost\Listener -ErrorAction SilentlyContinue).Count } Catch { }
+				$Detail += ", $ListenerCount listener(s)"
+			} Else {
+				$Detail += ' (run elevated to enumerate listeners)'
+			}
+			Add-Result 'Remoting' 'WinRM / PSRemoting' 'PASS' $Detail
+		} ElseIf ($WinRM) {
+			Add-Result 'Remoting' 'WinRM / PSRemoting' 'INFO' "WinRM service is $($WinRM.Status). Remoting not active (often expected on workstations)."
+		} Else {
+			Add-Result 'Remoting' 'WinRM / PSRemoting' 'INFO' 'WinRM service not present.'
+		}
+	} Catch {
+		Add-Result 'Remoting' 'WinRM / PSRemoting' 'INFO' $_.Exception.Message
+	}
+	#endregion
+
+	#region Profiles
+	Try {
+		$ProfileMap = [ordered]@{
+			'AllUsersAllHosts'       = $PROFILE.AllUsersAllHosts
+			'AllUsersCurrentHost'    = $PROFILE.AllUsersCurrentHost
+			'CurrentUserAllHosts'    = $PROFILE.CurrentUserAllHosts
+			'CurrentUserCurrentHost' = $PROFILE.CurrentUserCurrentHost
+		}
+		$Found = @()
+		ForEach ($Name in $ProfileMap.Keys) {
+			If (Test-Path $ProfileMap[$Name]) { $Found += $Name }
+		}
+		If ($Found.Count -eq 0) {
+			Add-Result 'Profiles' 'Profile scripts' 'INFO' 'No profile scripts present.'
+		} Else {
+			Add-Result 'Profiles' 'Profile scripts' 'INFO' "Present: $($Found -join ', '). Review these if the session behaves oddly at startup."
+		}
+	} Catch {
+		Add-Result 'Profiles' 'Profile scripts' 'INFO' $_.Exception.Message
+	}
+	#endregion
+
+	#region Disk space
+	Try {
+		$SysDrive = $env:SystemDrive.TrimEnd('\', ':')
+		$Drive = Get-PSDrive -Name $SysDrive -ErrorAction SilentlyContinue
+		If ($Drive) {
+			$FreeGB = [math]::Round($Drive.Free / 1GB, 1)
+			$TotalGB = [math]::Round(($Drive.Free + $Drive.Used) / 1GB, 1)
+			$PctFree = If ($TotalGB -gt 0) { [math]::Round($Drive.Free / ($Drive.Free + $Drive.Used) * 100, 0) } Else { 0 }
+			If ($FreeGB -lt 5 -or $PctFree -lt 10) {
+				Add-Result 'System' 'System drive free space' 'WARN' "$FreeGB GB free of $TotalGB GB ($PctFree%). Low space can cause module and update failures."
+			} Else {
+				Add-Result 'System' 'System drive free space' 'PASS' "$FreeGB GB free of $TotalGB GB ($PctFree%)."
+			}
+		}
+	} Catch {
+		Add-Result 'System' 'System drive free space' 'INFO' $_.Exception.Message
+	}
+	#endregion
+
+	#region Console encoding
+	Try {
+		$OutEnc = [Console]::OutputEncoding.WebName
+		Add-Result 'Console' 'Console output encoding' 'INFO' "$OutEnc (pipeline OutputEncoding: $($OutputEncoding.WebName))"
+	} Catch {
+		Add-Result 'Console' 'Console output encoding' 'INFO' $_.Exception.Message
+	}
+	#endregion
+
+	#region Session errors
+	Try {
+		Add-Result 'Session' 'Errors before health check' 'INFO' "$InitialErrorCount error(s) were already recorded in this session before the health check ran."
+	} Catch { }
+	#endregion
+
+	#region Pending reboot
+	Try {
+		$Reasons = @()
+		If (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $Reasons += 'CBS' }
+		If (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $Reasons += 'WindowsUpdate' }
+		$PFRO = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue).PendingFileRenameOperations
+		If ($PFRO) { $Reasons += 'PendingFileRename' }
+		If ($Reasons.Count -gt 0) {
+			Add-Result 'System' 'Pending reboot' 'WARN' "Reboot pending ($($Reasons -join ', ')). WMF / .NET changes may not be fully applied until reboot."
+		} Else {
+			Add-Result 'System' 'Pending reboot' 'PASS' 'No pending reboot detected.'
+		}
+	} Catch {
+		Add-Result 'System' 'Pending reboot' 'INFO' $_.Exception.Message
+	}
+	#endregion
+
+	# ---- Output ----
+	If ($PassThru) {
+		$Results
+		Return
+	}
+
+	$ColorMap = @{ PASS = 'Green'; WARN = 'Yellow'; FAIL = 'Red'; INFO = 'Cyan' }
+
+	Write-Host ''
+	Write-Host 'Windows PowerShell 5.1 Health Check' -ForegroundColor White
+	Write-Host ('Computer: {0}    User: {1}\{2}    Elevated: {3}' -f $env:COMPUTERNAME, $env:USERDOMAIN, $env:USERNAME, $IsElevated)
+	Write-Host ('Engine:   {0}    Date: {1}' -f $PSVersionTable.PSVersion, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+	Write-Host ('=' * 78)
+
+	$LastCategory = ''
+	ForEach ($R in $Results) {
+		If ($R.Category -ne $LastCategory) {
+			Write-Host ''
+			Write-Host ("-- {0} --" -f $R.Category) -ForegroundColor Gray
+			$LastCategory = $R.Category
+		}
+		$Color = If ($ColorMap.ContainsKey($R.Status)) { $ColorMap[$R.Status] } Else { 'White' }
+		Write-Host ("  [{0}] {1,-26} {2}" -f $R.Status, $R.Check, $R.Detail) -ForegroundColor $Color
+	}
+
+	$Pass = @($Results | Where-Object { $_.Status -eq 'PASS' }).Count
+	$Warn = @($Results | Where-Object { $_.Status -eq 'WARN' }).Count
+	$Fail = @($Results | Where-Object { $_.Status -eq 'FAIL' }).Count
+	$Info = @($Results | Where-Object { $_.Status -eq 'INFO' }).Count
+
+	Write-Host ''
+	Write-Host ('=' * 78)
+	$SummaryColor = If ($Fail -gt 0) { 'Red' } ElseIf ($Warn -gt 0) { 'Yellow' } Else { 'Green' }
+	Write-Host ("Summary: {0} PASS, {1} WARN, {2} FAIL, {3} INFO" -f $Pass, $Warn, $Fail, $Info) -ForegroundColor $SummaryColor
+	If ($Warn -gt 0 -or $Fail -gt 0) {
+		Write-Host 'Tip: pipe -PassThru into Where-Object to capture just the WARN and FAIL items.' -ForegroundColor Gray
+	}
+	Write-Host ''
+}
+
 Function Get-PSWinGetUpdatablePackages {
 	Start-PSWinGet -Command 'Get-WinGetPackage | Where {$_.IsUpdateAvailable -eq $True}'
 }

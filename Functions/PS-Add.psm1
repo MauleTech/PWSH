@@ -725,8 +725,8 @@ server port:i:3389
 
 			Write-Host "Creating Shortcut at $_"
 
-			# Write RDP file with UTF8 encoding
-			$CurrentRDPFile | Out-File $_ -Encoding UTF8
+			# Write RDP file with Unicode encoding
+			$CurrentRDPFile | Out-File $_ -Encoding Unicode
 
 			if (!(Test-Path $_ -ErrorAction SilentlyContinue)) {
 				Write-Error "Unable to create Shortcut at $_"

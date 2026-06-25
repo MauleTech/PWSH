@@ -146,8 +146,11 @@ Function Send-Item {
         # relative path. Passing an absolute path (e.g. D:\Folder) makes the receiver
         # try to recreate D:\Folder, which fails when the receiver has no writable
         # D: drive. See croc issue #809.
-        $sendParent = Split-Path -LiteralPath $resolvedPath.ProviderPath -Parent
-        $sendLeaf   = Split-Path -LiteralPath $resolvedPath.ProviderPath -Leaf
+        # Use .NET path helpers rather than Split-Path: in Windows PowerShell 5.1,
+        # 'Split-Path -LiteralPath' cannot be combined with -Parent or -Leaf (they are
+        # in mutually exclusive parameter sets) and throws AmbiguousParameterSet.
+        $sendParent = [System.IO.Path]::GetDirectoryName($resolvedPath.ProviderPath)
+        $sendLeaf   = [System.IO.Path]::GetFileName($resolvedPath.ProviderPath)
     } elseif ($PSCmdlet.ParameterSetName -eq 'Clipboard') {
         $lineCount = ($Text -split "`r`n|`r|`n").Count
         $displayLabel = "CLIPBOARD TEXT ($($Text.Length) chars, $lineCount lines)"
@@ -172,7 +175,7 @@ Function Send-Item {
         # Run croc from the parent directory and pass only the leaf so the transmitted
         # path is relative (no drive letter). Fall back to the full path for a drive
         # root, which has no leaf to send under.
-        if ([string]::IsNullOrEmpty($sendLeaf)) {
+        if ([string]::IsNullOrEmpty($sendLeaf) -or [string]::IsNullOrEmpty($sendParent)) {
             $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.ProviderPath)
             & $crocExe @crocArgs
         } else {

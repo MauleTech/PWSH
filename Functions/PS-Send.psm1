@@ -142,6 +142,12 @@ Function Send-Item {
     if ($PSCmdlet.ParameterSetName -eq 'File') {
         $resolvedPath = Resolve-Path -Path $Path -ErrorAction Stop
         $displayLabel = $resolvedPath.ProviderPath
+        # Send by leaf name from within the parent directory so croc transmits a
+        # relative path. Passing an absolute path (e.g. D:\Folder) makes the receiver
+        # try to recreate D:\Folder, which fails when the receiver has no writable
+        # D: drive. See croc issue #809.
+        $sendParent = Split-Path -LiteralPath $resolvedPath.ProviderPath -Parent
+        $sendLeaf   = Split-Path -LiteralPath $resolvedPath.ProviderPath -Leaf
     } elseif ($PSCmdlet.ParameterSetName -eq 'Clipboard') {
         $lineCount = ($Text -split "`r`n|`r|`n").Count
         $displayLabel = "CLIPBOARD TEXT ($($Text.Length) chars, $lineCount lines)"
@@ -163,12 +169,25 @@ Function Send-Item {
 
     # --disable-clipboard prevents croc from overwriting the receive command we put on the clipboard
     if ($PSCmdlet.ParameterSetName -eq 'File') {
-        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.ProviderPath)
+        # Run croc from the parent directory and pass only the leaf so the transmitted
+        # path is relative (no drive letter). Fall back to the full path for a drive
+        # root, which has no leaf to send under.
+        if ([string]::IsNullOrEmpty($sendLeaf)) {
+            $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.ProviderPath)
+            & $crocExe @crocArgs
+        } else {
+            Push-Location -LiteralPath $sendParent
+            try {
+                $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $sendLeaf)
+                & $crocExe @crocArgs
+            } finally {
+                Pop-Location
+            }
+        }
     } else {
         $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, '--text', $Text)
+        & $crocExe @crocArgs
     }
-
-    & $crocExe @crocArgs
 }
 
 # SIG # Begin signature block

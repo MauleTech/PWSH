@@ -435,6 +435,7 @@ function Global:Update-ITFunctions {
 # Set up global paths (must survive script scope for exported functions)
 $Global:PWSHFolder      = "$ITFolder\GitHub\PWSH"
 $Global:FunctionsFolder = "$PWSHFolder\Functions"
+$Global:MinGitFolder    = "$ITFolder\GitHub\MinGit"
 
 # Baseline recovery for a failed git bootstrap: delete the MinGit and PWSH working
 # folders so the next attempt downloads MinGit fresh and re-clones the repo. A corrupt
@@ -442,7 +443,7 @@ $Global:FunctionsFolder = "$PWSHFolder\Functions"
 # state) is the cause ~99% of the time, and starting from a clean slate clears it.
 # Deletes are best-effort; any genuine problem resurfaces on the retry and is reported there.
 function Reset-GitWorkspace {
-    foreach ($folder in @("$ITFolder\GitHub\MinGit", "$ITFolder\GitHub\PWSH")) {
+    foreach ($folder in @($Global:MinGitFolder, $Global:PWSHFolder)) {
         if (Test-Path $folder) {
             Write-Host "Removing $folder ..." -ForegroundColor Yellow
             Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
@@ -455,20 +456,20 @@ function Reset-GitWorkspace {
 }
 
 # Acquire git, then clone or update the PWSH repository. Throws on any failure so the
-# caller's retry loop can run Reset-GitWorkspace and try again. Re-resolves the MinGit
-# path and git strategy on every call, so it behaves correctly both on a clean machine
-# and immediately after the MinGit/PWSH folders have been deleted for recovery.
+# caller can run Reset-GitWorkspace and try again. Re-resolves the MinGit path and git
+# strategy on every call, so it behaves correctly both on a clean machine and immediately
+# after the MinGit/PWSH folders have been deleted for recovery.
 function Invoke-GitBootstrap {
-    $Global:GitExePath = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
+    $Global:GitExePath = Resolve-MinGitExe $Global:MinGitFolder
 
     # Three-path git strategy:
     #   1. MinGit already present   -> use it now, check for updates in the background
     #   2. MinGit absent, other git -> use that git now, install MinGit in the background
     #   3. No git at all            -> install MinGit synchronously, then continue
-    $Global:MinGitReady        = $null -ne $Global:GitExePath
+    $mingitReady               = $null -ne $Global:GitExePath
     $Global:MinGitNeedsInstall = $false
 
-    if (-not $Global:MinGitReady) {
+    if (-not $mingitReady) {
         # Look for any usable git to carry this session while MinGit is installed behind the scenes
         $fallbackGit = $null
         foreach ($candidate in $Script:GitCandidatePaths) {
@@ -489,12 +490,12 @@ function Invoke-GitBootstrap {
             if (-not (Install-MinGit)) {
                 throw "MinGit installation failed - cannot proceed without Git."
             }
-            $Global:GitExePath  = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
-            $Global:MinGitReady = $true
+            $Global:GitExePath = Resolve-MinGitExe $Global:MinGitFolder
+            $mingitReady       = $true
         }
     }
 
-    if ($Global:MinGitReady) {
+    if ($mingitReady) {
         $Global:GitCommand = $Global:GitExePath
         $gitBinPath        = Split-Path -Parent $Global:GitExePath
         if (($env:PATH -split ';') -notcontains $gitBinPath) {
@@ -529,25 +530,22 @@ function Invoke-GitBootstrap {
     }
 }
 
-# Run the git bootstrap with one automatic recovery attempt. If any git step fails,
-# delete the MinGit and PWSH folders (corrupt MinGit or a broken local repo is the cause
-# ~99% of the time) and retry the whole sequence once from a clean slate.
-$maxBootstrapAttempts = 2
-for ($attempt = 1; $attempt -le $maxBootstrapAttempts; $attempt++) {
+# Run the git bootstrap. On any git failure, delete the MinGit and PWSH folders (corrupt
+# MinGit or a broken local repo is the cause ~99% of the time) and try the whole sequence
+# once more from a clean slate before giving up.
+try {
+    Invoke-GitBootstrap
+}
+catch {
+    Write-Host "Git bootstrap failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Running baseline recovery (removing MinGit and PWSH folders), then retrying..." -ForegroundColor Yellow
+    Reset-GitWorkspace
     try {
         Invoke-GitBootstrap
-        break
     }
     catch {
-        Write-Host "Git bootstrap failed: $($_.Exception.Message)" -ForegroundColor Red
-        if ($attempt -lt $maxBootstrapAttempts) {
-            Write-Host "Running baseline recovery (removing MinGit and PWSH folders), then retrying..." -ForegroundColor Yellow
-            Reset-GitWorkspace
-        }
-        else {
-            Write-Host "Git bootstrap still failing after baseline recovery. Giving up." -ForegroundColor Red
-            return
-        }
+        Write-Host "Git bootstrap still failing after baseline recovery. Giving up: $($_.Exception.Message)" -ForegroundColor Red
+        return
     }
 }
 
@@ -573,7 +571,7 @@ if (Test-Path $Global:FunctionsFolder) {
             # Always runs when MinGit needs installing; otherwise only when git.exe is
             # older than 7 days (i.e. hasn't been updated this week).
             $runMaintenanceJob = $Global:MinGitNeedsInstall
-            if (-not $runMaintenanceJob -and $Global:MinGitReady) {
+            if (-not $runMaintenanceJob -and ($null -ne $Global:GitExePath)) {
                 $daysSinceUpdate   = ((Get-Date) - (Get-Item $Global:GitExePath).LastWriteTime).TotalDays
                 $runMaintenanceJob = $daysSinceUpdate -gt 7
             }

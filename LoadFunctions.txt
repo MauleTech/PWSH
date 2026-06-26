@@ -435,85 +435,119 @@ function Global:Update-ITFunctions {
 # Set up global paths (must survive script scope for exported functions)
 $Global:PWSHFolder      = "$ITFolder\GitHub\PWSH"
 $Global:FunctionsFolder = "$PWSHFolder\Functions"
-$Global:GitExePath      = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
 
-# Three-path git strategy:
-#   1. MinGit already present   → use it now, check for updates in the background
-#   2. MinGit absent, other git → use that git now, install MinGit in the background
-#   3. No git at all            → install MinGit synchronously, then continue
-$MinGitReady        = $null -ne $Global:GitExePath
-$MinGitNeedsInstall = $false
-
-if (-not $MinGitReady) {
-    # Look for any usable git to carry this session while MinGit is installed behind the scenes
-    $fallbackGit = $null
-    foreach ($candidate in $Script:GitCandidatePaths) {
-        if (Test-Path $candidate) { $fallbackGit = $candidate; break }
-    }
-    if (-not $fallbackGit) {
-        $gitCmd = Get-Command git -ErrorAction SilentlyContinue
-        if ($gitCmd) { $fallbackGit = $gitCmd.Source }
-    }
-
-    if ($fallbackGit) {
-        Write-Host "MinGit not found — using existing git for this session." -ForegroundColor Yellow
-        $Global:GitCommand  = $fallbackGit
-        $MinGitNeedsInstall = $true
-    }
-    else {
-        # No git at all — must block until MinGit is installed
-        if (-not (Install-MinGit)) {
-            Write-Host "Cannot proceed without Git. Exiting." -ForegroundColor Red
-            return
+# Baseline recovery for a failed git bootstrap: delete the MinGit and PWSH working
+# folders so the next attempt downloads MinGit fresh and re-clones the repo. A corrupt
+# MinGit extraction or a broken local repo (stale lock files, partial clone, conflicted
+# state) is the cause ~99% of the time, and starting from a clean slate clears it.
+# Deletes are best-effort; any genuine problem resurfaces on the retry and is reported there.
+function Reset-GitWorkspace {
+    foreach ($folder in @("$ITFolder\GitHub\MinGit", "$ITFolder\GitHub\PWSH")) {
+        if (Test-Path $folder) {
+            Write-Host "Removing $folder ..." -ForegroundColor Yellow
+            Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
         }
-        $Global:GitExePath = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
-        $MinGitReady = $true
     }
+
+    # Drop cached git paths so the next attempt re-resolves them (MinGit was just deleted)
+    $Global:GitExePath = $null
+    $Global:GitCommand = $null
 }
 
-if ($MinGitReady) {
-    $Global:GitCommand = $Global:GitExePath
-    $gitBinPath        = Split-Path -Parent $Global:GitExePath
-    if (($env:PATH -split ';') -notcontains $gitBinPath) {
-        $env:PATH += ";$gitBinPath"
+# Acquire git, then clone or update the PWSH repository. Throws on any failure so the
+# caller's retry loop can run Reset-GitWorkspace and try again. Re-resolves the MinGit
+# path and git strategy on every call, so it behaves correctly both on a clean machine
+# and immediately after the MinGit/PWSH folders have been deleted for recovery.
+function Invoke-GitBootstrap {
+    $Global:GitExePath = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
+
+    # Three-path git strategy:
+    #   1. MinGit already present   -> use it now, check for updates in the background
+    #   2. MinGit absent, other git -> use that git now, install MinGit in the background
+    #   3. No git at all            -> install MinGit synchronously, then continue
+    $Global:MinGitReady        = $null -ne $Global:GitExePath
+    $Global:MinGitNeedsInstall = $false
+
+    if (-not $Global:MinGitReady) {
+        # Look for any usable git to carry this session while MinGit is installed behind the scenes
+        $fallbackGit = $null
+        foreach ($candidate in $Script:GitCandidatePaths) {
+            if (Test-Path $candidate) { $fallbackGit = $candidate; break }
+        }
+        if (-not $fallbackGit) {
+            $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+            if ($gitCmd) { $fallbackGit = $gitCmd.Source }
+        }
+
+        if ($fallbackGit) {
+            Write-Host "MinGit not found - using existing git for this session." -ForegroundColor Yellow
+            $Global:GitCommand         = $fallbackGit
+            $Global:MinGitNeedsInstall = $true
+        }
+        else {
+            # No git at all - must block until MinGit is installed
+            if (-not (Install-MinGit)) {
+                throw "MinGit installation failed - cannot proceed without Git."
+            }
+            $Global:GitExePath  = Resolve-MinGitExe "$ITFolder\GitHub\MinGit"
+            $Global:MinGitReady = $true
+        }
     }
 
-    # Remove legacy PortableGit only once MinGit is confirmed ready — ensures we
-    # always have a working replacement before the deletion happens.
-    $PortableGitFolder = "$ITFolder\GitHub\PortableGit"
-    if (Test-Path $PortableGitFolder) {
-        Write-Warning "Deleting $PortableGitFolder (legacy PortableGit — no longer used). Move it first if another tool placed it there."
-        Remove-Item -Path $PortableGitFolder -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "Legacy PortableGit removed." -ForegroundColor Green
-    }
-}
+    if ($Global:MinGitReady) {
+        $Global:GitCommand = $Global:GitExePath
+        $gitBinPath        = Split-Path -Parent $Global:GitExePath
+        if (($env:PATH -split ';') -notcontains $gitBinPath) {
+            $env:PATH += ";$gitBinPath"
+        }
 
-# Clone or update the PWSH repository
-if (Test-Path $Global:PWSHFolder) {
-    Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
-    try {
+        # Remove legacy PortableGit only once MinGit is confirmed ready - ensures we
+        # always have a working replacement before the deletion happens.
+        $PortableGitFolder = "$ITFolder\GitHub\PortableGit"
+        if (Test-Path $PortableGitFolder) {
+            Write-Warning "Deleting $PortableGitFolder (legacy PortableGit - no longer used). Move it first if another tool placed it there."
+            Remove-Item -Path $PortableGitFolder -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Legacy PortableGit removed." -ForegroundColor Green
+        }
+    }
+
+    # Clone or update the PWSH repository
+    if (Test-Path $Global:PWSHFolder) {
+        Write-Host "Updating existing PowerShell Functions repository..." -ForegroundColor Yellow
         Sync-PWSHRepository
         Write-Host "Repository updated successfully!" -ForegroundColor Green
     }
-    catch {
-        Write-Host "Failed to update repository: $($_.Exception.Message)" -ForegroundColor Red
-        return
-    }
-}
-else {
-    Write-Host "Cloning PowerShell Functions repository..." -ForegroundColor Yellow
-    try {
+    else {
+        Write-Host "Cloning PowerShell Functions repository..." -ForegroundColor Yellow
         [void](New-Item -ItemType Directory -Force -Path "$ITFolder\GitHub")
 
-        # Shallow clone — only latest commit, single branch (faster and smaller)
-        Invoke-Git -GitPath $Global:GitCommand -Arguments @("clone", "--depth", "1", "--single-branch", "https://github.com/MauleTech/PWSH.git", $Global:PWSHFolder) -WorkingDirectory "$ITFolder\GitHub"
+        # Shallow clone - only latest commit, single branch (faster and smaller)
+        Invoke-Git -GitPath $Global:GitCommand -Arguments @("clone", "--depth", "1", "--single-branch", "https://github.com/MauleTech/PWSH.git", $Global:PWSHFolder) -WorkingDirectory "$ITFolder\GitHub" | Out-Null
         Set-GitSafeDirectory -Git $Global:GitCommand -Path $Global:PWSHFolder
 
         Write-Host "Repository cloned successfully!" -ForegroundColor Green
     }
+}
+
+# Run the git bootstrap with one automatic recovery attempt. If any git step fails,
+# delete the MinGit and PWSH folders (corrupt MinGit or a broken local repo is the cause
+# ~99% of the time) and retry the whole sequence once from a clean slate.
+$maxBootstrapAttempts = 2
+for ($attempt = 1; $attempt -le $maxBootstrapAttempts; $attempt++) {
+    try {
+        Invoke-GitBootstrap
+        break
+    }
     catch {
-        Write-Host "Failed to clone repository: $($_.Exception.Message)" -ForegroundColor Red
-        return
+        Write-Host "Git bootstrap failed: $($_.Exception.Message)" -ForegroundColor Red
+        if ($attempt -lt $maxBootstrapAttempts) {
+            Write-Host "Running baseline recovery (removing MinGit and PWSH folders), then retrying..." -ForegroundColor Yellow
+            Reset-GitWorkspace
+        }
+        else {
+            Write-Host "Git bootstrap still failing after baseline recovery. Giving up." -ForegroundColor Red
+            return
+        }
     }
 }
 
@@ -538,8 +572,8 @@ if (Test-Path $Global:FunctionsFolder) {
             # redirect is not hit on every session open when MinGit is already current.
             # Always runs when MinGit needs installing; otherwise only when git.exe is
             # older than 7 days (i.e. hasn't been updated this week).
-            $runMaintenanceJob = $MinGitNeedsInstall
-            if (-not $runMaintenanceJob -and $MinGitReady) {
+            $runMaintenanceJob = $Global:MinGitNeedsInstall
+            if (-not $runMaintenanceJob -and $Global:MinGitReady) {
                 $daysSinceUpdate   = ((Get-Date) - (Get-Item $Global:GitExePath).LastWriteTime).TotalDays
                 $runMaintenanceJob = $daysSinceUpdate -gt 7
             }
@@ -547,7 +581,7 @@ if (Test-Path $Global:FunctionsFolder) {
             if ($runMaintenanceJob) {
                 Get-Job -Name "MinGit-Maintenance" -ErrorAction SilentlyContinue |
                     Where-Object { $_.State -in @('Completed','Failed','Stopped') } | Remove-Job
-                if ($MinGitNeedsInstall) {
+                if ($Global:MinGitNeedsInstall) {
                     Write-Host " - Installing MinGit in the background for future sessions..." -ForegroundColor DarkGray
                 }
                 # ${function:Name} captures the function's ScriptBlock so it can be passed

@@ -226,6 +226,10 @@ Enable-SSL #Enables SSL Permanently
   Start-PSWinGet
   Start-ServerMaintenance
 
+[Test]
+------
+  Test-SmtpRelay
+
 [Uninstall]
 -----------
   Uninstall-Application

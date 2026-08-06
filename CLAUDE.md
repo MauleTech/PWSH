@@ -12,7 +12,7 @@ This runs `LoadFunctions.txt` which bootstraps Git, clones the repo, and dynamic
 
 ## Architecture
 
-- **Functions/** -- 30 verb-based modules (`PS-Install.psm1`, `PS-Get.psm1`, etc.) containing ~158 functions. No `.psd1` manifests; modules are loaded dynamically by `LoadFunctions.txt` via `Import-Module`.
+- **Functions/** -- 31 verb-based modules (`PS-Install.psm1`, `PS-Get.psm1`, etc.) containing ~195 functions. No `.psd1` manifests; modules are loaded dynamically by `LoadFunctions.txt` via `Import-Module`.
 - **Scripts/** -- Scenario-specific scripts (O365 migration, maintenance checks, server reboots).
 - **OneOffs/** -- Ad-hoc utility scripts.
 - **LoadFunctions.txt** -- Master loader: sets execution policy, configures TLS 1.2+, installs/finds MinGit, clones repo, imports all modules.

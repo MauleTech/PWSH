@@ -137,6 +137,90 @@ Function Reset-WindowsSearchIndex {
 	Write-Host "  Windows Search service restarted; index will rebuild."
 }
 
+#region Dell SupportAssist Removal
+
+<#
+	Standing order: Dell SupportAssist is uninstalled wherever it is found, because of its history of
+	vulnerabilities and instability. Dell Command Update is the supported replacement and is
+	deliberately left alone here.
+
+	This runs immediately before the C:\Recovery assessment on purpose. A present SupportAssist
+	install blocks that cleanup (it ships OS Recovery components), so removing it first lets the same
+	run go on to reclaim the folder instead of needing a second pass.
+#>
+Function Invoke-DellSupportAssistRemoval {
+	param(
+		[string]$Pattern = 'SupportAssist'
+	)
+	$outcome = [PSCustomObject]@{
+		Pattern           = $Pattern
+		Found             = @()
+		Removed           = @()
+		Remaining         = @()
+		RemainingServices = @()
+		Decision          = "Skipped"
+		Reason            = $null
+	}
+	if (-not (Get-Command -Name Get-InstalledApplication -ErrorAction SilentlyContinue) -or
+		-not (Get-Command -Name Uninstall-Application -ErrorAction SilentlyContinue)) {
+		$outcome.Reason = "Get-InstalledApplication/Uninstall-Application not loaded. Load the toolbox first: irm ps.mauletech.com | iex"
+		Write-Host "  $($outcome.Reason)" -ForegroundColor Yellow
+		return $outcome
+	}
+
+	# Get-InstalledApplication returns a boolean when given -Name, so call it bare and filter here
+	# to get the actual display names for per-product uninstall calls and for the log.
+	$outcome.Found = @(Get-InstalledApplication | Where-Object { $_.Name -match $Pattern } | Select-Object -ExpandProperty Name -Unique)
+	if ($outcome.Found.Count -eq 0) {
+		$outcome.Decision = "NotPresent"
+		$outcome.Reason = "no installed application matches '$Pattern'"
+		Write-Host "  Dell SupportAssist is not installed; nothing to remove." -ForegroundColor Green
+		return $outcome
+	}
+
+	Write-Host "  Found $($outcome.Found.Count) SupportAssist component(s): $(@($outcome.Found) -join ', ')" -ForegroundColor Cyan
+	# One exact name at a time: Uninstall-Application regex-matches its argument, so the name is
+	# escaped, and its WMI path cannot handle a pattern that matches several products at once.
+	ForEach ($app in $outcome.Found) {
+		Write-Host "  Uninstalling: $app" -ForegroundColor Cyan
+		Try {
+			Uninstall-Application -AppToUninstall ([regex]::Escape($app))
+		} Catch {
+			Write-Host "  Uninstall-Application failed on '$app': $($_.Exception.Message)" -ForegroundColor Yellow
+		}
+	}
+
+	# Uninstall-Application clears its own result variable before returning, so re-query to confirm.
+	$outcome.Remaining = @(Get-InstalledApplication | Where-Object { $_.Name -match $Pattern } | Select-Object -ExpandProperty Name -Unique)
+	$outcome.Removed = @($outcome.Found | Where-Object { $outcome.Remaining -notcontains $_ })
+	$outcome.RemainingServices = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
+		Where-Object { $_.Name -like "*$Pattern*" -or $_.DisplayName -like "*$Pattern*" } |
+		Select-Object -ExpandProperty Name)
+
+	if ($outcome.Remaining.Count -eq 0) {
+		$outcome.Decision = "Removed"
+		$outcome.Reason = "uninstalled $($outcome.Removed.Count) component(s): $(@($outcome.Removed) -join ', ')"
+		Write-Host "  Dell SupportAssist removed." -ForegroundColor Green
+	} elseif ($outcome.Removed.Count -gt 0) {
+		$outcome.Decision = "Partial"
+		$outcome.Reason = "removed $(@($outcome.Removed) -join ', '); still present: $(@($outcome.Remaining) -join ', ')"
+		Write-Host "  Partially removed. Still present: $(@($outcome.Remaining) -join ', ')" -ForegroundColor Yellow
+	} else {
+		$outcome.Decision = "Failed"
+		$outcome.Reason = "could not uninstall: $(@($outcome.Remaining) -join ', ')"
+		Write-Host "  Could not uninstall: $(@($outcome.Remaining) -join ', ')" -ForegroundColor Red
+	}
+	if ($outcome.RemainingServices.Count -gt 0) {
+		# A lingering service will block the C:\Recovery step below. Say so plainly.
+		Write-Host "  SupportAssist service(s) still registered: $(@($outcome.RemainingServices) -join ', ')." -ForegroundColor Yellow
+		Write-Host "  A reboot is likely needed to finish removal; re-run this script afterwards to reclaim C:\Recovery." -ForegroundColor Yellow
+		$outcome.Reason = "$($outcome.Reason); service(s) still registered: $(@($outcome.RemainingServices) -join ', ')"
+	}
+	return $outcome
+}
+
+#endregion Dell SupportAssist Removal
+
 #region OEM Recovery Folder (C:\Recovery) Helpers
 
 <#
@@ -487,12 +571,22 @@ Function Get-OemRecoveryVendorFootprint {
 		Note            = $null
 	}
 	# Dell SupportAssist, HP Support Assistant and Lenovo Vantage families.
+	# Scoped to vendor software that plausibly touches the recovery folder. Deliberately absent:
+	# Dell Command Update (DellClientManagementService, \Dell\Command Update\ tasks), which is the
+	# supported SupportAssist replacement, and Dell Data Vault (DDV*), which is telemetry writing to
+	# ProgramData. Neither touches C:\Recovery, and blocking on them would exclude every Dell machine
+	# permanently. Anything that does reference the folder is still caught by the path check below.
 	$ServicePatterns = @(
-		'*SupportAssist*', 'Dell*Recovery*', 'DellClientManagementService', 'DDV*',
+		'*SupportAssist*', 'Dell*Recovery*',
 		'HPSupportSolutionsFrameworkService', 'HP Support Assistant*', 'HP*Recovery*', 'HPSysInfoCap',
 		'LenovoVantageService', 'ImControllerService', 'Lenovo*Recovery*'
 	)
-	$TaskPathPatterns = @('\Dell\*', '\HP\*', '\Lenovo\*', '\OEM\*')
+	$TaskPathPatterns = @(
+		'\Dell\SupportAssist*', '\Dell\*Recovery*',
+		'\HP\HP Support Assistant*', '\HP\*Recovery*',
+		'\Lenovo\Vantage*', '\Lenovo\*Recovery*',
+		'\OEM\*'
+	)
 	$pathToken = $Path.TrimEnd('\')
 
 	Try {
@@ -1040,6 +1134,13 @@ Write-StepStatus -StepName "Delete Windows upgrade remnants" -Start
 	if (Test-Path $_) { Remove-PathForcefully -Path $_ }
 }
 Write-StepStatus -StepName "Delete Windows upgrade remnants"
+
+# --- Remove Dell SupportAssist (standing order; Dell Command Update is the replacement) ---
+# Runs before the C:\Recovery step so that removing it in this pass also clears the SupportAssist
+# blocker in front of that cleanup.
+Write-StepStatus -StepName "Remove Dell SupportAssist" -Start
+$SupportAssistResult = Invoke-DellSupportAssistRemoval
+Write-StepStatus -StepName "Remove Dell SupportAssist" -Decision $SupportAssistResult.Decision -Reason $SupportAssistResult.Reason
 
 # --- Delete C:\Recovery OEM push-button-reset folder when safe (1-20+ GB on OEM images) ---
 # This is the OEM extensibility folder on the OS volume, not the hidden WinRE partition. Machines
@@ -1641,8 +1742,8 @@ $Script:StepLog | Where-Object { $_.FreedGB -ne 0 -or $_.Decision } | Sort-Objec
 # Steps that made a go/no-go decision explain it here, where the reason is not truncated.
 ForEach ($DecidedStep in @($Script:StepLog | Where-Object { $_.Decision })) {
 	$DecisionColor = "Yellow"
-	if ($DecidedStep.Decision -eq 'Deleted') { $DecisionColor = "Green" }
-	if ($DecidedStep.Decision -eq 'Partial') { $DecisionColor = "Red" }
+	if (@('Deleted', 'Removed', 'NotPresent') -contains $DecidedStep.Decision) { $DecisionColor = "Green" }
+	if (@('Partial', 'Failed') -contains $DecidedStep.Decision) { $DecisionColor = "Red" }
 	Write-Host "  $($DecidedStep.Step) -> $($DecidedStep.Decision): $($DecidedStep.Reason)" -ForegroundColor $DecisionColor
 }
 

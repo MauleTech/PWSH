@@ -1352,6 +1352,460 @@ Function Remove-SyncroAgent {
 	}
 }
 
+Function Remove-UserProfile {
+<#
+	.SYNOPSIS
+		Removes a specific local user profile, stale or not, the way Windows removes it.
+
+	.DESCRIPTION
+		Targeted counterpart to Remove-StaleProfiles. Rather than aging every profile on the
+		machine, this removes the profile you name, no matter how recently it was used. Useful
+		for prepping a machine for a new user, or for rebuilding a corrupt profile (the
+		"You've been signed in with a temporary profile" case).
+
+		A profile can be named by user name, by SID, or by profile folder path. For each match
+		the function:
+		  - Deletes the profile with Remove-CimInstance against Win32_UserProfile, which
+			removes the ProfileList registry entry and the profile folder together. Deleting
+			the folder by hand leaves the registry entry orphaned, which is exactly what makes
+			the next logon land in a temporary profile.
+		  - Force-removes anything left on disk afterwards with Remove-PathForcefully.
+		  - Removes leftover ProfileList entries for the same SID or folder, including the
+			<SID>.bak entry left behind by a failed profile load.
+		  - Removes orphaned ProfileGuid entries that referenced the deleted SID.
+		  - Handles the half-deleted states too: a ProfileList entry whose folder is already
+			gone, and a profile folder that no ProfileList entry points at.
+
+		Never touches the special service profiles (S-1-5-18, S-1-5-19, S-1-5-20), the
+		All Users, Default, Default User, LocalService, NetworkService and Public folders, or
+		the profile of the account running the command.
+
+		Profiles that are currently loaded (the user is still signed in) are skipped unless
+		-Force is supplied. Sign the user out first where possible; removing a loaded profile
+		usually leaves locked files that only clear on reboot.
+
+		Deleting a profile permanently destroys any data stored only in that profile. Use
+		-BackupPath first when the data matters. Supports -WhatIf and prompts per profile;
+		pass -Confirm:$false for unattended RMM use. Requires an elevated session.
+
+	.PARAMETER UserName
+		One or more user names to remove. Matched against the profile folder name (including
+		domain-suffixed folders such as jdoe.CONTOSO) and against the account name the SID
+		resolves to, in either 'jdoe' or 'CONTOSO\jdoe' form. If no profile matches but a
+		leftover folder of that name exists under the profiles directory, the folder is
+		treated as an orphan and removed.
+
+	.PARAMETER SID
+		One or more security identifiers to remove, e.g. 'S-1-5-21-1234567890-...'. Use this
+		when the account is already deleted from AD and the profile shows as "Unknown Account".
+
+	.PARAMETER ProfilePath
+		One or more full profile folder paths to remove, e.g. 'C:\Users\jdoe'. Matched against
+		Win32_UserProfile.LocalPath and against ProfileList\ProfileImagePath.
+
+	.PARAMETER BackupPath
+		Copies the profile folder into this directory before deleting it. Each profile lands in
+		its own timestamped subfolder. The copy uses robocopy with /XJ so the AppData junctions
+		inside a profile do not send it into a loop. If the backup fails, the profile is left
+		alone. The backup destination cannot live inside the profile being removed.
+
+	.PARAMETER Force
+		Removes the profile even if it is currently loaded (the user is signed in). Expect
+		locked files and a reboot to finish the cleanup. Without this switch loaded profiles
+		are reported and skipped.
+
+	.PARAMETER PassThru
+		Outputs a result object for each target (Target, ProfilePath, SID, Loaded, BackupPath,
+		Action).
+
+	.EXAMPLE
+		Remove-UserProfile -UserName jdoe -WhatIf
+		Shows exactly what would be removed for jdoe without changing anything.
+
+	.EXAMPLE
+		Remove-UserProfile -UserName jdoe
+		Removes jdoe's profile and registry entries after a confirmation prompt. Run this with
+		jdoe signed out, then have them sign back in to get a freshly built profile.
+
+	.EXAMPLE
+		Remove-UserProfile -UserName jdoe -BackupPath 'D:\ProfileBackups'
+		Copies C:\Users\jdoe to D:\ProfileBackups\jdoe-20250114-101500 first, then removes the
+		profile. Nothing is deleted if the copy fails.
+
+	.EXAMPLE
+		Remove-UserProfile -UserName 'olduser1','olduser2','contractor' -Confirm:$false
+		Clears several profiles unattended, e.g. when prepping a machine for a new user.
+
+	.EXAMPLE
+		Remove-UserProfile -SID 'S-1-5-21-1004336348-1177238915-682003330-1013' -Confirm:$false
+		Removes a profile whose account no longer exists and shows as "Unknown Account".
+
+	.EXAMPLE
+		Remove-UserProfile -ProfilePath 'C:\Users\jdoe.CONTOSO' -Force -PassThru
+		Removes a domain-suffixed profile even though it is loaded, and returns a result object
+		for logging.
+
+	.LINK
+		https://learn.microsoft.com/en-us/troubleshoot/windows-server/user-profiles-and-logon/delete-user-profile
+
+	.LINK
+		https://learn.microsoft.com/en-us/troubleshoot/windows-server/support-tools/scripts-to-cleanup-profile-folder-information-and-prevent-temp-user-profiles-from-being-created
+#>
+	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'UserName')]
+	param (
+		[Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'UserName')]
+		[ValidateNotNullOrEmpty()]
+		[string[]] $UserName,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'SID')]
+		[ValidatePattern('^S-1-[0-9\-]+$')]
+		[string[]] $SID,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'ProfilePath')]
+		[ValidateNotNullOrEmpty()]
+		[string[]] $ProfilePath,
+
+		[ValidateNotNullOrEmpty()]
+		[string] $BackupPath,
+
+		[switch] $Force,
+
+		[switch] $PassThru
+	)
+
+	$ProfileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+	$ProfileGuidKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileGuid'
+	# Service SIDs and shared/template folders that must never be deleted, per the Microsoft
+	# orphaned-profile cleanup guidance linked above.
+	$ProtectedSIDs = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')
+	$ProtectedNames = @('All Users', 'Default', 'Default User', 'LocalService', 'NetworkService', 'Public')
+
+	Function Get-ProfileRegistryEntry {
+		# Every ProfileList child key, including the <SID>.bak entries that Win32_UserProfile
+		# does not surface.
+		param ([string] $KeyPath)
+		Get-ChildItem -Path $KeyPath -ErrorAction SilentlyContinue | ForEach-Object {
+			$ImagePath = (Get-ItemProperty -LiteralPath $_.PSPath -Name 'ProfileImagePath' -ErrorAction SilentlyContinue).ProfileImagePath
+			[PSCustomObject]@{
+				KeyName  = $_.PSChildName
+				SID      = ($_.PSChildName -replace '\.bak$', '')
+				Path     = $(If ($ImagePath) { $ImagePath.TrimEnd('\') } Else { $null })
+				PSPath   = $_.PSPath
+				IsBackup = ($_.PSChildName -like '*.bak')
+			}
+		}
+	}
+
+	Function Resolve-ProfileAccountName {
+		param ([string] $ProfileSID)
+		If (-not $ProfileSID) { Return $null }
+		Try {
+			Return (New-Object System.Security.Principal.SecurityIdentifier($ProfileSID)).Translate([System.Security.Principal.NTAccount]).Value
+		} Catch {
+			Return $null
+		}
+	}
+
+	Function Test-ProfileNameMatch {
+		param ([string] $Name, [string] $Account, [string] $Path)
+		If ($Path) {
+			$Leaf = Split-Path -Path $Path -Leaf
+			# Domain logons produce jdoe.CONTOSO / jdoe.000 style folders for the same user.
+			If (($Leaf -ieq $Name) -or ($Leaf -ilike ([System.Management.Automation.WildcardPattern]::Escape($Name) + '.*'))) { Return $true }
+		}
+		If ($Account) {
+			If ($Account -ieq $Name) { Return $true }
+			If (($Account -split '\\')[-1] -ieq $Name) { Return $true }
+		}
+		Return $false
+	}
+
+	Function Backup-ProfileFolder {
+		# Robocopy rather than Copy-Item: profile folders contain junctions such as
+		# AppData\Local\Application Data that point back at themselves, and Copy-Item -Recurse
+		# follows them until it dies. /XJ skips them.
+		param ([string] $Source, [string] $Destination)
+		$Robocopy = Join-Path -Path $env:SystemRoot -ChildPath 'System32\robocopy.exe'
+		Try {
+			$null = & $Robocopy $Source $Destination /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:DAT /NFL /NDL /NP /NJH /NJS
+			Return $LASTEXITCODE
+		} Catch {
+			Write-Host "Robocopy could not be run: $($_.Exception.Message)" -ForegroundColor Red
+			Return 16
+		}
+	}
+
+	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+	If (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Write-Host "Remove-UserProfile requires an elevated session. Run as Administrator." -ForegroundColor Red
+		Return
+	}
+	$CurrentSID = $Identity.User.Value
+
+	$ProfilesDirectory = (Get-ItemProperty -Path $ProfileListKey -Name 'ProfilesDirectory' -ErrorAction SilentlyContinue).ProfilesDirectory
+	If (-not $ProfilesDirectory) { $ProfilesDirectory = Join-Path -Path $env:SystemDrive -ChildPath 'Users' }
+	$ProfilesDirectory = $ProfilesDirectory.TrimEnd('\')
+
+	If ($BackupPath) {
+		$BackupPath = $BackupPath.TrimEnd('\')
+		If (-not (Test-Path -LiteralPath $BackupPath)) {
+			Try {
+				$null = New-Item -Path $BackupPath -ItemType Directory -Force -ErrorAction Stop
+			} Catch {
+				Write-Host "Unable to create backup folder ${BackupPath}: $($_.Exception.Message)" -ForegroundColor Red
+				Return
+			}
+		}
+	}
+
+	Try {
+		$AllProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)
+	} Catch {
+		Write-Host "Failed to enumerate user profiles: $($_.Exception.Message)" -ForegroundColor Red
+		Return
+	}
+	$RegEntries = @(Get-ProfileRegistryEntry -KeyPath $ProfileListKey)
+
+	$AccountNameBySID = @{}
+	ForEach ($UserProfile in $AllProfiles) {
+		If ($UserProfile.SID -and -not $AccountNameBySID.ContainsKey($UserProfile.SID)) {
+			$AccountNameBySID[$UserProfile.SID] = Resolve-ProfileAccountName -ProfileSID $UserProfile.SID
+		}
+	}
+
+	Switch ($PSCmdlet.ParameterSetName) {
+		'SID'         { $Targets = $SID }
+		'ProfilePath' { $Targets = $ProfilePath }
+		Default       { $Targets = $UserName }
+	}
+
+	$Results = [System.Collections.ArrayList]::new()
+
+	ForEach ($RawTarget in $Targets) {
+		$Target = "$RawTarget".Trim()
+		If (-not $Target) { Continue }
+
+		# --- Resolve the target to zero or more profiles ---
+		$WorkItems = [System.Collections.ArrayList]::new()
+		$CandidatePath = $null
+		$MatchedProfiles = @()
+
+		Switch ($PSCmdlet.ParameterSetName) {
+			'SID' {
+				$MatchedProfiles = @($AllProfiles | Where-Object { $_.SID -ieq $Target })
+				$CandidatePath = $RegEntries | Where-Object { ($_.SID -ieq $Target) -and $_.Path } | Select-Object -First 1 -ExpandProperty Path
+			}
+			'ProfilePath' {
+				$CandidatePath = $Target.TrimEnd('\')
+				$MatchedProfiles = @($AllProfiles | Where-Object { $_.LocalPath -and ($_.LocalPath.TrimEnd('\') -ieq $CandidatePath) })
+			}
+			Default {
+				$MatchedProfiles = @($AllProfiles | Where-Object {
+					Test-ProfileNameMatch -Name $Target -Account $AccountNameBySID[$_.SID] -Path $_.LocalPath
+				})
+				# A plain user name maps to <ProfilesDirectory>\<name> when nothing else matches.
+				If ($Target.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -lt 0) {
+					$CandidatePath = Join-Path -Path $ProfilesDirectory -ChildPath $Target
+				}
+			}
+		}
+
+		ForEach ($Match in $MatchedProfiles) {
+			[void]$WorkItems.Add([PSCustomObject]@{
+				CimProfile = $Match
+				Path       = $(If ($Match.LocalPath) { $Match.LocalPath.TrimEnd('\') } Else { $null })
+				SID        = $Match.SID
+				Loaded     = [bool]$Match.Loaded
+				Special    = [bool]$Match.Special
+			})
+		}
+
+		If (($WorkItems.Count -eq 0) -and $CandidatePath) {
+			# Nothing in Win32_UserProfile. Look for the half-deleted leftovers: a ProfileList
+			# entry (or .bak entry) pointing at the folder, or a folder with no entry at all.
+			$LeftoverEntries = @($RegEntries | Where-Object { $_.Path -and ($_.Path -ieq $CandidatePath) })
+			If ($PSCmdlet.ParameterSetName -eq 'SID') {
+				$LeftoverEntries += @($RegEntries | Where-Object { $_.SID -ieq $Target })
+			}
+			$LeftoverEntries = @($LeftoverEntries | Sort-Object -Property PSPath -Unique)
+
+			If ($LeftoverEntries -or (Test-Path -LiteralPath $CandidatePath)) {
+				[void]$WorkItems.Add([PSCustomObject]@{
+					CimProfile = $null
+					Path       = $CandidatePath
+					SID        = $(If ($LeftoverEntries) { $LeftoverEntries[0].SID } Else { $null })
+					Loaded     = $false
+					Special    = $false
+				})
+			}
+		}
+
+		If ($WorkItems.Count -eq 0) {
+			Write-Host "No profile found for '$Target'." -ForegroundColor Yellow
+			[void]$Results.Add([PSCustomObject]@{
+				Target = $Target; ProfilePath = $null; SID = $null; Loaded = $false; BackupPath = $null; Action = 'NotFound'
+			})
+			Continue
+		}
+
+		If ($WorkItems.Count -gt 1) {
+			Write-Host "'$Target' matched $($WorkItems.Count) profiles: $(($WorkItems | ForEach-Object { $_.Path }) -join ', ')" -ForegroundColor Yellow
+		}
+
+		# --- Process each resolved profile ---
+		ForEach ($Item in $WorkItems) {
+			$ItemPath = $Item.Path
+			$ItemSID = $Item.SID
+			$Action = 'Skipped'
+			$BackupDestination = $null
+			$Leaf = $null
+			$Display = "SID $ItemSID"
+			If ($ItemPath) {
+				$Leaf = Split-Path -Path $ItemPath -Leaf
+				$Display = $ItemPath
+			}
+
+			Write-Host "Assessing $Display" -ForegroundColor Cyan
+
+			# --- Guards. Anything shared, system owned, or in use by this session is off limits. ---
+			$ProtectReason = $null
+			If ($Item.Special) { $ProtectReason = 'it is a special system profile' }
+			ElseIf ($ItemSID -and ($ProtectedSIDs -contains $ItemSID)) { $ProtectReason = 'it belongs to a well-known service account' }
+			ElseIf ($ItemSID -and ($ItemSID -ieq $CurrentSID)) { $ProtectReason = 'it belongs to the account running this command' }
+			ElseIf ($Leaf -and ($ProtectedNames -icontains $Leaf)) { $ProtectReason = 'it is a shared or template profile folder' }
+			ElseIf ($ItemPath -and ($ItemPath -ieq $ProfilesDirectory)) { $ProtectReason = 'it is the profiles directory itself' }
+			ElseIf ($ItemPath -and ($ItemPath -imatch '^[A-Za-z]:\\?$')) { $ProtectReason = 'it is a drive root' }
+			ElseIf ($ItemPath -and ($ItemPath -ieq $env:SystemRoot.TrimEnd('\'))) { $ProtectReason = 'it is the Windows directory' }
+			ElseIf ($ItemPath -and $ItemPath.StartsWith((Join-Path -Path $env:SystemRoot -ChildPath 'ServiceProfiles\'), [System.StringComparison]::OrdinalIgnoreCase)) { $ProtectReason = 'it is a service account profile' }
+
+			If ($ProtectReason) {
+				Write-Host "Refusing to remove $Display because $ProtectReason." -ForegroundColor Red
+				[void]$Results.Add([PSCustomObject]@{
+					Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $null; Action = 'Protected'
+				})
+				Continue
+			}
+
+			If ($Item.Loaded -and -not $Force) {
+				Write-Host "$Display is currently loaded (the user is still signed in). Sign the session out and re-run, or use -Force." -ForegroundColor Yellow
+				[void]$Results.Add([PSCustomObject]@{
+					Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $true; BackupPath = $null; Action = 'Loaded'
+				})
+				Continue
+			}
+			If ($Item.Loaded) {
+				Write-Warning "$Display is loaded. Removing it anyway because -Force was supplied. Expect locked files and a reboot to finish the cleanup."
+			}
+
+			If (-not $PSCmdlet.ShouldProcess("$Display (SID: $ItemSID)", "Permanently remove user profile and all of its files")) {
+				[void]$Results.Add([PSCustomObject]@{
+					Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $null; Action = 'Declined'
+				})
+				Continue
+			}
+
+			# --- Optional backup, taken before anything is destroyed ---
+			If ($BackupPath -and $ItemPath -and (Test-Path -LiteralPath $ItemPath)) {
+				If (($BackupPath -ieq $ItemPath) -or $BackupPath.StartsWith(($ItemPath + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+					Write-Host "Backup path $BackupPath is inside the profile being removed. Skipping $Display." -ForegroundColor Red
+					[void]$Results.Add([PSCustomObject]@{
+						Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $null; Action = 'BackupFailed'
+					})
+					Continue
+				}
+				$BackupDestination = Join-Path -Path $BackupPath -ChildPath "$Leaf-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+				Write-Host "Backing up $ItemPath to $BackupDestination..." -ForegroundColor Cyan
+				$RoboExit = Backup-ProfileFolder -Source $ItemPath -Destination $BackupDestination
+				# Robocopy returns a bit map; anything under 8 means the copy succeeded.
+				If ($RoboExit -ge 8) {
+					Write-Host "Backup of $ItemPath failed (robocopy exit code $RoboExit). Leaving the profile alone." -ForegroundColor Red
+					[void]$Results.Add([PSCustomObject]@{
+						Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $BackupDestination; Action = 'BackupFailed'
+					})
+					Continue
+				}
+				Write-Host "Backup complete." -ForegroundColor Green
+			}
+
+			# --- Removal ---
+			If ($Item.CimProfile) {
+				Try {
+					Remove-CimInstance -InputObject $Item.CimProfile -ErrorAction Stop
+					$Action = 'Removed'
+					Write-Host "Removed profile $Display (SID: $ItemSID)." -ForegroundColor Green
+				} Catch {
+					# Do not force-delete the folder when the profile removal itself failed; a
+					# ProfileList entry pointing at a gutted folder breaks that user's next logon.
+					Write-Host "Failed to remove profile ${Display}: $($_.Exception.Message)" -ForegroundColor Red
+					[void]$Results.Add([PSCustomObject]@{
+						Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $BackupDestination; Action = 'Failed'
+					})
+					Continue
+				}
+			} Else {
+				Write-Host "No Win32_UserProfile entry for $Display. Cleaning up the leftovers directly." -ForegroundColor Yellow
+				$Action = 'RemovedOrphan'
+			}
+
+			# Leftover ProfileList entries: duplicates pointing at the same folder, and the
+			# <SID>.bak entry that a failed profile load leaves behind.
+			ForEach ($Entry in @(Get-ProfileRegistryEntry -KeyPath $ProfileListKey)) {
+				$SameSID = ($ItemSID -and ($Entry.SID -ieq $ItemSID))
+				$SamePath = ($ItemPath -and $Entry.Path -and ($Entry.Path -ieq $ItemPath))
+				If (-not ($SameSID -or $SamePath)) { Continue }
+				Try {
+					Remove-Item -LiteralPath $Entry.PSPath -Recurse -Force -ErrorAction Stop
+					Write-Host "Removed leftover ProfileList entry $($Entry.KeyName)." -ForegroundColor Green
+				} Catch {
+					Write-Host "Failed to remove ProfileList entry $($Entry.KeyName): $($_.Exception.Message)" -ForegroundColor Red
+				}
+			}
+
+			# Orphaned ProfileGuid entries pointing at a SID with no ProfileList key left.
+			If ($ItemSID -and (Test-Path -LiteralPath $ProfileGuidKey)) {
+				ForEach ($GuidKey in @(Get-ChildItem -Path $ProfileGuidKey -ErrorAction SilentlyContinue)) {
+					$SidString = (Get-ItemProperty -LiteralPath $GuidKey.PSPath -Name 'SidString' -ErrorAction SilentlyContinue).SidString
+					If ($SidString -and ($SidString -ieq $ItemSID) -and -not (Test-Path -LiteralPath (Join-Path -Path $ProfileListKey -ChildPath $SidString))) {
+						Try {
+							Remove-Item -LiteralPath $GuidKey.PSPath -Recurse -Force -ErrorAction Stop
+							Write-Host "Removed orphaned ProfileGuid entry $($GuidKey.PSChildName)." -ForegroundColor Green
+						} Catch {
+							Write-Host "Failed to remove ProfileGuid entry $($GuidKey.PSChildName): $($_.Exception.Message)" -ForegroundColor Red
+						}
+					}
+				}
+			}
+
+			# Whatever is still on disk.
+			If ($ItemPath -and (Test-Path -LiteralPath $ItemPath)) {
+				Write-Host "Folder still present. Force-removing $ItemPath..." -ForegroundColor Yellow
+				Remove-PathForcefully -Path $ItemPath
+				If (Test-Path -LiteralPath $ItemPath) {
+					Write-Warning "$ItemPath still exists. Files were locked; reboot to finish the cleanup."
+					$Action = 'RemovedPendingReboot'
+				}
+			}
+
+			[void]$Results.Add([PSCustomObject]@{
+				Target      = $Target
+				ProfilePath = $ItemPath
+				SID         = $ItemSID
+				Loaded      = $Item.Loaded
+				BackupPath  = $BackupDestination
+				Action      = $Action
+			})
+		}
+	}
+
+	$RemovedCount = @($Results | Where-Object { $_.Action -in @('Removed', 'RemovedOrphan', 'RemovedPendingReboot') }).Count
+	$FailedCount = @($Results | Where-Object { $_.Action -in @('Failed', 'BackupFailed') }).Count
+	Write-Host "Profile removal complete. Removed: $RemovedCount. Failed: $FailedCount. Targets processed: $($Results.Count)." -ForegroundColor Cyan
+	If ($PassThru) {
+		Write-Output $Results
+	}
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

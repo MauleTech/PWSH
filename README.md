@@ -180,6 +180,7 @@ Enable-SSL #Enables SSL Permanently
   Remove-PathForcefully
   Remove-StaleObjects
   Remove-StaleProfiles
+  Remove-UserProfile
 
 [Rename]
 --------

@@ -229,6 +229,7 @@ Enable-SSL #Enables SSL Permanently
 
 [Test]
 ------
+  Test-PendingReboot
   Test-SmtpRelay
 
 [Uninstall]

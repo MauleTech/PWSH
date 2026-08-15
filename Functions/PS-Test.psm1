@@ -300,6 +300,329 @@ Function Test-SmtpRelay {
 	}
 }
 
+Function Test-PendingReboot {
+	<#
+	.SYNOPSIS
+		Reports whether Windows is waiting on a reboot, and which subsystem is asking for it.
+	.DESCRIPTION
+		Answers the question that comes up before every patch window, install, or handoff:
+		is this machine already waiting on a reboot, and why? A pending reboot is the usual
+		cause of an installer refusing to run, a Windows Update cycle that never finishes,
+		or a rename that appears to have been ignored.
+
+		Six independent signals are checked, because no single one covers every case:
+
+		- Component Based Servicing (servicing stack has staged work)
+		- Windows Update, Auto Update branch (the classic RebootRequired flag)
+		- Windows Update, Orchestrator branch (used by newer update paths)
+		- Pending file rename operations (files queued to move or delete at boot)
+		- Pending computer rename (the active name no longer matches the configured name)
+		- Pending domain join (Netlogon has a join staged)
+
+		If a Configuration Manager client is present, its own reboot state is queried as a
+		seventh signal, since ConfigMgr tracks deployments the registry flags do not.
+
+		Registry reads go through an explicit 64-bit view rather than the HKLM: PSDrive.
+		RMM tools, ScreenConnect included, often launch the 32-bit powershell.exe on a
+		64-bit OS, and WOW64 then redirects HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion
+		to Wow6432Node, where the servicing and Windows Update keys do not exist. A naive
+		check run from a 32-bit host reports a clean machine that is in fact waiting on a
+		reboot. This function does not have that blind spot.
+
+		Nothing is changed, started, or stopped. The function only reads state.
+	.PARAMETER Quiet
+		Return a single [bool] and print nothing, for use in a condition:
+		If (Test-PendingReboot -Quiet) { ... }. Cannot be combined with -PassThru.
+	.PARAMETER PassThru
+		Return the full result object instead of printing the report, for logging or for
+		feeding into a report. Cannot be combined with -Quiet.
+	.PARAMETER SkipFileRenameCheck
+		Ignore the pending file rename signal. This is the weakest of the signals: antivirus
+		products, Windows Defender definition updates, and some installers leave entries in
+		PendingFileRenameOperations during normal operation, on machines that do not need a
+		reboot. Use this switch when that noise makes the overall verdict useless.
+	.PARAMETER SkipConfigMgrCheck
+		Skip the Configuration Manager client query. The query is already skipped silently
+		on machines with no client installed; this switch is for machines where WMI is
+		damaged and the call is slow or hangs.
+	.OUTPUTS
+		[bool] with -Quiet.
+
+		[PSCustomObject] with -PassThru, carrying ComputerName, PendingReboot, Reasons,
+		ComponentBasedServicing, WindowsUpdate, WindowsUpdateOrchestrator,
+		PendingFileRename, PendingFileRenameEntries, PendingComputerRename,
+		PendingDomainJoin, ConfigMgrRebootPending, and ConfigMgrHardRebootPending.
+
+		ConfigMgrRebootPending and ConfigMgrHardRebootPending are $null, not $false, when no
+		Configuration Manager client answered. Test them with -eq $true so an unanswered
+		check is not read as a clean result.
+
+		Nothing is returned in the default console mode; the report is written to the host.
+	.NOTES
+		A pending reboot is a state, not a fault. Plenty of healthy machines carry one
+		between a patch install and the next maintenance window.
+
+		Reading these keys does not require elevation. The Configuration Manager query
+		generally does, so on an unelevated session that check may report nothing on a
+		machine that does have a client.
+
+		The pending file rename list is shown truncated in the console report. Use
+		-PassThru to see every entry.
+
+		Deliberately not checked, because each produces more noise than signal on the
+		machines this toolbox runs against: the Component Based Servicing PackagesPending
+		key, which is populated during normal servicing without implying a reboot; the
+		legacy HKLM\SOFTWARE\Microsoft\Updates UpdateExeVolatile value, which applies to
+		Windows XP and Server 2003 era hotfix installers; and App-V 5.x pending tasks.
+	.EXAMPLE
+		Test-PendingReboot
+		Prints the colored report. This is the form to run from a remote session when you
+		just want to look at the machine.
+	.EXAMPLE
+		If (Test-PendingReboot -Quiet) { Write-Host "Reboot first." }
+		Boolean form, for gating an install or a maintenance script.
+	.EXAMPLE
+		Test-PendingReboot -PassThru | Format-List
+		Full detail, including the reason list and the queued file rename entries.
+	.EXAMPLE
+		Test-PendingReboot -SkipFileRenameCheck
+		Ignores the file rename signal on a machine whose antivirus keeps that key
+		populated, so the remaining signals decide the verdict.
+	.EXAMPLE
+		Invoke-Command -ComputerName SERVER01, SERVER02 -ScriptBlock ${function:Test-PendingReboot}
+		Runs the check on remote machines without loading the whole toolbox on each one, by
+		shipping the function itself. The function is deliberately local-only; remoting is
+		how it reaches other machines. Note that -ArgumentList cannot supply named switches
+		to a script block, so use a wrapper when a remote -PassThru is needed:
+		Invoke-Command -ComputerName SERVER01 -ScriptBlock { param($Fn) & ([scriptblock]::Create($Fn)) -PassThru } -ArgumentList (Get-Command Test-PendingReboot).Definition
+	#>
+	[CmdletBinding(DefaultParameterSetName = 'Console')]
+	[OutputType([bool], ParameterSetName = 'Quiet')]
+	[OutputType([PSCustomObject], ParameterSetName = 'Object')]
+	param(
+		[Parameter(ParameterSetName = 'Quiet')]
+		[switch]$Quiet,
+
+		[Parameter(ParameterSetName = 'Object')]
+		[switch]$PassThru,
+
+		[switch]$SkipFileRenameCheck,
+
+		[switch]$SkipConfigMgrCheck
+	)
+
+	# Platform is absent on Windows PowerShell 5.1 and 'Win32NT' on PowerShell 7 for Windows,
+	# so this catches PowerShell 7 on Linux or macOS without touching the $IsWindows
+	# automatic variable, which does not exist under 5.1 and would trip Set-StrictMode.
+	If ($PSVersionTable.PSVersion.Major -ge 6 -and $PSVersionTable.Platform -ne 'Win32NT') {
+		Throw 'Test-PendingReboot reads the Windows registry and requires Windows.'
+	}
+
+	Function Test-RegKeyPresent {
+		Param([Microsoft.Win32.RegistryKey]$BaseKey, [string]$Path)
+		$SubKey = $null
+		Try {
+			$SubKey = $BaseKey.OpenSubKey($Path)
+			Return ($null -ne $SubKey)
+		} Catch {
+			# A key this function cannot open is reported as absent rather than fatal: an
+			# ACL on one hive branch should not sink the other five checks.
+			Write-Verbose "Could not open HKLM\$Path - $($_.Exception.Message)"
+			Return $false
+		} Finally {
+			If ($SubKey) { $SubKey.Close() }
+		}
+	}
+
+	Function Get-RegValueData {
+		Param([Microsoft.Win32.RegistryKey]$BaseKey, [string]$Path, [string]$Name)
+		$SubKey = $null
+		Try {
+			$SubKey = $BaseKey.OpenSubKey($Path)
+			If ($null -eq $SubKey) { Return $null }
+			Return $SubKey.GetValue($Name, $null)
+		} Catch {
+			Write-Verbose "Could not read HKLM\$Path\$Name - $($_.Exception.Message)"
+			Return $null
+		} Finally {
+			If ($SubKey) { $SubKey.Close() }
+		}
+	}
+
+	Function Write-CheckLine {
+		Param([string]$Label, $State, [string]$SkippedNote = 'Not checked')
+		If ($null -eq $State) {
+			Write-Host ("  {0,-30} {1}" -f $Label, $SkippedNote) -ForegroundColor DarkGray
+		} ElseIf ($State) {
+			Write-Host ("  {0,-30} {1}" -f $Label, 'YES') -ForegroundColor Red
+		} Else {
+			Write-Host ("  {0,-30} {1}" -f $Label, 'No') -ForegroundColor Green
+		}
+	}
+
+	$Reasons = New-Object System.Collections.Generic.List[string]
+	$Cbs = $false
+	$WindowsUpdate = $false
+	$Orchestrator = $false
+	$PendingFileRename = $null
+	$FileRenameEntries = @()
+	$PendingComputerRename = $false
+	$PendingDomainJoin = $false
+	$ConfiguredName = $null
+	$CcmRebootPending = $null
+	$CcmHardRebootPending = $null
+
+	$BaseKey = $null
+	Try {
+		$View = If ([Environment]::Is64BitOperatingSystem) {
+			[Microsoft.Win32.RegistryView]::Registry64
+		} Else {
+			[Microsoft.Win32.RegistryView]::Registry32
+		}
+		Write-Verbose "Reading HKLM through the $View view (host process is $(If ([Environment]::Is64BitProcess) { '64-bit' } Else { '32-bit' }))."
+		$BaseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $View)
+
+		$Cbs = Test-RegKeyPresent -BaseKey $BaseKey -Path 'SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+		If ($Cbs) { $Reasons.Add('Component Based Servicing') }
+
+		$WindowsUpdate = Test-RegKeyPresent -BaseKey $BaseKey -Path 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+		If ($WindowsUpdate) { $Reasons.Add('Windows Update') }
+
+		$Orchestrator = Test-RegKeyPresent -BaseKey $BaseKey -Path 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\RebootRequired'
+		If ($Orchestrator) { $Reasons.Add('Windows Update Orchestrator') }
+
+		If (-not $SkipFileRenameCheck) {
+			$SessionManager = 'SYSTEM\CurrentControlSet\Control\Session Manager'
+			$RawEntries = @()
+			ForEach ($ValueName in @('PendingFileRenameOperations', 'PendingFileRenameOperations2')) {
+				$Data = Get-RegValueData -BaseKey $BaseKey -Path $SessionManager -Name $ValueName
+				If ($Data) { $RawEntries += @($Data) }
+			}
+			# REG_MULTI_SZ holds source and destination in alternating slots, and an empty
+			# destination means "delete at boot". The blanks are structure, not entries, so
+			# they are dropped before the list is counted or shown.
+			$FileRenameEntries = @($RawEntries | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+			$PendingFileRename = $FileRenameEntries.Count -gt 0
+			If ($PendingFileRename) { $Reasons.Add('Pending file rename') }
+		}
+
+		# A rename is applied to the configured name immediately and to the active name only
+		# at boot, so a mismatch is exactly the window between the two.
+		$ActiveName = Get-RegValueData -BaseKey $BaseKey -Path 'SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name 'ComputerName'
+		$ConfiguredName = Get-RegValueData -BaseKey $BaseKey -Path 'SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name 'ComputerName'
+		If ($ActiveName -and $ConfiguredName -and $ActiveName -ne $ConfiguredName) {
+			$PendingComputerRename = $true
+			$Reasons.Add("Pending rename from $ActiveName to $ConfiguredName")
+		}
+
+		$Netlogon = 'SYSTEM\CurrentControlSet\Services\Netlogon'
+		If ((Test-RegKeyPresent -BaseKey $BaseKey -Path "$Netlogon\JoinDomain") -or
+			(Test-RegKeyPresent -BaseKey $BaseKey -Path "$Netlogon\AvoidSpnSet")) {
+			$PendingDomainJoin = $true
+			$Reasons.Add('Pending domain join')
+		}
+	} Finally {
+		If ($BaseKey) { $BaseKey.Close() }
+	}
+
+	If (-not $SkipConfigMgrCheck) {
+		Try {
+			# The timeout matters more than it looks: on a machine with a damaged WMI
+			# repository this call is the one step here that can sit indefinitely, and a
+			# toolbox item that never returns is worse than one that reports less.
+			$Ccm = Invoke-CimMethod -Namespace 'root\ccm\ClientSDK' -ClassName 'CCM_ClientUtilities' -MethodName 'DetermineIfRebootPending' -OperationTimeoutSec 30 -ErrorAction Stop
+			If ($null -ne $Ccm -and $Ccm.ReturnValue -eq 0) {
+				$CcmRebootPending = [bool]$Ccm.RebootPending
+				$CcmHardRebootPending = [bool]$Ccm.IsHardRebootPending
+				If ($CcmHardRebootPending) {
+					$Reasons.Add('Configuration Manager client (hard reboot, no grace period)')
+				} ElseIf ($CcmRebootPending) {
+					$Reasons.Add('Configuration Manager client')
+				}
+			} Else {
+				# A client that answers with a non-zero ReturnValue has told us nothing, so the
+				# flags stay $null rather than being recorded as a clean result.
+				Write-Verbose "Configuration Manager client returned $($Ccm.ReturnValue); treating its reboot state as unknown."
+			}
+		} Catch {
+			# Absent on any machine without a ConfigMgr client, which is the common case.
+			Write-Verbose "No Configuration Manager client answered - $($_.Exception.Message)"
+		}
+	}
+
+	$IsPending = $Reasons.Count -gt 0
+
+	If ($Quiet) { Return $IsPending }
+
+	$Result = [PSCustomObject]@{
+		ComputerName               = $env:COMPUTERNAME
+		PendingReboot              = $IsPending
+		Reasons                    = $Reasons.ToArray()
+		ComponentBasedServicing    = $Cbs
+		WindowsUpdate              = $WindowsUpdate
+		WindowsUpdateOrchestrator  = $Orchestrator
+		PendingFileRename          = $PendingFileRename
+		PendingFileRenameEntries   = $FileRenameEntries
+		PendingComputerRename      = $PendingComputerRename
+		PendingDomainJoin          = $PendingDomainJoin
+		ConfigMgrRebootPending     = $CcmRebootPending
+		ConfigMgrHardRebootPending = $CcmHardRebootPending
+	}
+
+	If ($PassThru) { Return $Result }
+
+	Write-Host ''
+	Write-Host '=== Pending Reboot Check ===' -ForegroundColor Cyan
+	Write-Host ("Computer: {0}    Checked: {1}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+	Write-Host ''
+
+	Write-CheckLine -Label 'Component Based Servicing' -State $Cbs
+	Write-CheckLine -Label 'Windows Update' -State $WindowsUpdate
+	Write-CheckLine -Label 'Windows Update Orchestrator' -State $Orchestrator
+	Write-CheckLine -Label 'Pending file rename' -State $PendingFileRename -SkippedNote 'Skipped'
+	Write-CheckLine -Label 'Pending computer rename' -State $PendingComputerRename
+	If ($PendingComputerRename) {
+		Write-Host ("    New name at next boot: {0}" -f $ConfiguredName) -ForegroundColor Yellow
+	}
+	Write-CheckLine -Label 'Pending domain join' -State $PendingDomainJoin
+	If ($SkipConfigMgrCheck) {
+		Write-CheckLine -Label 'ConfigMgr client' -State $null -SkippedNote 'Skipped'
+	} Else {
+		# A hard reboot is reported through IsHardRebootPending rather than RebootPending, so
+		# showing only the latter would print "No" on a line the verdict counts as pending.
+		# Stay $null when neither answered, so "No client" is not shown as a clean result.
+		$CcmDisplay = If ($null -eq $CcmRebootPending -and $null -eq $CcmHardRebootPending) {
+			$null
+		} Else {
+			($CcmRebootPending -eq $true) -or ($CcmHardRebootPending -eq $true)
+		}
+		Write-CheckLine -Label 'ConfigMgr client' -State $CcmDisplay -SkippedNote 'No client'
+		If ($CcmHardRebootPending -eq $true) {
+			Write-Host '    Hard reboot: the client will not offer a grace period.' -ForegroundColor Yellow
+		}
+	}
+
+	If ($FileRenameEntries.Count -gt 0) {
+		Write-Host ''
+		Write-Host ("Queued file operations ({0}):" -f $FileRenameEntries.Count) -ForegroundColor Yellow
+		ForEach ($Entry in ($FileRenameEntries | Select-Object -First 10)) {
+			Write-Host "    $Entry" -ForegroundColor Gray
+		}
+		If ($FileRenameEntries.Count -gt 10) {
+			Write-Host ("    ... and {0} more. Use -PassThru for the full list." -f ($FileRenameEntries.Count - 10)) -ForegroundColor Gray
+		}
+	}
+
+	Write-Host ''
+	If ($IsPending) {
+		Write-Host '>>> REBOOT IS PENDING <<<' -ForegroundColor Red
+		Write-Host ("Reason(s): {0}" -f ($Reasons -join '; ')) -ForegroundColor Red
+	} Else {
+		Write-Host '>>> NO REBOOT DETECTED <<<' -ForegroundColor Green
+	}
+	Write-Host ''
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

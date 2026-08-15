@@ -188,6 +188,7 @@ Enable-SSL #Enables SSL Permanently
 
 [Repair]
 --------
+  Repair-AdobeCreativeCloud
   Repair-O365AppIssues
   Repair-Volumes
   Repair-Windows

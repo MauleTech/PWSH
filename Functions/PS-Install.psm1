@@ -10,6 +10,11 @@ Function Install-Action1 {
 		The password to decrypt the Action1 site configuration file
 	.Notes
 		Use Protect-ConfigFile to encrypt an updated Action1.csv before uploading to BinCache.
+		Action1.csv columns: Code, Site, GUID, and optional Region. Region is the
+		regional subdomain (e.g. "na-2") Action1 assigned to that organization; leave
+		it blank for orgs on the default region. Check the org's download link in the
+		Action1 console (Agents > Download) if the install fails with a 404 to see
+		whether it needs a Region value.
 	#>
 
 	###Require -RunAsAdministrator
@@ -58,9 +63,11 @@ Function Install-Action1 {
 		}
 
 		# Proceed with installation after validation
-		$MSIUrl = 'https://app.action1.com/agent/'
-		$GUID = ($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID
-		$InstallURL = $MSIUrl + $GUID + "/Windows/Action1agent($Code).msi"
+		$SiteConfig = $SiteConfigs | Where-Object { $_.Code -eq $Code }
+		$GUID = $SiteConfig.GUID
+		$RegionPrefix = if ([string]::IsNullOrEmpty($SiteConfig.Region)) { "" } else { "$($SiteConfig.Region)." }
+		$MSIUrl = "https://app.$($RegionPrefix)action1.com/agent/"
+		$InstallURL = $MSIUrl + $GUID + "/Windows/agent($Code).msi"
 		$Action1Installer = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\Action1Patches
 		$msiPath = $Action1Installer[1]
 		$arguments = "/i `"$msiPath`" /quiet /norestart"

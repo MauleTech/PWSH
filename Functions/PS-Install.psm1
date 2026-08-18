@@ -10,6 +10,9 @@ Function Install-Action1 {
 		The password to decrypt the Action1 site configuration file
 	.Notes
 		Use Protect-ConfigFile to encrypt an updated Action1.csv before uploading to BinCache.
+		Action1.csv columns: Code, Site, Url. Url is the full agent MSI download link
+		for that organization, copied from the Action1 console (Agents > Download),
+		since Action1 assigns each org its own regional download server.
 	#>
 
 	###Require -RunAsAdministrator
@@ -43,10 +46,10 @@ Function Install-Action1 {
 			$Silent = $True
 		}
 
-		if ([String]::IsNullOrEmpty(($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID)) {
+		if ([String]::IsNullOrEmpty(($SiteConfigs | Where-Object { $_.Code -eq $Code }).Url)) {
 			# Always display the available site codes before prompting
 			Write-Host "`nAvailable Site Codes:" -ForegroundColor Cyan
-			$SiteConfigs | Where-Object -Property GUID -ne "" | Select-Object Code, Site | Format-Table -AutoSize
+			$SiteConfigs | Where-Object -Property Url -ne "" | Select-Object Code, Site | Format-Table -AutoSize
 
 			# Ensure $Code is provided and valid
 			while ($null -eq $Code -or -not ($SiteConfigs | Where-Object { $_.Code -eq $Code })) {
@@ -58,9 +61,8 @@ Function Install-Action1 {
 		}
 
 		# Proceed with installation after validation
-		$MSIUrl = 'https://app.action1.com/agent/'
-		$GUID = ($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID
-		$InstallURL = $MSIUrl + $GUID + "/Windows/Action1agent($Code).msi"
+		$SiteConfig = $SiteConfigs | Where-Object { $_.Code -eq $Code }
+		$InstallURL = $SiteConfig.Url
 		$Action1Installer = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\Action1Patches
 		$msiPath = $Action1Installer[1]
 		$arguments = "/i `"$msiPath`" /quiet /norestart"

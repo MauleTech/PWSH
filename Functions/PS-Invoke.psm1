@@ -1889,6 +1889,13 @@ Function Invoke-OneDriveFreeUpSpace {
 		Uses one recursive attrib.exe call per sync folder rather than walking individual
 		files, which is many orders of magnitude faster on populated trees.
 
+		A folder whose root (or any subfolder under it) has no plain files directly
+		inside it, only nested subfolders, causes attrib to print "File not found - *"
+		for that level; this is a benign quirk of how attrib's wildcard matching works
+		with /S /D and does not stop it from recursing further or processing the
+		subfolders themselves, so it is filtered out of the failure detection rather
+		than reported as a per-folder failure.
+
 		Author: Maule Technologies
 #>
 	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -2018,14 +2025,22 @@ Function Invoke-OneDriveFreeUpSpace {
 			if ($Pushed) { Pop-Location }
 		}
 
-		# attrib is silent on success and writes to stderr on per-file failure. Any
-		# captured output (locale-independent) means at least one item failed, even when
-		# the process exit code is 0.
-		$Failed = $LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($AttribOutput)
+		# attrib is silent on success and writes to stderr on per-file failure. But when
+		# a directory (at the root or anywhere under it, since /S recurses) contains only
+		# subfolders and no plain files directly inside it, attrib prints "File not found
+		# - *" for that directory level even though /D and /S still correctly process the
+		# subfolders and keep recursing. That specific line is therefore benign noise, not
+		# a failure; OneDrive folders routinely have no loose files at the root. Any other
+		# output (e.g. "Access is denied") is a genuine per-file failure. This benign-line
+		# match is locale-dependent (assumes English Windows); a non-English OS will fall
+		# back to treating all attrib output as failures, same as before.
+		$OutputLines = @($AttribOutput -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+		$RealIssueLines = @($OutputLines | Where-Object { $_.Trim() -notmatch '^File not found - \*$' })
+		$Failed = $LASTEXITCODE -ne 0 -or $RealIssueLines.Count -gt 0
 		if ($Failed) {
 			$FoldersFailed++
 			Write-Verbose "attrib.exe issues in ${Folder}: $AttribOutput"
-			$FolderResults.Add([pscustomobject]@{ Folder = $Folder; Status = 'Failed'; Detail = $AttribOutput })
+			$FolderResults.Add([pscustomobject]@{ Folder = $Folder; Status = 'Failed'; Detail = ($RealIssueLines -join "`n") })
 		} else {
 			$FoldersDone++
 			$FolderResults.Add([pscustomobject]@{ Folder = $Folder; Status = 'Done'; Detail = '' })

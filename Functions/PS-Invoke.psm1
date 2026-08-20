@@ -1818,6 +1818,18 @@ Function Invoke-OneDriveFreeUpSpace {
 		Use -UserName to target specific profiles, or -Path to point at one specific
 		folder.
 
+		After the attrib flags are set, the function looks up each affected user's
+		per-user "OneDrive Startup Task-<SID>" scheduled task (the logon-triggered task
+		Windows creates to launch onedrive.exe for that user) and, if that user is
+		currently logged on interactively, runs Start-ScheduledTask against it. This is
+		the same task Windows already fires at logon; nudging it here just prompts the
+		already-running (or about-to-start) OneDrive sync agent to notice the flag
+		change sooner instead of waiting for the next natural trigger (logon, or
+		OneDrive's own periodic rescan). The task will not run for a user who is not
+		logged on, because it is configured to run only in that user's interactive
+		session; the function detects this and skips those users rather than erroring.
+		Use -SkipOneDriveRestart to disable this behavior entirely.
+
 	.PARAMETER Mode
 		FreeSpace (default): unpin files so OneDrive dehydrates them to cloud-only.
 		KeepLocal: pin files so OneDrive downloads and keeps them locally.
@@ -1835,6 +1847,13 @@ Function Invoke-OneDriveFreeUpSpace {
 		Contoso") roots. Pass additional patterns for SharePoint or tenant sync folders,
 		e.g. @("OneDrive*", "SharePoint - *") or @("OneDrive*", "*Contoso*").
 
+	.PARAMETER SkipOneDriveRestart
+		Skip triggering each affected user's "OneDrive Startup Task-<SID>" scheduled
+		task after processing. By default the function attempts this for every user
+		whose folders were processed, but only actually starts the task for a user who
+		is currently logged on interactively (required by the task's own logon-trigger
+		configuration).
+
 	.EXAMPLE
 		Invoke-OneDriveFreeUpSpace
 		Free local space across every user's OneDrive folders on this machine.
@@ -1851,9 +1870,16 @@ Function Invoke-OneDriveFreeUpSpace {
 		Invoke-OneDriveFreeUpSpace -FolderFilter @('OneDrive*', 'SharePoint - *')
 		Include SharePoint sync folders in addition to OneDrive.
 
+	.EXAMPLE
+		Invoke-OneDriveFreeUpSpace -Mode FreeSpace -UserName 'jdoe' -SkipOneDriveRestart
+		Free jdoe's local space without attempting to trigger their OneDrive scheduled task.
+
 	.OUTPUTS
-		PSCustomObject with FoldersProcessed, FoldersFailed, and Folders properties.
-		Folders is a list of per-folder result objects (Folder, Status, Detail).
+		PSCustomObject with FoldersProcessed, FoldersFailed, Folders, and
+		OneDriveRestarts properties. Folders is a list of per-folder result objects
+		(Folder, Status, Detail). OneDriveRestarts is a list of per-user objects
+		(Sid, Account, Status, Detail) describing whether that user's OneDrive
+		startup task was triggered.
 
 	.NOTES
 		Adapted from a long-running community pattern (originally posted by u/criostage on
@@ -1880,7 +1906,10 @@ Function Invoke-OneDriveFreeUpSpace {
 
 		[Parameter()]
 		[ValidateNotNullOrEmpty()]
-		[string[]]$FolderFilter = @('OneDrive*')
+		[string[]]$FolderFilter = @('OneDrive*'),
+
+		[Parameter()]
+		[switch]$SkipOneDriveRestart
 	)
 
 	$ModeConfig = @{
@@ -1891,6 +1920,22 @@ Function Invoke-OneDriveFreeUpSpace {
 	$ActionVerb = $ModeConfig[$Mode].Verb
 
 	$FoldersToProcess = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+	# Maps each folder in $FoldersToProcess to the SID of the profile that owns it, so the
+	# OneDrive Startup Task restart step below knows which users were actually affected.
+	$FolderOwnerSid = @{}
+
+	# Push Special = false to WMI so SYSTEM/LocalService/NetworkService/defaultuser0
+	# are filtered server-side. LocalPath honors a redirected ProfilesDirectory. Queried
+	# up front (even in -Path mode) so folders can be attributed back to an owning SID
+	# for the OneDrive Startup Task restart step.
+	$AllUserProfiles = @()
+	$ProfileQueryError = $null
+	try {
+		$AllUserProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = false' -ErrorAction Stop |
+			Where-Object { Test-Path -LiteralPath $_.LocalPath })
+	} catch {
+		$ProfileQueryError = $_.Exception.Message
+	}
 
 	if ($Path) {
 		$Resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
@@ -1899,16 +1944,19 @@ Function Invoke-OneDriveFreeUpSpace {
 			return
 		}
 		$null = $FoldersToProcess.Add($Resolved.Path)
+
+		$OwningProfile = $AllUserProfiles | Where-Object {
+			$Resolved.Path -eq $_.LocalPath -or $Resolved.Path -like "$($_.LocalPath)\*"
+		} | Select-Object -First 1
+		if ($OwningProfile) {
+			$FolderOwnerSid[$Resolved.Path] = $OwningProfile.SID
+		}
 	} else {
-		# Push Special = false to WMI so SYSTEM/LocalService/NetworkService/defaultuser0
-		# are filtered server-side. LocalPath honors a redirected ProfilesDirectory.
-		try {
-			$Profiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = false' -ErrorAction Stop |
-				Where-Object { Test-Path -LiteralPath $_.LocalPath })
-		} catch {
-			Write-Warning "Could not query Win32_UserProfile: $($_.Exception.Message)"
+		if ($ProfileQueryError) {
+			Write-Warning "Could not query Win32_UserProfile: $ProfileQueryError"
 			return
 		}
+		$Profiles = $AllUserProfiles
 
 		if ($UserName) {
 			$Profiles = $Profiles | Where-Object { $UserName -contains (Split-Path $_.LocalPath -Leaf) }
@@ -1927,6 +1975,7 @@ Function Invoke-OneDriveFreeUpSpace {
 			foreach ($Filter in $FolderFilter) {
 				foreach ($Found in Get-ChildItem -LiteralPath $UserProfile.LocalPath -Directory -Filter $Filter -ErrorAction SilentlyContinue) {
 					$null = $FoldersToProcess.Add($Found.FullName)
+					$FolderOwnerSid[$Found.FullName] = $UserProfile.SID
 				}
 			}
 		}
@@ -1983,17 +2032,78 @@ Function Invoke-OneDriveFreeUpSpace {
 		}
 	}
 
+	$OneDriveRestarts = [System.Collections.Generic.List[pscustomobject]]::new()
+	$AffectedSids = @()
+
+	if (-not $SkipOneDriveRestart) {
+		$AffectedSids = @($FolderOwnerSid.Values | Select-Object -Unique)
+
+		if ($AffectedSids.Count -gt 0) {
+			# One Win32_Process query covers every affected SID; GetOwner is the standard
+			# CIM way to map a running process back to the account it runs as, and is how
+			# a logged-on interactive user is detected here (via their explorer.exe shell).
+			$ExplorerOwners = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+			Get-CimInstance -ClassName Win32_Process -Filter "Name = 'explorer.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+				$Owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+				if ($Owner -and $Owner.ReturnValue -eq 0) {
+					$null = $ExplorerOwners.Add("$($Owner.Domain)\$($Owner.User)")
+				}
+			}
+
+			foreach ($Sid in $AffectedSids) {
+				$TaskName = "OneDrive Startup Task-$Sid"
+
+				$Account = $null
+				try {
+					$Account = ([System.Security.Principal.SecurityIdentifier]$Sid).Translate([System.Security.Principal.NTAccount]).Value
+				} catch {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $null; Status = 'Skipped'; Detail = 'Could not resolve SID to an account name' })
+					continue
+				}
+
+				if (-not $ExplorerOwners.Contains($Account)) {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Skipped'; Detail = 'User is not currently logged on interactively' })
+					continue
+				}
+
+				# Requires the ScheduledTasks module (built in on Windows 10/11 and Server 2012+).
+				$Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+				if (-not $Task) {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Skipped'; Detail = "Scheduled task '$TaskName' not found" })
+					continue
+				}
+
+				if (-not $PSCmdlet.ShouldProcess($TaskName, 'Start-ScheduledTask (trigger OneDrive sync)')) {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Skipped'; Detail = 'Skipped by -WhatIf' })
+					continue
+				}
+
+				try {
+					Start-ScheduledTask -InputObject $Task -ErrorAction Stop
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Triggered'; Detail = '' })
+				} catch {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Failed'; Detail = $_.Exception.Message })
+				}
+			}
+		}
+	}
+
 	Write-Host ""
 	Write-Host "Invoke-OneDriveFreeUpSpace summary:" -ForegroundColor Green
 	Write-Host "  Folders processed   : $FoldersDone" -ForegroundColor Green
 	$FailColor = if ($FoldersFailed -gt 0) { 'Red' } else { 'Gray' }
 	Write-Host "  Folders with errors : $FoldersFailed" -ForegroundColor $FailColor
 	Write-Host "Note: OneDrive sync agent must be running for the disk-space change to materialize." -ForegroundColor Gray
+	if (-not $SkipOneDriveRestart -and $AffectedSids.Count -gt 0) {
+		$RestartedCount = @($OneDriveRestarts | Where-Object { $_.Status -eq 'Triggered' }).Count
+		Write-Host "  OneDrive tasks triggered : $RestartedCount of $($AffectedSids.Count)" -ForegroundColor Green
+	}
 
 	[pscustomobject]@{
 		FoldersProcessed = $FoldersDone
 		FoldersFailed    = $FoldersFailed
 		Folders          = $FolderResults
+		OneDriveRestarts = $OneDriveRestarts
 	}
 }
 

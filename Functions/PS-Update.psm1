@@ -118,10 +118,34 @@ Function Update-DellPackages {
 	<#
 	.SYNOPSIS
 		Uses the CLI version of Dell Command | Update to install any missing drivers/firmwares/Bios and update existing ones.
+	.DESCRIPTION
+		Installs or updates Dell Command | Update, then runs its CLI to apply every driver,
+		firmware and BIOS update Dell publishes for the model.
+
+		Dell Command | Update will not install unless its .NET Desktop Runtime prerequisite
+		is already present, and the major version it wants changes between DCU releases:
+		DCU 5.5.0 through 5.7.0 want .NET Desktop Runtime 8 (8.0.8 or newer), while
+		DCU 5.7.1 and newer want .NET Desktop Runtime 10 (10.0.8 or newer). When the runtime
+		is missing, the Dell installer exits with code 4 (DEP_HARD_ERROR), which Chocolatey
+		reports as "A fatal error occurred during installation process". That is the usual
+		failure on a freshly imaged machine, where no .NET Desktop Runtime is present yet.
+
+		Rather than hard coding one runtime, the prerequisite is chosen from the DCU version
+		that is about to be installed. If the install still fails, the prerequisite the
+		installer named in its own log is installed and the install is retried, then the
+		other package source is tried (winget when Chocolatey failed, and the reverse).
+		Runtimes that are already present are left alone, so a re-run does not pull down
+		another 100MB of installers or create an avoidable pending reboot.
+
+		dcu-cli exit codes are translated to readable output, so "no updates found" (500) and
+		"reboot required" (1) stop looking like failures.
 	.PARAMETER EnableAdvancedDriverRestore
-		Enables Advanced Driver Restore feature in Dell Command Update, allowing restoration to any previously installed driver version.
+		Enables Advanced Driver Restore in Dell Command | Update, allowing restoration to any
+		previously installed driver version.
 	.LINK
 		https://www.dell.com/support/kbdoc/en-us/000177325/dell-command-update
+	.LINK
+		https://www.dell.com/support/manuals/en-us/command-update/dcu_rg/command-line-interface-error-codes
 	.EXAMPLE
 		Update-DellPackages
 	.EXAMPLE
@@ -134,144 +158,463 @@ Function Update-DellPackages {
 	)
 
 	Write-Host "Dell Updates"
-		$Manufact = (Get-CimInstance -Class Win32_ComputerSystem).Manufacturer
-		If ( $Manufact -match "Dell" -or $Manufact -match "Alienware") {
-			#Install and update Chocolatey if Needed
-			If (Get-Command choco -errorAction SilentlyContinue) {
-				choco upgrade chocolatey -y
-			} Else { Install-Choco }
 
-			Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
-			$DCUx86 = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
-			$DCUx64 = Join-Path -Path $Env:ProgramFiles -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
+	$Manufact = (Get-CimInstance -Class Win32_ComputerSystem).Manufacturer
+	If ($Manufact -notmatch "Dell" -and $Manufact -notmatch "Alienware") {
+		Write-Host "This is not a Dell Computer"
+		Write-Host "`nEnd of Dell Updates"
+		Return
+	}
 
-			# Decide the install source ONCE and reuse for both the available-version check
-			# and the actual install. Mixing sources (e.g. check via choco, install via winget)
-			# causes upgrade loops when the two catalogs disagree on the latest version.
-			$IsSystem      = $(whoami) -eq "nt authority\system"
-			$InstallSource = If (Get-Command winget -ErrorAction SilentlyContinue) { 'winget' } Else { 'choco' }
-			Write-Host "DCU package source for this run: $InstallSource" -ForegroundColor Cyan
+	# ProgramW6432 always points at the 64 bit Program Files, even from a 32 bit
+	# powershell.exe under WOW64 where $env:ProgramFiles resolves to Program Files (x86).
+	# RMM tools regularly launch the 32 bit host, and without this the 64 bit DCU install
+	# is invisible and gets reinstalled on every run.
+	$ProgramFiles64 = If ($env:ProgramW6432) { $env:ProgramW6432 } Else { $env:ProgramFiles }
+	$DCUx86 = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
+	$DCUx64 = Join-Path -Path $ProgramFiles64 -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
+	$ChocoLog = Join-Path -Path $env:ProgramData -ChildPath "chocolatey\logs\chocolatey.log"
 
-			Function Install-DCU {
-				#Starts the IPMI Service if needed
-				$IPMIService = (Get-Service -Name IPMIDRV -ErrorAction SilentlyContinue).Status
-				If ($IPMIService -and $IPMIService -ne "Running") {Start-Service -Name IPMIDRV}
-				Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
+	# Decide the install source ONCE and reuse for both the available-version check
+	# and the actual install. Mixing sources (e.g. check via choco, install via winget)
+	# causes upgrade loops when the two catalogs disagree on the latest version.
+	$IsSystem      = $(whoami) -eq "nt authority\system"
+	$InstallSource = If (Get-Command winget -ErrorAction SilentlyContinue) { 'winget' } Else { 'choco' }
+	Write-Host "DCU package source for this run: $InstallSource" -ForegroundColor Cyan
 
-				If ($InstallSource -eq 'winget') {
-					If (-not $IsSystem) {
-						Write-Host "Using winget to install Dell Command Update and dependencies." -ForegroundColor Cyan
-						winget source update
-						Invoke-WinGetInstall -Id Microsoft.DotNet.DesktopRuntime.8
-						Invoke-WinGetInstall -Id Dell.CommandUpdate
-					} Else {
-						Write-Host "Running as SYSTEM; invoking winget via Start-PSWinGet." -ForegroundColor Yellow
-						Try {
-							# Update-PowerShellModule must be included in the command so that the spawned pwsh Core
-							# session imports Microsoft.WinGet.Client before calling Install-WinGetPackage.
-							# When Start-PSWinGet runs in PS5 it spawns a new pwsh process; the module is installed
-							# in the caller's session but not auto-imported in the child process.
-							Start-PSWinGet -Command 'Update-PowerShellModule -ModuleName Microsoft.WinGet.Client ; Install-WinGetPackage "Microsoft.DotNet.DesktopRuntime.8" ; Install-WinGetPackage "Dell.CommandUpdate"'
-						} Catch {
-							Write-Warning "Start-PSWinGet failed: $_"
-						}
-					}
+	# A pending reboot does not stop the run, but it is the most common reason a Dell
+	# installer or dcu-cli refuses to do anything, so say so up front.
+	If (Get-Command Test-PendingReboot -ErrorAction SilentlyContinue) {
+		If (Test-PendingReboot -Quiet -SkipFileRenameCheck -SkipConfigMgrCheck) {
+			Write-Warning "This machine already has a pending reboot. Dell installers and dcu-cli may refuse to run until it is rebooted."
+		}
+	}
+
+	Function Sync-ProcessPath {
+		# An installer that just ran has updated the registry copy of PATH but not this
+		# process's copy. Refresh it so freshly installed tools are findable without
+		# restarting the session.
+		Try {
+			$MachinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+			$UserPath    = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+			$Combined    = @($MachinePath, $UserPath) | Where-Object { $_ }
+			If ($Combined) { $env:Path = $Combined -join ';' }
+		} Catch {
+			Write-Verbose "Could not refresh PATH: $_"
+		}
+	}
+
+	Function Get-DCUCliPath {
+		ForEach ($Candidate in @($DCUx64, $DCUx86)) {
+			If ($Candidate -and (Test-Path -LiteralPath $Candidate)) { Return $Candidate }
+		}
+		# Fall back to whatever the uninstall entry recorded, so a change to Dell's install
+		# location does not read as "not installed".
+		$UninstallKeys = @(
+			'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+			'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+		)
+		ForEach ($Key in $UninstallKeys) {
+			$Entries = Get-ChildItem -Path $Key -ErrorAction SilentlyContinue |
+				Get-ItemProperty -ErrorAction SilentlyContinue |
+				Where-Object { $_.DisplayName -like 'Dell Command*Update*' -and $_.InstallLocation }
+			ForEach ($Entry in $Entries) {
+				$Cli = Join-Path -Path $Entry.InstallLocation -ChildPath 'dcu-cli.exe'
+				If (Test-Path -LiteralPath $Cli) { Return $Cli }
+			}
+		}
+		Return $null
+	}
+
+	Function Wait-DCUCliPath {
+		# The package manager can return before the Dell installer has finished dropping
+		# files, so poll briefly instead of deciding on a single check.
+		Param([int]$TimeoutSeconds = 30)
+		$Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+		Do {
+			$Cli = Get-DCUCliPath
+			If ($Cli) { Return $Cli }
+			Start-Sleep -Seconds 2
+		} While ((Get-Date) -lt $Deadline)
+		Return $null
+	}
+
+	Function Get-DotNetDesktopRuntimeVersion {
+		# Dell needs the x64 desktop runtime. Reading the shared framework folder avoids
+		# depending on dotnet.exe being on PATH, which it often is not under SYSTEM.
+		$SharedPath = Join-Path -Path $ProgramFiles64 -ChildPath "dotnet\shared\Microsoft.WindowsDesktop.App"
+		If (-not (Test-Path -LiteralPath $SharedPath)) { Return @() }
+		Get-ChildItem -Path $SharedPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+			$Parsed = $null
+			If ([System.Version]::TryParse($_.Name, [ref]$Parsed)) { $Parsed }
+		}
+	}
+
+	Function Test-DotNetDesktopRuntime {
+		# .NET patch releases live in the build field: 10.0.8 is major 10, minor 0, build 8.
+		Param([int]$Major, [int]$MinimumBuild = 0)
+		$Match = @(Get-DotNetDesktopRuntimeVersion | Where-Object { $_.Major -eq $Major -and $_.Build -ge $MinimumBuild })
+		Return ($Match.Count -gt 0)
+	}
+
+	Function Install-DotNetDesktopRuntime {
+		Param([int]$Major, [int]$MinimumBuild = 0)
+
+		If (Test-DotNetDesktopRuntime -Major $Major -MinimumBuild $MinimumBuild) {
+			Write-Host -ForegroundColor Green ".NET Desktop Runtime $Major ($Major.0.$MinimumBuild or newer) is already installed."
+			Return $True
+		}
+
+		Write-Host "Installing .NET Desktop Runtime $Major, required by Dell Command | Update." -ForegroundColor Cyan
+
+		# winget first when it is usable, because it will not force a reinstall of a runtime
+		# that is already current. winget is not reachable under SYSTEM, so that case goes
+		# straight to Chocolatey rather than paying for a pwsh Core relaunch.
+		If (-not $IsSystem -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+			Try {
+				Invoke-WinGetInstall -Id "Microsoft.DotNet.DesktopRuntime.$Major" | Out-Host
+			} Catch {
+				Write-Warning "winget could not install .NET Desktop Runtime ${Major}: $_"
+			}
+			Sync-ProcessPath
+		}
+
+		If (-not (Test-DotNetDesktopRuntime -Major $Major -MinimumBuild $MinimumBuild)) {
+			If (-not (Get-Command choco -ErrorAction SilentlyContinue)) { Install-Choco | Out-Host }
+			Try {
+				choco upgrade "dotnet-$Major.0-desktopruntime" --exact -y | Out-Host
+			} Catch {
+				Write-Warning "Chocolatey could not install .NET Desktop Runtime ${Major}: $_"
+			}
+			Sync-ProcessPath
+		}
+
+		If (Test-DotNetDesktopRuntime -Major $Major -MinimumBuild $MinimumBuild) {
+			Write-Host -ForegroundColor Green ".NET Desktop Runtime $Major is installed."
+			Return $True
+		}
+
+		Write-Warning ".NET Desktop Runtime $Major ($Major.0.$MinimumBuild or newer) is still missing after the install attempt."
+		Return $False
+	}
+
+	Function Get-DCUPrerequisiteRuntime {
+		<#
+			Dell changes the required runtime between DCU releases and the installer hard
+			fails (exit 4, DEP_HARD_ERROR) instead of pulling it in:
+				5.5.0 through 5.7.0 : .NET Desktop Runtime 8, 8.0.8 or newer
+				5.7.1 and newer     : .NET Desktop Runtime 10, 10.0.8 or newer
+			Anything newer or unparseable is treated as the newest known requirement, and
+			whatever the installer actually names is picked up by Get-NamedPrerequisiteRuntime.
+		#>
+		Param([string]$DCUVersion)
+		$Parsed = $null
+		If ($DCUVersion -and [System.Version]::TryParse(($DCUVersion -replace '[^0-9\.]', ''), [ref]$Parsed)) {
+			If ($Parsed -lt [System.Version]'5.7.1') { Return @{ Major = 8; MinimumBuild = 8 } }
+		}
+		Return @{ Major = 10; MinimumBuild = 8 }
+	}
+
+	Function Get-NamedPrerequisiteRuntime {
+		<#
+			The Dell installer states the runtime it wants, for example:
+			"Microsoft .NET Desktop Runtime 10.0 with version greater than 10.0.7 (x64)
+			needs to be installed for this installation to continue."
+			Reading that back means the next time Dell moves the prerequisite, this function
+			follows it without another code change.
+		#>
+		Param([datetime]$Since)
+
+		$Logs = @($ChocoLog)
+		$Logs += @(Get-ChildItem -Path $env:TEMP -Filter 'dell*.log' -File -ErrorAction SilentlyContinue |
+			Sort-Object LastWriteTime -Descending | Select-Object -First 5 -ExpandProperty FullName)
+
+		ForEach ($Log in $Logs) {
+			If (-not ($Log -and (Test-Path -LiteralPath $Log))) { Continue }
+			# Skip a log left over from an earlier run, so a stale line does not send us
+			# installing the wrong runtime. The window is deliberately loose: NTFS updates
+			# last-write time lazily while a writer still holds the handle, and the value is
+			# rounded down, so an exact comparison against the moment the attempt started
+			# rejects logs that were in fact just written.
+			If ($Since -and (Get-Item -LiteralPath $Log).LastWriteTime -lt $Since.AddMinutes(-10)) { Continue }
+
+			$Tail = Get-Content -LiteralPath $Log -Tail 500 -ErrorAction SilentlyContinue
+			If (-not $Tail) { Continue }
+
+			$Hit = $Tail | Select-String -Pattern '\.NET Desktop Runtime (\d+)\.\d+.*?greater than (\d+)\.(\d+)\.(\d+)' | Select-Object -Last 1
+			If ($Hit) {
+				$Groups = $Hit.Matches[0].Groups
+				# "greater than 10.0.7" means 10.0.8 is the first acceptable build.
+				Return @{ Major = [int]$Groups[1].Value; MinimumBuild = ([int]$Groups[4].Value + 1) }
+			}
+
+			$Hit = $Tail | Select-String -Pattern '\.NET Desktop Runtime (\d+)\.\d+' | Select-Object -Last 1
+			If ($Hit) {
+				Return @{ Major = [int]$Hit.Matches[0].Groups[1].Value; MinimumBuild = 0 }
+			}
+		}
+		Return $null
+	}
+
+	Function Install-DCU {
+		Param([ValidateSet('choco', 'winget')][string]$Source)
+
+		#Starts the IPMI Service if needed
+		$IPMIService = (Get-Service -Name IPMIDRV -ErrorAction SilentlyContinue).Status
+		If ($IPMIService -and $IPMIService -ne "Running") { Start-Service -Name IPMIDRV -ErrorAction SilentlyContinue }
+		Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
+
+		Try {
+			If ($Source -eq 'winget') {
+				If (-not $IsSystem) {
+					Write-Host "Using winget to install Dell Command Update." -ForegroundColor Cyan
+					winget source update | Out-Host
+					Invoke-WinGetInstall -Id Dell.CommandUpdate | Out-Host
 				} Else {
-					Write-Host "Using Chocolatey to install Dell Command Update and dependencies." -ForegroundColor Cyan
-					choco upgrade dotnet-8.0-desktopruntime --exact -y --force --forcedependencies -i
-					choco upgrade DellCommandUpdate --exact -y --force --forcedependencies -i --ignorechecksums
+					Write-Host "Running as SYSTEM; invoking winget via Start-PSWinGet." -ForegroundColor Yellow
+					# Update-PowerShellModule must be included in the command so that the spawned pwsh Core
+					# session imports Microsoft.WinGet.Client before calling Install-WinGetPackage.
+					# When Start-PSWinGet runs in PS5 it spawns a new pwsh process; the module is installed
+					# in the caller's session but not auto-imported in the child process.
+					Start-PSWinGet -Command 'Update-PowerShellModule -ModuleName Microsoft.WinGet.Client ; Install-WinGetPackage "Dell.CommandUpdate"' | Out-Host
 				}
-			}
-
-			If ((!(Test-Path $DCUx86)) -and (!(Test-Path $DCUx64))) {
-				Write-Host "Checking if 'Dell Command | Update' is current."
-				#Remove any Windows 10 "Apps"
-				Get-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -like "*Dell*Update*"} | Remove-ProvisionedAppPackage -Online
-
-				# Scan once to gate the uninstall calls below. Uninstall-Application's
-				# internal WMI scan is the expensive part; skipping it when no match
-				# exists is the whole point.
-				Write-Host "Scanning installed applications for conflicts..." -ForegroundColor Cyan
-				$InstalledApps = Get-InstalledApplication
-
-				$Conflicts = @(
-					@{ Pattern = 'Dell.*Update';                           App = 'Dell*Update' },
-					@{ Pattern = 'Alienware Update for Windows Universal'; App = 'Alienware Update for Windows Universal' }
-				)
-				ForEach ($c in $Conflicts) {
-					If ($InstalledApps.Name -match $c.Pattern) {
-						Uninstall-Application -AppToUninstall $c.App
-					} Else {
-						Write-Host -ForegroundColor Green "No '$($c.App)' found; skipping."
-					}
-				}
-				Get-Package "Dell*Windows 10" -ErrorAction SilentlyContinue | Uninstall-Package -AllVersions -Force
-				If (Get-AppxPackage *Dell*Update*){
-					$apps = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall,HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall | Get-ItemProperty | Where-Object {$_.DisplayName -like "Dell*Update*" } | Select-Object -Property DisplayName, UninstallString
-					ForEach ($ver in $apps) {
-						If ($ver.UninstallString) {
-							$uninst = $ver.UninstallString
-							Write-Host Uninstalling: $ver.DisplayName
-							Start-Process cmd -ArgumentList "/c $uninst /quiet /norestart" -NoNewWindow -Wait -PassThru
-						}
-					}
-				}
-			}
-			#Compare version numbers of any remaining installed version.
-			$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
-			If (-not $DCUInstalledVersion -and (Test-Path $DCUx86 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx86).VersionInfo.ProductVersion}
-			If (-not $DCUInstalledVersion -and (Test-Path $DCUx64 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx64).VersionInfo.ProductVersion}
-			# Query available version from the SAME source that will install it. If the
-			# query source and install source can disagree, the installed version will
-			# never match what the check reports and every run will trigger a needless
-			# uninstall + reinstall.
-			$DCUAvailableVersion = $null
-			Switch ($InstallSource) {
-				'winget' {
-					$wingetVersionLine = winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:" | Select-Object -First 1
-					If ($wingetVersionLine) {
-						$DCUAvailableVersion = $wingetVersionLine.Line.Replace("Version: ","").Trim()
-					} Else {
-						Write-Host "winget could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
-					}
-				}
-				'choco' {
-					$chocoVersionLine = choco search DellCommandUpdate --exact | Select-String -Pattern "DellCommandUpdate " -SimpleMatch | Select-Object -First 1
-					If ($chocoVersionLine) {
-						$DCUAvailableVersion = $chocoVersionLine.Line.split(" ",[System.StringSplitOptions]::RemoveEmptyEntries)[1]
-					} Else {
-						Write-Host "choco could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
-					}
-				}
-			}
-
-			If (-not $DCUInstalledVersion) {
-				Write-Host "'Dell Command | Update' is not installed, installing now."
-				Install-DCU
-
-			} ElseIf ($DCUAvailableVersion -and ([System.Version]$DCUInstalledVersion -lt [System.Version]$DCUAvailableVersion)) {
-				Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
-
-				#Remove any programs listed through "Add and remove programs"
-				Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
-				Install-DCU
-
 			} Else {
-				Write-Host -ForegroundColor Green "'Dell Command | Update' is current (version $DCUInstalledVersion)."
+				Write-Host "Using Chocolatey to install Dell Command Update." -ForegroundColor Cyan
+				If (-not (Get-Command choco -ErrorAction SilentlyContinue)) { Install-Choco | Out-Host }
+				# No --ignore-dependencies here. The old command passed -i, which told Chocolatey
+				# to skip the package's own .NET Desktop Runtime dependency, guaranteeing the
+				# DEP_HARD_ERROR this function now works to avoid.
+				choco upgrade DellCommandUpdate --exact -y --force --ignorechecksums | Out-Host
+			}
+		} Catch {
+			Write-Warning "The $Source install of Dell Command Update threw an error: $_"
+		}
+
+		Sync-ProcessPath
+		Return [bool](Wait-DCUCliPath -TimeoutSeconds 30)
+	}
+
+	Function Install-DCUWithFallback {
+		Param([string]$AvailableVersion)
+
+		# Prerequisite first. Without it the Dell installer exits 4 before doing anything.
+		If ($AvailableVersion) {
+			$Prereq = Get-DCUPrerequisiteRuntime -DCUVersion $AvailableVersion
+			$null = Install-DotNetDesktopRuntime -Major $Prereq.Major -MinimumBuild $Prereq.MinimumBuild
+		} Else {
+			Write-Host "DCU version could not be determined; covering both runtimes DCU 5.x has required." -ForegroundColor Yellow
+			$null = Install-DotNetDesktopRuntime -Major 10 -MinimumBuild 8
+			$null = Install-DotNetDesktopRuntime -Major 8 -MinimumBuild 8
+		}
+
+		# Preferred source first, then the other one. The two catalogs fail independently:
+		# a broken package on one still installs cleanly from the other.
+		$Sources = @($InstallSource) + @(@('choco', 'winget') | Where-Object { $_ -ne $InstallSource })
+
+		ForEach ($Source in $Sources) {
+			If ($Source -eq 'winget' -and -not $IsSystem -and -not (Get-Command winget -ErrorAction SilentlyContinue)) {
+				Write-Host "Skipping the winget fallback; winget is not available on this machine." -ForegroundColor Yellow
+				Continue
 			}
 
-			#Configure and run Dell Command Update
-			If (Test-Path $DCUx86) {
-				& $DCUx86 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
+			ForEach ($Attempt in 1..2) {
+				Write-Host "Installing 'Dell Command | Update' via $Source (attempt $Attempt of 2)." -ForegroundColor Cyan
+				$StartedAt = Get-Date
+				If (Install-DCU -Source $Source) {
+					Write-Host -ForegroundColor Green "'Dell Command | Update' installed successfully via $Source."
+					Return $True
+				}
+				Write-Warning "'Dell Command | Update' did not install via $Source on attempt $Attempt."
 
-				& $DCUx86 /applyUpdates -reboot=disable -forceupdate=enable
-			} ElseIf (Test-Path $DCUx64) {
-				& $DCUx64 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
+				# Honour whatever prerequisite the installer named before spending another attempt.
+				$Named = Get-NamedPrerequisiteRuntime -Since $StartedAt
+				If ($Named) {
+					Write-Host "The installer asked for .NET Desktop Runtime $($Named.Major) build $($Named.MinimumBuild) or newer." -ForegroundColor Yellow
+					If (-not (Install-DotNetDesktopRuntime -Major $Named.Major -MinimumBuild $Named.MinimumBuild)) {
+						# The runtime is still missing, so retrying the same source fails identically.
+						Break
+					}
+				} ElseIf ($Attempt -eq 1) {
+					Start-Sleep -Seconds 10
+				}
+			}
+		}
 
-				& $DCUx64 /applyUpdates -reboot=disable -forceupdate=enable
-			} Else { Write-Error "Dell Command Update CLI not found."}
+		Return $False
+	}
 
-		} Else { Write-Host "This is not a Dell Computer" }
+	Function Write-DCUResult {
+		# https://www.dell.com/support/manuals/en-us/command-update/dcu_rg/command-line-interface-error-codes
+		Param([string]$Operation, [int]$ExitCode)
+		$Codes = @{
+			0    = @{ Text = 'Completed successfully.';                                                   Color = 'Green' }
+			1    = @{ Text = 'Completed, but a reboot is required to finish.';                            Color = 'Yellow' }
+			2    = @{ Text = 'An unknown application error occurred.';                                    Color = 'Red' }
+			3    = @{ Text = 'The system manufacturer is not Dell.';                                      Color = 'Red' }
+			4    = @{ Text = 'dcu-cli was not launched with administrative privileges.';                  Color = 'Red' }
+			5    = @{ Text = 'A reboot was pending from a previous operation. Reboot and run again.';     Color = 'Yellow' }
+			6    = @{ Text = 'Another instance of Dell Command Update is already running.';               Color = 'Yellow' }
+			7    = @{ Text = 'Dell Command Update does not support this system model.';                   Color = 'Red' }
+			500  = @{ Text = 'No updates were found. The system is already current.';                     Color = 'Green' }
+			501  = @{ Text = 'An error occurred while determining the available updates.';                Color = 'Red' }
+			502  = @{ Text = 'The operation was cancelled.';                                              Color = 'Yellow' }
+			1000 = @{ Text = 'An error occurred retrieving the result of the operation. Retry the run.';  Color = 'Red' }
+		}
+		If ($Codes.ContainsKey($ExitCode)) {
+			Write-Host "dcu-cli $Operation : $($Codes[$ExitCode].Text) (exit code $ExitCode)" -ForegroundColor $Codes[$ExitCode].Color
+		} Else {
+			Write-Host "dcu-cli $Operation returned exit code $ExitCode." -ForegroundColor Yellow
+		}
+	}
+
+	#Install and update Chocolatey if Needed. A failure here is not fatal; winget may still
+	#be usable, and Install-DCU installs Chocolatey on demand if it turns out to be needed.
+	Try {
+		If (Get-Command choco -errorAction SilentlyContinue) {
+			choco upgrade chocolatey -y
+		} Else { Install-Choco }
+	} Catch {
+		Write-Warning "Chocolatey could not be installed or upgraded: $_"
+	}
+
+	Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
+
+	If (-not (Get-DCUCliPath)) {
+		Write-Host "Checking if 'Dell Command | Update' is current."
+		#Remove any Windows 10 "Apps"
+		Get-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue |
+			Where-Object { $_.DisplayName -like "*Dell*Update*" } |
+			Remove-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue
+
+		# Scan once to gate the uninstall calls below. Uninstall-Application's
+		# internal WMI scan is the expensive part; skipping it when no match
+		# exists is the whole point.
+		Write-Host "Scanning installed applications for conflicts..." -ForegroundColor Cyan
+		$InstalledApps = Get-InstalledApplication
+
+		$Conflicts = @(
+			@{ Pattern = 'Dell.*Update';                           App = 'Dell*Update' },
+			@{ Pattern = 'Alienware Update for Windows Universal'; App = 'Alienware Update for Windows Universal' }
+		)
+		ForEach ($c in $Conflicts) {
+			If ($InstalledApps.Name -match $c.Pattern) {
+				Uninstall-Application -AppToUninstall $c.App
+			} Else {
+				Write-Host -ForegroundColor Green "No '$($c.App)' found; skipping."
+			}
+		}
+		Get-Package "Dell*Windows 10" -ErrorAction SilentlyContinue | Uninstall-Package -AllVersions -Force -ErrorAction SilentlyContinue
+		If (Get-AppxPackage *Dell*Update* -ErrorAction SilentlyContinue) {
+			$apps = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall, HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall -ErrorAction SilentlyContinue | Get-ItemProperty | Where-Object { $_.DisplayName -like "Dell*Update*" } | Select-Object -Property DisplayName, UninstallString
+			ForEach ($ver in $apps) {
+				If ($ver.UninstallString) {
+					$uninst = $ver.UninstallString
+					Write-Host Uninstalling: $ver.DisplayName
+					Start-Process cmd -ArgumentList "/c $uninst /quiet /norestart" -NoNewWindow -Wait -PassThru
+				}
+			}
+		}
+	}
+
+	#Compare version numbers of any remaining installed version.
+	$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
+	If (-not $DCUInstalledVersion) {
+		$InstalledCli = Get-DCUCliPath
+		If ($InstalledCli) { $DCUInstalledVersion = (Get-Item -LiteralPath $InstalledCli).VersionInfo.ProductVersion }
+	}
+
+	# Query available version from the SAME source that will install it. If the
+	# query source and install source can disagree, the installed version will
+	# never match what the check reports and every run will trigger a needless
+	# uninstall + reinstall.
+	$DCUAvailableVersion = $null
+	Try {
+		Switch ($InstallSource) {
+			'winget' {
+				$wingetVersionLine = winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:" | Select-Object -First 1
+				If ($wingetVersionLine) {
+					$DCUAvailableVersion = $wingetVersionLine.Line.Replace("Version: ", "").Trim()
+				} Else {
+					Write-Host "winget could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
+				}
+			}
+			'choco' {
+				$chocoVersionLine = choco search DellCommandUpdate --exact | Select-String -Pattern "DellCommandUpdate " -SimpleMatch | Select-Object -First 1
+				If ($chocoVersionLine) {
+					$DCUAvailableVersion = $chocoVersionLine.Line.split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[1]
+				} Else {
+					Write-Host "choco could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
+				}
+			}
+		}
+	} Catch {
+		Write-Warning "Could not query the available DCU version from ${InstallSource}: $_"
+	}
+
+	# Version strings from either catalog can be shapes [System.Version] refuses, so a bad
+	# parse must not take the whole run down with it.
+	$DCUNeedsUpgrade = $False
+	If ($DCUInstalledVersion -and $DCUAvailableVersion) {
+		Try {
+			$DCUNeedsUpgrade = ([System.Version]$DCUInstalledVersion -lt [System.Version]$DCUAvailableVersion)
+		} Catch {
+			Write-Warning "Could not compare DCU versions '$DCUInstalledVersion' and '$DCUAvailableVersion'; leaving the installed version in place."
+		}
+	}
+
+	If (-not $DCUInstalledVersion) {
+		Write-Host "'Dell Command | Update' is not installed, installing now."
+		$null = Install-DCUWithFallback -AvailableVersion $DCUAvailableVersion
+
+	} ElseIf ($DCUNeedsUpgrade) {
+		Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
+
+		#Remove any programs listed through "Add and remove programs"
+		Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
+		If (-not (Install-DCUWithFallback -AvailableVersion $DCUAvailableVersion)) {
+			Write-Warning "The upgrade to $DCUAvailableVersion failed. If the previous version is still present, it will be used for this run."
+		}
+
+	} Else {
+		Write-Host -ForegroundColor Green "'Dell Command | Update' is current (version $DCUInstalledVersion)."
+	}
+
+	#Configure and run Dell Command Update. Install-DCU already polled for the CLI, so a
+	#plain lookup here is enough and does not add a pointless wait to the failure path.
+	$DCUCli = Get-DCUCliPath
+	If (-not $DCUCli) {
+		# Say what actually went wrong instead of just "not found". On a fresh image this is
+		# almost always the .NET Desktop Runtime prerequisite.
+		$Runtimes = @(Get-DotNetDesktopRuntimeVersion | ForEach-Object { $_.ToString() })
+		$RuntimeText = If ($Runtimes) { $Runtimes -join ', ' } Else { 'none' }
+		$Named = Get-NamedPrerequisiteRuntime
+		$Detail = "Dell Command Update CLI not found after install attempts from: $($InstallSource), then the fallback source."
+		$Detail += "`nInstalled .NET Desktop Runtimes (x64): $RuntimeText"
+		If ($DCUAvailableVersion) { $Detail += "`nDCU version offered by ${InstallSource}: $DCUAvailableVersion" }
+		If ($Named) { $Detail += "`nThe Dell installer asked for .NET Desktop Runtime $($Named.Major) build $($Named.MinimumBuild) or newer." }
+		If (Test-Path -LiteralPath $ChocoLog) { $Detail += "`nChocolatey log: $ChocoLog" }
+		$Detail += "`nIf a reboot is pending, reboot and run Update-DellPackages again."
+		Write-Error $Detail
+	} Else {
+		Write-Host "Using Dell Command Update CLI at $DCUCli" -ForegroundColor Cyan
+		$AdvancedDriverRestore = If ($EnableAdvancedDriverRestore) { 'enable' } Else { 'disable' }
+
+		# A dcu-cli that fails to launch at all must not take the calling script down with it.
+		Try {
+			& $DCUCli /configure -autoSuspendBitLocker=enable "-advancedDriverRestore=$AdvancedDriverRestore" -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
+			Write-DCUResult -Operation '/configure' -ExitCode $LASTEXITCODE
+		} Catch {
+			Write-Warning "dcu-cli /configure could not be run: $_"
+		}
+
+		Try {
+			& $DCUCli /applyUpdates -reboot=disable -forceupdate=enable
+			Write-DCUResult -Operation '/applyUpdates' -ExitCode $LASTEXITCODE
+		} Catch {
+			Write-Error "dcu-cli /applyUpdates could not be run: $_"
+		}
+	}
+
 	Write-Host "`nEnd of Dell Updates"
 }
 
@@ -1119,7 +1462,10 @@ Function Update-OEMDrivers {
 	# Dell/Alienware Detection
 	If ($Manufacturer -match "Dell" -or $Manufacturer -match "Alienware") {
 		Write-Host "`nUsing Dell Command Update via Update-DellPackages..." -ForegroundColor Green
-		Update-DellPackages
+		# -EnableAdvancedDriverRestore is passed explicitly now that the switch actually drives
+		# the dcu-cli -advancedDriverRestore setting; this keeps the behaviour this call site
+		# has always had, where advanced driver restore was enabled unconditionally.
+		Update-DellPackages -EnableAdvancedDriverRestore
 		Write-Host "`nDell updates completed." -ForegroundColor Green
 		return
 	}

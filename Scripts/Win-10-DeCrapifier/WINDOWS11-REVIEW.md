@@ -158,8 +158,8 @@ Also add `#Requires -RunAsAdministrator`; the script needs elevation but never c
 - Legacy Edge and Internet Explorer Do Not Track keys: both browsers retired.
 - Delivery Optimization is written under `...\CurrentVersion\DeliveryOptimization\Config`,
   not the supported policy path `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization`.
-- `Invoke-Win10Decrap` fetches from `/PWSH/master/`; the repo only has `main`. GitHub's
-  legacy-name redirect still serves it (confirmed HTTP 200) but this is fragile.
+- ~~`Invoke-Win10Decrap` fetches from `/PWSH/master/`; the repo only has `main`.~~ FIXED.
+  All 16 self-referencing URLs across the repo now use `refs/heads/main`.
 - No integrity check on the fetch. `Invoke-Win10Decrap` does a bare
   `Invoke-WebRequest | Invoke-Expression` while this repo already has
   `Invoke-ValidatedDownload` and `DownloadManifest.json` for exactly this pattern; the

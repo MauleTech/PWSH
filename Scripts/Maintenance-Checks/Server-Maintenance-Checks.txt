@@ -26,14 +26,14 @@ $progressPreference = 'silentlyContinue'
 		Write-Host "No version number found on the website."
 	}
 Function DattoBDRCheck {
+	$OnlineDattoVersion = $null
 	#Determine if Shadowsnap agent is installed
-	$OnlineDattoAgent = iwr https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Datto-Agent-Update/OnlineDattoAgent.json | ConvertFrom-Json
 	if (Get-Service "StorageCraft Raw Agent" -ErrorAction SilentlyContinue) {
 		#Designate Registry key to read version number from
 		$RegKeyVer = "hklm:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ShadowSnap"
 		#Designate name of agent
 		$agent = "ShadowSnap Agent"
-		$OnlineDattoVersion = $OnlineDattoAgent.ShadowSnapAgent.Version
+		#ShadowSnap is end-of-life; no online version source remains to compare against.
 		$InstalledVer = (Get-ItemProperty "$RegKeyVer" -Name "DisplayVersion" -ErrorAction SilentlyContinue).DisplayVersion
 	}
 	#Determine if Datto Windows agent is installed
@@ -61,7 +61,6 @@ Function DattoBDRCheck {
 			} else {
 				Write-Host "No version number found on the website."
 			}
-		#$OnlineDattoVersion = $OnlineDattoAgent.DattoWindowsAgent.Version
 		$InstalledVer = (Get-Item $FileVer).VersionInfo.ProductVersion
 	}
 	#If neither agent is installed
@@ -70,7 +69,10 @@ Function DattoBDRCheck {
 	}
  else {
 		#Check Version number
-		If ($InstalledVer -match $OnlineDattoVersion) {
+		If (!$OnlineDattoVersion) {
+			Write-Host -ForegroundColor Yellow 'The'$agent' version '$InstalledVer' is installed. The latest available version could not be determined.'
+		}
+		ElseIf ($InstalledVer -match $OnlineDattoVersion) {
 			Write-Host -ForegroundColor Green 'The'$agent' version '$InstalledVer' is currently installed and it is up to date'
 		}
 		Else {

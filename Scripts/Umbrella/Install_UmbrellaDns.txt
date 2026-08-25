@@ -14,7 +14,7 @@
 	#Requires -RunAsAdministrator
 [cmdletbinding()]
 param(
-	[string]$Code #Shortcode of the site you want to install, list available at https://github.com/MauleTech/PWSH/blob/master/Scripts/ITS247Agent/SiteAgentURLs.csv
+	[string]$Code #Shortcode of the site you want to install, list available at Scripts/Umbrella/UDNS-Client-Mapping.csv
 )
 
 Write-Host "Checking Status Indicator"

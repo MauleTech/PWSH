@@ -116,7 +116,5 @@ on does.
 * Not yet run on real hardware. Logic was exercised against stubbed Appx, service, scheduled task
   and `reg.exe` calls; the `SignatureKind` / `IsFramework` / `NonRemovable` filter in particular
   needs confirming on a live Windows 11 build.
-* `Invoke-Win10Decrap` still fetches from a `master` branch URL that no longer exists. GitHub's
-  legacy-name redirect keeps it working. Left alone deliberately so the old path is untouched.
 * Windows 11 Start layout is not configured at all. If we want one, it belongs in Intune or a
   staged `LayoutModification.json`, not in this script.

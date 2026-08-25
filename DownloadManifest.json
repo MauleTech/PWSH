@@ -14,11 +14,6 @@
         "LastVerified": "2026-02-26",
         "Note": "RapidFire Tools Network Detective Data Collector"
     },
-    "https://update.itsupport247.net/agtupdt/DPMAPatch.exe": {
-        "SHA256": "3A41840380456CCCF8162736463FDEC72D6A062C803AB65464A6217EC8265793",
-        "LastVerified": "2026-02-26",
-        "Note": "Continuum ITS247 DPMA agent patch"
-    },
     "https://dl.dell.com/FOLDER12418375M/1/Systems-Management_Application_03GC8_WN64_2.1.1.0_A00.EXE": {
         "SHA256": "DC3D740BCDBF89D0A8DCBF8B57E21D6369455E2EFE5313FC73233AEEFA381CD5",
         "LastVerified": "2026-02-26",

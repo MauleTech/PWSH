@@ -161,40 +161,8 @@
 				}
 			}
 		}
-		#Update the Datto agent on remote servers, Warn users of impending reboot
-		#Download latest datto update script
 		#Forces downloads to use TLS1.2
 		[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-		<#(New-Object System.Net.WebClient).DownloadFile("https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Datto-Agent-Update/DattoAgentUpdate.txt", "$ITFolder\scripts\DattoAgentUpdate.ps1")
-		Unblock-File -Path "$ITFolder\scripts\DattoAgentUpdate.ps1"
-		ForEach ($d in $objdata) {
-			$sequence = $d.SEQUENCE | Out-String
-			$sequence = [int]$sequence
-			$server = $d.SRVR
-			$action = $d.Action
-			$vmhost = $d.Host
-			$NoWait = $d.NoWait
-			$DattoUpdate = {}
-			
-			If ($server -ne "allremainingvms"){
-				Write-Host "Datto update assessment is being performed on $server"
-				$color = '0000ff'
-				$message = "Datto update assessment is being performed on $server"
-				#Send-To-Teams
-				#If command is running locally, use "Start-VM -Name #$server"
-				If (($env:computername.StartsWith($server,"CurrentCultureIgnoreCase")) -or ($server.StartsWith($env:computername,"CurrentCultureIgnoreCase"))) {
-					& $ITFolder\scripts\DattoAgentUpdate.ps1
-				} Else {
-					#If command is running remotely, use "Invoke-Command -ComputerName $vmhost -ScriptBlock { "Start-VM -Name #$server" }"
-					Invoke-Command -ComputerName $server -Credential $cred -FilePath "$ITFolder\scripts\DattoAgentUpdate.ps1"
-				}
-			} Else {
-				Write-Host "Datto update assessment is being skipped on End User Client VMs"
-				$color = '0000ff'
-				$message = "Datto update assessment is being skipped on End User Client VMs"
-				#Send-To-Teams
-			}
-		}#>
 
 		#Reboot, or shutdown the servers in order
 		#Stop-Process -Name "iexplore"

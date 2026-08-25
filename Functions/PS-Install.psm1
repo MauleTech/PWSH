@@ -206,27 +206,6 @@ function Install-ClaudeCode {
 	}
 }
 
-Function Install-ITS247Agent {
-	If ($SiteCode -and !$IAmJOB) {
-		Start-Job -Name "InstallAgent" -InitializationScript {
-			$progressPreference = 'silentlyContinue'
-			irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-		} -ScriptBlock {
-			$global:SiteCode = $using:SiteCode
-			$global:IAmJOB = $True
-			irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-			Install-ITS247Agent
-		} | Receive-Job -Wait #-AutoRemoveJob
-	} ElseIf (($SiteCode -and $IAmJOB) -or (!$SiteCode -and !$IAmJOB)) {
-		Write-Host "I'm running as a job!"
-		$progressPreference = 'silentlyContinue'
-		Set-ExecutionPolicy Bypass -Scope Process -Force
-		irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-		Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/ITS247Agent/Install_ITS247_Agent_MSI.txt -UseBasicParsing | Invoke-Expression
-	} ElseIf (!$SiteCode -and $IAmJOB) {Write-Warning "You can't run the installer as job without specifying the SiteCode Variable. You can't interact with a job."}
-
-}
-
 Function Install-NetExtender {
 	$App = Get-WmiObject -Class Win32_Product | Where-Object -Property "Name" -Like "*NetExtender*"
 
@@ -1166,7 +1145,7 @@ Function Install-UmbrellaDNSasJob {
 		###Require -RunAsAdministrator
 	[cmdletbinding()]
 	param(
-		[string]$Code #Shortcode of the site you want to install, list available at https://github.com/MauleTech/PWSH/blob/master/Scripts/ITS247Agent/SiteAgentURLs.csv
+		[string]$Code #Shortcode of the site you want to install, list available at Scripts/Umbrella/UDNS-Client-Mapping.csv
 	)
 	$SiteConfigs = @()
 	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','

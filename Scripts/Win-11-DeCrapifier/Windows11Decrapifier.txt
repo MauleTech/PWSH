@@ -65,6 +65,11 @@
 #-AppsOnly                  Only remove apps.
 #-SettingsOnly              Only apply settings, services and tasks.
 #-Force                     Run even if the OS is not detected as Windows 11.
+#-Quiet                     Suppress the detailed per-item output. Verbose IS the default:
+#                           the script prints an environment banner, the full package
+#                           triage, every registry write, and a post-run read-back that
+#                           re-checks the settings that matter. Use -Quiet once a build
+#                           process is trusted and you only want the summary.
 
 [cmdletbinding(DefaultParameterSetName="Decrapifier")]
 param (
@@ -80,6 +85,7 @@ param (
 	[switch]$DisableTelemetryService,
 	[switch]$NoLog,
 	[switch]$Force,
+	[switch]$Quiet,
 	[Parameter(ParameterSetName="AppsOnly")]
 	[switch]$AppsOnly,
 	[Parameter(ParameterSetName="SettingsOnly")]
@@ -123,6 +129,8 @@ $Global:MTDecrap = @{
 	RegChanges   = 0
 	RegFailures  = 0
 	RegFailed    = New-Object System.Collections.ArrayList
+	VerifyPass   = 0
+	VerifyFail   = 0
 }
 
 Function Test-Elevated {
@@ -142,7 +150,60 @@ Function Test-Windows11 {
 }
 
 
-#---Functions---
+#Detail output. On by default; -Quiet turns it off. Everything printed through here is
+#confirmation of what the script actually did, so it is worth having on for a test build.
+Function Write-Detail {
+	param([string]$Message, [string]$Color = "Gray")
+	If (-not $Quiet) { Write-Host $Message -ForegroundColor $Color }
+}
+
+
+#Environment banner. Proves which OS gate was hit and which switches are actually in effect,
+#which is the first thing you want in a transcript when something looks wrong.
+Function Show-DecrapBanner {
+	$OS = $null
+	Try { $OS = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } Catch { }
+
+	Write-Host ""
+	Write-Host "=====================================================" -ForegroundColor Cyan
+	Write-Host " Windows 11 Decrapifier (Maule Techs)" -ForegroundColor Cyan
+	Write-Host "=====================================================" -ForegroundColor Cyan
+	If ($OS) {
+		Write-Detail ("  OS             : {0}" -f $OS.Caption)
+		Write-Detail ("  Build          : {0}" -f $OS.BuildNumber)
+	} Else {
+		Write-Detail "  OS             : could not be determined" "Yellow"
+	}
+	Write-Detail ("  Computer       : {0}" -f $env:COMPUTERNAME)
+	Write-Detail ("  Running as     : {0}\{1} (elevated)" -f $env:USERDOMAIN, $env:USERNAME)
+	Write-Detail ("  PowerShell     : {0}" -f $PSVersionTable.PSVersion)
+	Write-Detail ("  Started        : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+
+	$Mode = If ($AppsOnly) { "Apps only" } ElseIf ($SettingsOnly) { "Settings only" } Else { "Apps and settings" }
+	Write-Detail ("  Mode           : {0}" -f $Mode)
+
+	#Only list switches that are actually on, so the line is short and meaningful.
+	$On = @()
+	ForEach ($S in "AllApps","LeaveTasks","LeaveServices","RestrictAppAccess","RestrictLocation",
+	                "DisableOneDrive","Xbox","Cortana","LeaveAI","DisableTelemetryService","Force","NoLog") {
+		If ((Get-Variable -Name $S -ValueOnly -ErrorAction SilentlyContinue)) { $On += "-$S" }
+	}
+	If ($On.Count) {
+		Write-Detail ("  Switches on    : {0}" -f ($On -join " "))
+	} Else {
+		Write-Detail "  Switches on    : none (default workforce build)"
+	}
+
+	#Call out the two switches that change something a tech would want to know about.
+	If ($DisableTelemetryService) {
+		Write-Host "  [WARN] -DisableTelemetryService will break Intune/Defender reporting." -ForegroundColor Red
+	}
+	If ($RestrictAppAccess) {
+		Write-Host "  [WARN] -RestrictAppAccess will break Teams camera and microphone." -ForegroundColor Yellow
+	}
+	Write-Host ""
+}
+
 
 #Writes a registry value quietly and records the result, instead of emitting
 #"The operation completed successfully." for every one of the ~100 writes.
@@ -157,6 +218,10 @@ Function Set-DecrapReg {
 	$null = & reg.exe add "$Path" /T $Type /V "$Name" /D "$Value" /F 2>&1
 	if ($LASTEXITCODE -eq 0) {
 		$Global:MTDecrap.RegChanges++
+		#Strip the hive prefix so the lines stay readable; the pass header already says which hive.
+		$Short = $Path -replace '^(HKCU|HKLM\\AllProfile|HKLM|HKCR)\\', ''
+		$Note  = If ($Comment) { "   # $Comment" } Else { "" }
+		Write-Detail ("      {0} = {1}{2}" -f "$Short\$Name", $Value, $Note) "DarkGray"
 	} else {
 		$Global:MTDecrap.RegFailures++
 		$null = $Global:MTDecrap.RegFailed.Add("$Path -> $Name")
@@ -188,13 +253,40 @@ Function RemoveApps {
 
 	Write-Host "***Removing app packages...***" -ForegroundColor Cyan
 
-	$RemoveApps = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
-		$_.SignatureKind -ne 'System' -and
-		-not $_.IsFramework -and
-		-not $_.NonRemovable -and
-		$_.Name -notmatch $SafeApps
+	#Classify every package once, so the transcript shows WHY each one was spared. On a test
+	#build this is the evidence that the SignatureKind guard is doing its job: the SystemApps\SxS
+	#packages, AI components and shell components should all land in the "system" bucket.
+	$AllPkgs = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+	$SysPkgs = @($AllPkgs | Where-Object { $_.SignatureKind -eq 'System' })
+	$FwPkgs  = @($AllPkgs | Where-Object { $_.SignatureKind -ne 'System' -and $_.IsFramework })
+	$LockPkg = @($AllPkgs | Where-Object { $_.SignatureKind -ne 'System' -and -not $_.IsFramework -and $_.NonRemovable })
+	$Cand    = @($AllPkgs | Where-Object { $_.SignatureKind -ne 'System' -and -not $_.IsFramework -and -not $_.NonRemovable })
+	$KeptPkg = @($Cand | Where-Object { $_.Name -match $SafeApps })
+	$RemoveApps = @($Cand | Where-Object { $_.Name -notmatch $SafeApps })
+
+	Write-Detail ("    {0,4} packages installed" -f $AllPkgs.Count) "White"
+	Write-Detail ("    {0,4} skipped: inbox system components (SignatureKind System)" -f $SysPkgs.Count)
+	Write-Detail ("    {0,4} skipped: frameworks (VCLibs, .NET Native, WinUI)" -f $FwPkgs.Count)
+	Write-Detail ("    {0,4} skipped: flagged NonRemovable by Windows" -f $LockPkg.Count)
+	Write-Detail ("    {0,4} protected by the keep-list" -f $KeptPkg.Count)
+	Write-Detail ("    {0,4} targeted for removal" -f $RemoveApps.Count) "White"
+
+	If ($SysPkgs.Count -eq 0 -and $AllPkgs.Count -gt 0) {
+		#Every Windows 11 build has system packages. Zero means the property did not populate,
+		#which would put the old deny-by-default behaviour back in play.
+		Write-Host "    [WARN] No packages reported SignatureKind 'System'. The structural guard" -ForegroundColor Yellow
+		Write-Host "           may not be working on this build; only the name list is protecting" -ForegroundColor Yellow
+		Write-Host "           system components. Check the removal list below before continuing." -ForegroundColor Yellow
 	}
 
+	If ($KeptPkg.Count) {
+		Write-Detail "    Protected by the keep-list:"
+		ForEach ($K in ($KeptPkg | Sort-Object Name)) {
+			Write-Detail ("      [KEEP]    {0}" -f $K.Name) "DarkGray"
+		}
+	}
+
+	If ($RemoveApps.Count) { Write-Detail "    Removing:" }
 	ForEach ($RemovedApp in $RemoveApps) {
 		Remove-AppxPackage -Package $RemovedApp.PackageFullName -AllUsers -ErrorAction SilentlyContinue
 		#Verify rather than assume. The Windows 10 script printed a removal line before every
@@ -210,8 +302,14 @@ Function RemoveApps {
 
 	Write-Host "***Removing provisioned packages (stops them returning for new profiles)...***" -ForegroundColor Cyan
 
-	$RemovePrApps = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-		Where-Object { $_.DisplayName -notmatch $SafeApps }
+	$AllPrApps   = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+	$RemovePrApps = @($AllPrApps | Where-Object { $_.DisplayName -notmatch $SafeApps })
+	$KeptPrApps   = @($AllPrApps | Where-Object { $_.DisplayName -match $SafeApps })
+
+	Write-Detail ("    {0,4} provisioned, {1} protected, {2} targeted" -f $AllPrApps.Count, $KeptPrApps.Count, $RemovePrApps.Count) "White"
+	ForEach ($K in ($KeptPrApps | Sort-Object DisplayName)) {
+		Write-Detail ("      [KEEP]    {0}" -f $K.DisplayName) "DarkGray"
+	}
 
 	ForEach ($RemovedPrApp in $RemovePrApps) {
 		Try {
@@ -246,9 +344,18 @@ Function DisableTasks {
 	#signal on a machine we are responsible for supporting.
 	ForEach ($Task in $Tasks) {
 		$T = Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
-		If ($T) {
+		If (-not $T) {
+			Write-Detail "    [ABSENT]   $Task (not present on this build)" "DarkGray"
+		} ElseIf ($T.State -eq 'Disabled') {
+			Write-Detail "    [ALREADY]  $Task was already disabled" "DarkGray"
+		} Else {
 			$null = $T | Disable-ScheduledTask -ErrorAction SilentlyContinue
-			Write-Host "    [DISABLED] $Task" -ForegroundColor Green
+			$After = (Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue).State
+			If ($After -eq 'Disabled') {
+				Write-Host "    [DISABLED] $Task" -ForegroundColor Green
+			} Else {
+				Write-Host "    [FAILED]   $Task is still '$After'" -ForegroundColor Yellow
+			}
 		}
 	}
 }
@@ -263,9 +370,7 @@ Function DisableServices {
 	Write-Host "***Stopping and disabling services...***" -ForegroundColor Cyan
 
 	#Windows Media Player Network Sharing. Safe to disable on a workstation.
-	Get-Service WMPNetworkSvc -ErrorAction SilentlyContinue |
-		Stop-Service -Force -PassThru -ErrorAction SilentlyContinue |
-		Set-Service -StartupType Disabled -ErrorAction SilentlyContinue
+	Set-DecrapService -Name WMPNetworkSvc -Reason "Media sharing, not needed on a workstation"
 
 	#DiagTrack (Connected User Experiences and Telemetry) is intentionally left running.
 	#Intune Endpoint Analytics lists it as a hard prerequisite, Windows Update for Business
@@ -273,18 +378,49 @@ Function DisableServices {
 	If ($DisableTelemetryService) {
 		Write-Host "    [WARN] -DisableTelemetryService set. Disabling DiagTrack." -ForegroundColor Red
 		Write-Host "    [WARN] This breaks Intune Endpoint Analytics, WUfB reports and MDE reporting." -ForegroundColor Red
-		Get-Service Diagtrack -ErrorAction SilentlyContinue |
-			Stop-Service -Force -PassThru -ErrorAction SilentlyContinue |
-			Set-Service -StartupType Disabled -ErrorAction SilentlyContinue
+		Set-DecrapService -Name Diagtrack -Reason "-DisableTelemetryService was supplied"
 	} Else {
-		Write-Host "    [KEPT] DiagTrack left running (required by Intune / Defender reporting)." -ForegroundColor DarkGray
+		$DT = Get-Service Diagtrack -ErrorAction SilentlyContinue
+		If ($DT) {
+			Write-Host ("    [KEPT] DiagTrack is '{0}' / '{1}' - required by Intune and Defender reporting." -f $DT.Status, $DT.StartType) -ForegroundColor DarkGray
+			If ($DT.Status -ne 'Running') {
+				Write-Host "    [WARN] DiagTrack is not running. Something else on this image disabled it;" -ForegroundColor Yellow
+				Write-Host "           Endpoint Analytics and Defender reporting will be degraded." -ForegroundColor Yellow
+			}
+		} Else {
+			Write-Host "    [WARN] DiagTrack service not found on this machine." -ForegroundColor Yellow
+		}
 	}
 
 	#Xbox services
 	If (-not $Xbox) {
-		Get-Service XblAuthManager,XblGameSave,XboxNetApiSvc -ErrorAction SilentlyContinue |
-			Stop-Service -Force -PassThru -ErrorAction SilentlyContinue |
-			Set-Service -StartupType Disabled -ErrorAction SilentlyContinue
+		ForEach ($Svc in "XblAuthManager","XblGameSave","XboxNetApiSvc") {
+			Set-DecrapService -Name $Svc -Reason "Xbox service"
+		}
+	}
+}
+
+
+#Stop and disable one service, reporting the state it actually ended in.
+Function Set-DecrapService {
+	param([Parameter(Mandatory=$true)][string]$Name, [string]$Reason = "")
+	$Svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+	If (-not $Svc) {
+		Write-Detail "    [ABSENT]   $Name (not present on this build)" "DarkGray"
+		return
+	}
+	If ($Svc.StartType -eq 'Disabled' -and $Svc.Status -ne 'Running') {
+		Write-Detail "    [ALREADY]  $Name was already stopped and disabled" "DarkGray"
+		return
+	}
+	$Svc | Stop-Service -Force -ErrorAction SilentlyContinue
+	Set-Service -Name $Name -StartupType Disabled -ErrorAction SilentlyContinue
+	$After = Get-Service -Name $Name -ErrorAction SilentlyContinue
+	If ($After -and $After.StartType -eq 'Disabled') {
+		$Note = If ($Reason) { " ($Reason)" } Else { "" }
+		Write-Host ("    [DISABLED] {0} -> {1} / {2}{3}" -f $Name, $After.Status, $After.StartType, $Note) -ForegroundColor Green
+	} Else {
+		Write-Host ("    [FAILED]   {0} is still '{1}' / '{2}'" -f $Name, $After.Status, $After.StartType) -ForegroundColor Yellow
 	}
 }
 
@@ -564,6 +700,104 @@ Function RegSetMachine {
 }
 
 
+#Post-run verification. Reads the settings back rather than trusting that the writes landed,
+#and confirms the packages we promised to protect are still installed. This is the automated
+#version of the checklist in Scripts\Win-11-DeCrapifier\README.md.
+Function Assert-DecrapValue {
+	param(
+		[Parameter(Mandatory=$true)][string]$Label,
+		[Parameter(Mandatory=$true)][string]$Path,
+		[Parameter(Mandatory=$true)][string]$Name,
+		[Parameter(Mandatory=$true)]$Expected
+	)
+	$Actual = $null
+	Try { $Actual = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } Catch { }
+
+	If ("$Actual" -eq "$Expected") {
+		Write-Host ("  [PASS] {0,-34} {1}" -f $Label, $Actual) -ForegroundColor Green
+		$Global:MTDecrap.VerifyPass++
+	} Else {
+		$Shown = If ($null -eq $Actual) { "<not set>" } Else { $Actual }
+		Write-Host ("  [FAIL] {0,-34} got '{1}', expected '{2}'" -f $Label, $Shown, $Expected) -ForegroundColor Red
+		$Global:MTDecrap.VerifyFail++
+	}
+}
+
+Function Assert-DecrapApp {
+	param([Parameter(Mandatory=$true)][string]$Name)
+	If (Get-AppxPackage -Name $Name -AllUsers -ErrorAction SilentlyContinue) {
+		Write-Host ("  [PASS] {0,-34} still installed" -f $Name) -ForegroundColor Green
+		$Global:MTDecrap.VerifyPass++
+	} Else {
+		#Not every machine ships every one of these, so this is informational rather than a hard fail.
+		Write-Host ("  [n/a ] {0,-34} not installed on this machine" -f $Name) -ForegroundColor DarkGray
+	}
+}
+
+Function Test-DecrapResult {
+	Write-Host ""
+	Write-Host "***Verifying (reading settings back)...***" -ForegroundColor Cyan
+
+	If (-not $AppsOnly) {
+		#--- Services ---
+		$DT = Get-Service Diagtrack -ErrorAction SilentlyContinue
+		$WantRunning = -not $DisableTelemetryService
+		If ($DT) {
+			$IsRunning = ($DT.Status -eq 'Running')
+			If ($IsRunning -eq $WantRunning) {
+				Write-Host ("  [PASS] {0,-34} {1} / {2}" -f "DiagTrack service", $DT.Status, $DT.StartType) -ForegroundColor Green
+				$Global:MTDecrap.VerifyPass++
+			} Else {
+				Write-Host ("  [FAIL] {0,-34} {1} / {2}" -f "DiagTrack service", $DT.Status, $DT.StartType) -ForegroundColor Red
+				$Global:MTDecrap.VerifyFail++
+			}
+		}
+
+		#--- Machine policies ---
+		$Want = If ($DisableTelemetryService) { 0 } Else { 1 }
+		Assert-DecrapValue "AllowTelemetry" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" $Want
+		Assert-DecrapValue "DisableWindowsConsumerFeatures" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
+		Assert-DecrapValue "Widgets off" "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+		Assert-DecrapValue "Consumer Chat icon hidden" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon" 3
+
+		If (-not $LeaveAI) {
+			Assert-DecrapValue "Recall snapshots off" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+			Assert-DecrapValue "Recall component removed" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "AllowRecallEnablement" 0
+			Assert-DecrapValue "Click to Do off" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableClickToDo" 1
+			Assert-DecrapValue "Paint Image Creator off" "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint" "DisableImageCreator" 1
+		}
+
+		#--- Current user ---
+		Assert-DecrapValue "File extensions visible" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
+		Assert-DecrapValue "Explorer opens to This PC" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
+		Assert-DecrapValue "Setup nag suppressed" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+		Assert-DecrapValue "Content delivery off" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "ContentDeliveryAllowed" 0
+		Assert-DecrapValue "Advertising ID off" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
+
+		#--- Default profile. This is what new users inherit, and the only way to check it
+		#    without creating an account is to mount the hive again.
+		If (LoadDefaultHive -RegLocation "HKLM\DecrapVerify") {
+			Assert-DecrapValue "New profiles: file extensions" "HKLM:\DecrapVerify\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
+			Assert-DecrapValue "New profiles: content delivery" "HKLM:\DecrapVerify\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "ContentDeliveryAllowed" 0
+			UnloadDefaultHive -RegLocation "HKLM\DecrapVerify"
+		} Else {
+			Write-Host "  [WARN] Could not mount the default profile to verify it." -ForegroundColor Yellow
+		}
+	}
+
+	If (-not $SettingsOnly) {
+		#--- Packages we promised to keep ---
+		Write-Host "  Packages that must survive:" -ForegroundColor Cyan
+		ForEach ($A in "MSTeams","Microsoft.OutlookForWindows","Microsoft.MicrosoftOfficeHub",
+		                "Microsoft.GetHelp","Microsoft.PowerShell","Microsoft.CompanyPortal",
+		                "Microsoft.WindowsStore","Microsoft.SecHealthUI","Microsoft.DesktopAppInstaller",
+		                "AppUp.IntelArcSoftware","MicrosoftCorporationII.QuickAssist") {
+			Assert-DecrapApp -Name $A
+		}
+	}
+}
+
+
 Function Goodbye {
 	$S = $Global:MTDecrap
 	Write-Host ""
@@ -574,6 +808,13 @@ Function Goodbye {
 	Write-Host ("  Apps Windows refused      : {0}" -f $S.AppsRefused) -ForegroundColor DarkGray
 	Write-Host ("  Provisioned pkgs removed  : {0}" -f $S.ProvRemoved) -ForegroundColor Green
 	Write-Host ("  Registry values written   : {0}" -f $S.RegChanges)  -ForegroundColor Green
+	If (($S.VerifyPass + $S.VerifyFail) -gt 0) {
+		If ($S.VerifyFail -gt 0) {
+			Write-Host ("  Verification              : {0} passed, {1} FAILED" -f $S.VerifyPass, $S.VerifyFail) -ForegroundColor Red
+		} Else {
+			Write-Host ("  Verification              : {0} passed, 0 failed" -f $S.VerifyPass) -ForegroundColor Green
+		}
+	}
 	If ($S.RegFailures -gt 0) {
 		Write-Host ("  Registry values FAILED    : {0}" -f $S.RegFailures) -ForegroundColor Yellow
 		ForEach ($F in $S.RegFailed) { Write-Host "      $F" -ForegroundColor Yellow }
@@ -607,9 +848,7 @@ If (-not $NoLog) {
 	Start-Transcript "$ENV:SYSTEMDRIVE\Windows11DCtranscript.txt" -Force | Out-Null
 }
 
-Write-Host ""
-Write-Host "****** Decrapifying Windows 11 ******" -ForegroundColor Cyan
-Write-Host ""
+Show-DecrapBanner
 
 Try {
 	If ($AppsOnly) {
@@ -624,6 +863,7 @@ Try {
 		DisableServices
 		RegChange
 	}
+	If (-not $Quiet) { Test-DecrapResult }
 	Goodbye
 } Finally {
 	Remove-Variable -Name MTDecrap -Scope Global -ErrorAction SilentlyContinue

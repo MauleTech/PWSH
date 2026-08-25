@@ -1828,6 +1828,11 @@ Function Invoke-Win11Decrap {
 		downloaded from GitHub otherwise. A transcript is written to
 		SYSTEMDRIVE\Windows11DCtranscript.txt unless -NoLog is used.
 
+		Output is verbose by default so a run can be checked rather than assumed: an environment
+		banner, a package triage showing what was skipped and why, every registry value written,
+		and a closing pass that reads the important settings back and reports PASS/FAIL. Pass
+		-Quiet for the summary only.
+
 		Requires an elevated session. Reboot the machine when it finishes.
 
 	.PARAMETER AllApps
@@ -1877,6 +1882,12 @@ Function Invoke-Win11Decrap {
 	.PARAMETER Force
 		Run even if the machine does not report a Windows 11 build.
 
+	.PARAMETER Quiet
+		Suppress the detailed per-item output. Verbose is the DEFAULT: the script prints an
+		environment banner, the full package triage (what was skipped and why), every registry
+		value it writes, and a post-run pass that reads the important settings back and reports
+		PASS/FAIL. Use -Quiet only once a build process is trusted and you want the summary alone.
+
 	.EXAMPLE
 		Invoke-Win11Decrap
 
@@ -1888,6 +1899,11 @@ Function Invoke-Win11Decrap {
 
 		Apply the settings to a machine whose apps have already been handled, for example one
 		that was run through Invoke-Win11Debloat first.
+
+	.EXAMPLE
+		Invoke-Win11Decrap -Quiet
+
+		Same work, summary output only. For trusted build automation, not for a first run.
 
 	.EXAMPLE
 		Invoke-Win11Decrap -RestrictAppAccess -RestrictLocation -DisableOneDrive
@@ -1908,6 +1924,7 @@ Function Invoke-Win11Decrap {
 		[switch]$DisableTelemetryService,
 		[switch]$NoLog,
 		[switch]$Force,
+		[switch]$Quiet,
 		[Parameter(ParameterSetName = "AppsOnly")]
 		[switch]$AppsOnly,
 		[Parameter(ParameterSetName = "SettingsOnly")]

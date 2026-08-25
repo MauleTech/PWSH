@@ -41,7 +41,38 @@ OEM Win32 crapware entirely. Use that if you would rather not introduce the thir
 
 ## What to verify on the test build
 
-After the reboot, confirm these. They are the findings the fork exists to fix.
+`Invoke-Win11Decrap` is **verbose by default** and now checks itself. Look for these in the
+output before you go anywhere near the manual commands:
+
+1. **Environment banner** at the top. Confirms the OS gate saw a Windows 11 build, and lists
+   exactly which switches were in effect.
+2. **Package triage.** A count of what was skipped and why:
+
+   ```
+       142 packages installed
+        61 skipped: inbox system components (SignatureKind System)
+        24 skipped: frameworks (VCLibs, .NET Native, WinUI)
+         3 skipped: flagged NonRemovable by Windows
+        31 protected by the keep-list
+        23 targeted for removal
+   ```
+
+   The "SignatureKind System" line is the F4 fix proving itself. If it reads **0**, the script
+   says so loudly: the structural guard did not work on that build and only the name list is
+   protecting system components. Stop and check the removal list before continuing.
+   Every protected package is then listed by name, so you can eyeball that Teams, Get Help,
+   PowerShell and the Intel graphics panel are on the keep side.
+3. **Every registry value it writes**, as `path\name = value`.
+4. **Post-run verification.** The script re-reads the settings that matter and prints PASS/FAIL
+   per item, including two values read back out of the **default profile hive**, which is the
+   only way to confirm new users will inherit the settings without creating an account. The
+   summary ends with `Verification : N passed, N failed`.
+
+Anything other than `0 failed` needs looking at before the build ships.
+
+Pass `-Quiet` to drop back to summary-only output once a build process is trusted.
+
+The manual cross-checks below still hold if you want to confirm independently after the reboot.
 
 | Check | Expected | Command |
 |---|---|---|
@@ -73,6 +104,10 @@ The output is deliberately different from the old script:
   summary. The old script emitted "The operation completed successfully." roughly 100 times per run
   and buried two real failures in the middle of it.
 
+* Scheduled tasks and services report the state they actually ended in, and distinguish
+  `[DISABLED]` (we changed it) from `[ALREADY]` (it was fine) and `[ABSENT]` (not on this build).
+  A `[FAILED]` line means the item is still enabled after the attempt.
+
 `Invoke-Win11Debloat` uses upstream's own log at `C:\ProgramData\Debloat\Debloat.log`.
 
 ## Switch mapping from the Windows 10 script
@@ -90,6 +125,7 @@ on does.
 | `$ClearStart = $true` (hardcoded) | removed | `Import-StartLayout` is deprecated on Windows 11 and failed on every run |
 | n/a | `-LeaveAI` | off, so Recall / Click to Do / Copilot / Paint AI get disabled |
 | n/a | `-DisableTelemetryService` | off. Only for genuinely unmanaged machines. |
+| n/a | `-Quiet` | off, i.e. verbose output IS the default |
 
 `-LeaveTasks`, `-LeaveServices`, `-Xbox`, `-Cortana`, `-AllApps`, `-NoLog`, `-AppsOnly` and
 `-SettingsOnly` behave as they did.
@@ -115,6 +151,9 @@ on does.
 
 * Not yet run on real hardware. Logic was exercised against stubbed Appx, service, scheduled task
   and `reg.exe` calls; the `SignatureKind` / `IsFramework` / `NonRemovable` filter in particular
-  needs confirming on a live Windows 11 build.
+  needs confirming on a live Windows 11 build. The package triage output is designed to make that
+  confirmation a glance rather than an investigation.
+* The verification pass checks the current user and the default profile. It does not check other
+  existing user profiles, which the script does not write to either.
 * Windows 11 Start layout is not configured at all. If we want one, it belongs in Intune or a
   staged `LayoutModification.json`, not in this script.

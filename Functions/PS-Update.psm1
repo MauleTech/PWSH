@@ -111,7 +111,7 @@ function Update-ClaudeCode {
 Function Update-DattoAgent {
 	Enable-SSL
 	$progressPreference = 'silentlyContinue'
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Datto-Agent-Update/DattoAgentUpdate.txt -usebasicparsing | Invoke-Expression
+	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Datto-Agent-Update/DattoAgentUpdate.txt -usebasicparsing | Invoke-Expression
 }
 
 Function Update-DellPackages {
@@ -844,7 +844,7 @@ Function Update-Everything {
 Function Update-ITS247Agent {
 	$DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion
 	$TYPE = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).TYPE
-	$AvailableVersion = ((Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/ITS247Agent/DPMAVersion.txt -UseBasicParsing).Content).Trim()
+	$AvailableVersion = ((Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/ITS247Agent/DPMAVersion.txt -UseBasicParsing).Content).Trim()
 
 	If(($DisplayVersion -ne $AvailableVersion) -and ($TYPE -eq "DPMA")) {
 	 WRITE-HOST "Updating Agent from $DisplayVersion to $AvailableVersion"

@@ -1792,7 +1792,7 @@ Function Invoke-Win10Decrap {
 	$progressPreference = 'silentlyContinue'
 	Set-ExecutionPolicy Bypass -Scope Process -Force
 	Enable-SSL
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Win-10-DeCrapifier/Windows10Decrapifier.txt -UseBasicParsing | Invoke-Expression
+	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Win-10-DeCrapifier/Windows10Decrapifier.txt -UseBasicParsing | Invoke-Expression
 }
 
 Function Invoke-Win11Decrap {
@@ -1915,7 +1915,7 @@ Function Invoke-Win11Decrap {
 	)
 
 	$RelativePath = "Scripts\Win-11-DeCrapifier\Windows11Decrapifier.txt"
-	$ScriptUrl    = "https://raw.githubusercontent.com/MauleTech/PWSH/main/Scripts/Win-11-DeCrapifier/Windows11Decrapifier.txt"
+	$ScriptUrl    = "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Win-11-DeCrapifier/Windows11Decrapifier.txt"
 
 	Write-Host "Windows 11 Decrapifier (Maule Techs)" -ForegroundColor Cyan
 

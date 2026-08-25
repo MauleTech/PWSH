@@ -27,7 +27,7 @@ $progressPreference = 'silentlyContinue'
 	}
 Function DattoBDRCheck {
 	#Determine if Shadowsnap agent is installed
-	$OnlineDattoAgent = iwr https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Datto-Agent-Update/OnlineDattoAgent.json | ConvertFrom-Json
+	$OnlineDattoAgent = iwr https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Datto-Agent-Update/OnlineDattoAgent.json | ConvertFrom-Json
 	if (Get-Service "StorageCraft Raw Agent" -ErrorAction SilentlyContinue) {
 		#Designate Registry key to read version number from
 		$RegKeyVer = "hklm:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ShadowSnap"
@@ -549,7 +549,7 @@ function LongMaintenance {
 			Write-Host SQL Database Instance Name: $SQLName ($SQLEd)
 			Write-Host -NoNewLine "SQL Service Pack Build Version | Patch: "
 			$SQLweb = New-Object Net.WebClient
-			$SQLstring = $SQLweb.DownloadString("https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Maintenance-Checks/SQL_SP_Current_Build_Numbers.txt")
+			$SQLstring = $SQLweb.DownloadString("https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Maintenance-Checks/SQL_SP_Current_Build_Numbers.txt")
 			if (($SQLstring -match $Version) -or ($SQLstring -match $PatchLevel)) {
 				Write-Host -ForegroundColor Green "$Version | $PatchLevel `(Service Pack $SQLSP`) and it is up to date!"
 			}

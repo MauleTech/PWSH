@@ -165,7 +165,7 @@
 		#Download latest datto update script
 		#Forces downloads to use TLS1.2
 		[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-		<#(New-Object System.Net.WebClient).DownloadFile("https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Datto-Agent-Update/DattoAgentUpdate.txt", "$ITFolder\scripts\DattoAgentUpdate.ps1")
+		<#(New-Object System.Net.WebClient).DownloadFile("https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Datto-Agent-Update/DattoAgentUpdate.txt", "$ITFolder\scripts\DattoAgentUpdate.ps1")
 		Unblock-File -Path "$ITFolder\scripts\DattoAgentUpdate.ps1"
 		ForEach ($d in $objdata) {
 			$sequence = $d.SEQUENCE | Out-String

@@ -59,7 +59,7 @@ If ($NewIsInstalled) {
 	Start-Sleep -Seconds 10
 	#Dowload config file index
 	$SiteConfigs = @()
-	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
+	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
 	$MSIUrl = 'https://files.mauletech.com/Software/cisco-secure-client-win-5.1.2.42-predeploy-k9.zip?dl'
 
 	Function InstallAgent {

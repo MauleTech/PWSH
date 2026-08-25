@@ -82,6 +82,8 @@ The manual cross-checks below still hold if you want to confirm independently af
 | Get Help survived | package present | `Get-AppxPackage Microsoft.GetHelp` |
 | Intel graphics panel survived | package present | `Get-AppxPackage AppUp.IntelArcSoftware` |
 | Widgets policy applied | `0` | `Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' AllowNewsAndInterests` |
+| Widgets board disabled | `1` | `Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' DisableWidgetsBoard` |
+| Widgets taskbar button hidden | `0` | `Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarDa` |
 | Recall off | `1` | `Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' DisableAIDataAnalysis` |
 | File extensions visible | `0` | `Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' HideFileExt` |
 | No Start menu errors | transcript has no `Import-StartLayout` | `Select-String -Path C:\Windows11DCtranscript.txt -Pattern 'StartLayout'` |
@@ -129,6 +131,35 @@ on does.
 
 `-LeaveTasks`, `-LeaveServices`, `-Xbox`, `-Cortana`, `-AllApps`, `-NoLog`, `-AppsOnly` and
 `-SettingsOnly` behave as they did.
+
+## A note on the widgets "Open on hover" behaviour
+
+There is **no machine-wide policy for the "Open Widgets board on hover" toggle**, and no working
+per-user registry value for it either. Microsoft does not ship one: the `NewsAndInterests` CSP
+contains exactly three settings (`AllowNewsAndInterests`, `DisableWidgetsBoard`,
+`DisableWidgetsOnLockScreen`) and none of them is hover.
+
+Two keys that guides commonly suggest do **not** do what people think:
+
+* `HKCU\...\CurrentVersion\Feeds\ShellFeedsTaskbarOpenOnHover` is the Windows **10** News and
+  Interests key. It has no effect on Windows 11.
+* `HKCU\...\CurrentVersion\Feeds\DSB\OpenOnHover` is **search** on hover, not widgets. The
+  script sets it anyway, because opening search on hover is the same class of annoyance, but it
+  is a different feature.
+
+The script handles hover by removing the thing you would hover over, at three levels:
+
+| Setting | Scope | Effect |
+|---|---|---|
+| `Dsh\AllowNewsAndInterests` = 0 | machine | Turns off the whole widgets feature "including content on the taskbar". Released policy, Pro supported. |
+| `Dsh\DisableWidgetsBoard` = 1 | machine | "Its entry point will no longer appear on the taskbar." Same ADMX. Microsoft still marks this preview, so it may be a no-op on some builds; an unrecognised policy value is ignored, so it costs nothing and starts working when the build catches up. |
+| `Explorer\Advanced\TaskbarDa` = 0 | per user + default profile | Hides the widgets button. Belt and braces if a build ignores the policies above. |
+
+`Dsh\DisableWidgetsOnLockScreen` = 1 is set too, for lock screen widgets.
+
+Worth knowing: Microsoft is changing this default upstream anyway. Insider Beta build 26220.8680
+(June 2026) lists "Disabling **Open on hover** by default" and taskbar badging off by default as
+shipping changes to make Widgets "quiet by default".
 
 ## Notes on Invoke-Win11Debloat
 

@@ -1,0 +1,900 @@
+#Windows 11 Decrapifier (Maule Techs)
+#
+#Forked from the Windows 10 Decrapifier 18XX/19XX/20XX by CSAND (Jan 2022), which is still at
+#Scripts\Win-10-DeCrapifier\Windows10Decrapifier.txt. That script remains callable via
+#Invoke-Win10Decrap and is unchanged. This one is called by Invoke-Win11Decrap.
+#
+#PURPOSE: Same intent as the original -- strip consumer bloat, turn off advertising and content
+#         delivery, restrict data collection -- but scoped for a device that is going to be a
+#         MANAGED WORKFORCE ENDPOINT (Microsoft 365, Intune and/or Action1, Defender).
+#
+#WHY THIS FORK EXISTS: see Scripts\Win-10-DeCrapifier\WINDOWS11-REVIEW.md for the full writeup.
+#         Summary of what changed from the Windows 10 script:
+#
+#  F1  No longer stops/disables DiagTrack, and AllowTelemetry is now 1 (Required) instead of 0.
+#      Intune Endpoint Analytics requires DiagTrack running; Windows Update for Business reports
+#      require diagnostic data at Required minimum; Defender for Endpoint logs Event 62 when
+#      DiagTrack cannot start. Use -DisableTelemetryService to restore the old behavior on
+#      unmanaged devices.
+#  F2  ClearStartMenu is gone. Import-StartLayout is deprecated on Windows 11 and threw a
+#      terminating error on every single run. Nothing replaced it here; do Start layout from
+#      Intune or a staged LayoutModification.json if you need it.
+#  F3  $GoodApps extended: Teams, new Outlook, Office Hub, Company Portal, Get Help, PowerShell 7,
+#      Remote Desktop / Windows App, current Intel companion apps, and OEM driver publishers.
+#  F4  App removal now skips inbox system packages by SignatureKind instead of relying on a
+#      hand-maintained keep-list. This is what stops new Windows components (the SystemApps\SxS
+#      packages, AI Fabric, shell components) being swept in the next time Microsoft ships some.
+#  F5  The obsolete Windows 10 Feeds\ShellFeedsTaskbarViewMode key (which threw "Access is denied"
+#      twice per run) is replaced with the documented Dsh\AllowNewsAndInterests policy.
+#  F6  The four switches the Windows 10 script silently hardcoded after the param block are now
+#      real, visible, overridable parameters. See the switch table below for the mapping.
+#  F7  Remove-AppxPackage now uses -AllUsers, and removals are verified rather than assumed.
+#  F8  Dead Windows 10 settings removed (My People, Meet Now, legacy Edge, Internet Explorer).
+#      Delivery Optimization now also written to the supported policy path.
+#  NEW Windows 11 era controls added: Recall, Click to Do, Paint generative AI, Copilot, Widgets,
+#      show file extensions, Explorer opens to This PC, "Finish setting up your device" nag.
+#      On widgets: there is no machine-wide "Open on hover" policy, so the taskbar entry point
+#      is removed instead. See the Widgets block in RegSetMachine for the detail.
+#
+#IMPORTANT: this script is delivered by piping to Invoke-Expression, so #Requires is not honored.
+#           The elevation check below is explicit for that reason.
+#
+#
+#***Switches***
+#
+#Switch                     Function
+#-------------------------------------------------------------------------------------------------
+#No switches                Removes consumer apps, disables CEIP scheduled tasks, disables a small
+#                           set of services, applies privacy/advertising/AI registry settings to
+#                           HKCU, the default user hive, and HKLM.
+#-AllApps                   Removes ALL removable apps including the Store. Rarely what you want.
+#-LeaveTasks                Leaves scheduled tasks alone.
+#-LeaveServices             Leaves services alone.
+#-RestrictAppAccess         Deny camera/mic/contacts/calendar/documents to Store apps. OFF by
+#                           default. (The Windows 10 script hardcoded $AppAccess = $true, which
+#                           meant this block never ran. Same default, now visible.) Turning this
+#                           on will break Teams camera and microphone for Store-app callers.
+#-RestrictLocation          Deny location and sensors. OFF by default. (Was hardcoded $Tablet.)
+#-DisableOneDrive           Kill OneDrive via policy and remove it from Explorer. OFF by default.
+#                           (Was hardcoded $OneDrive = $true, i.e. leave OneDrive working.)
+#-Xbox                      Leave Xbox apps, services and Game DVR alone.
+#-Cortana                   Leave the legacy Cortana / Bing search keys alone.
+#-LeaveAI                   Leave Recall, Click to Do, Copilot and Paint generative AI alone.
+#-DisableTelemetryService   Stop and disable DiagTrack and set AllowTelemetry to 0. DO NOT USE on
+#                           anything managed by Intune, Action1 reporting, or Defender for
+#                           Endpoint. Present only for genuinely unmanaged standalone machines.
+#-NoLog                     Do not write a transcript to SYSTEMDRIVE\Windows11DCtranscript.txt.
+#-AppsOnly                  Only remove apps.
+#-SettingsOnly              Only apply settings, services and tasks.
+#-Force                     Run even if the OS is not detected as Windows 11.
+#-Quiet                     Suppress the detailed per-item output. Verbose IS the default:
+#                           the script prints an environment banner, the full package
+#                           triage, every registry write, and a post-run read-back that
+#                           re-checks the settings that matter. Use -Quiet once a build
+#                           process is trusted and you only want the summary.
+
+[cmdletbinding(DefaultParameterSetName="Decrapifier")]
+param (
+	[switch]$AllApps,
+	[switch]$LeaveTasks,
+	[switch]$LeaveServices,
+	[switch]$RestrictAppAccess,
+	[switch]$RestrictLocation,
+	[switch]$DisableOneDrive,
+	[switch]$Xbox,
+	[switch]$Cortana,
+	[switch]$LeaveAI,
+	[switch]$DisableTelemetryService,
+	[switch]$NoLog,
+	[switch]$Force,
+	[switch]$Quiet,
+	[Parameter(ParameterSetName="AppsOnly")]
+	[switch]$AppsOnly,
+	[Parameter(ParameterSetName="SettingsOnly")]
+	[switch]$SettingsOnly
+)
+
+#------USER EDITABLE VARIABLES------
+
+#Apps to KEEP. Substring match, case-insensitive, evaluated with -notmatch. Be specific enough not
+#to overlap with something you do want removed, and avoid very short tokens (a bare "HP" would
+#match unrelated packages). Do not begin or end the string with "|".
+#
+#Additions over the Windows 10 list, and why:
+#  MSTeams, Microsoft.OutlookForWindows, Microsoft.MicrosoftOfficeHub  -- Microsoft 365 clients.
+#      OfficeHub was renamed to the Microsoft 365 Copilot app in Jan 2025 and is the Office launcher.
+#  Microsoft.CompanyPortal                     -- Intune Company Portal.
+#  Microsoft.GetHelp                           -- hosts several Windows 11 troubleshooters.
+#  Microsoft.PowerShell                        -- PowerShell 7 (Store/MSIX build).
+#  Microsoft.RemoteDesktop, MicrosoftCorporationII.MicrosoftRemoteDesktop,
+#      MicrosoftCorporationII.Windows365       -- the Windows App / Remote Desktop family.
+#  AppUp.IntelArcSoftware                      -- Intel Graphics Software. On Core Ultra hardware
+#      this IS the graphics control panel; IntelGraphicsExperience is the deprecated one.
+#  AppUp.IntelManagementandSecurityStatus      -- vPro / AMT status.
+#  AD2F1837 (HP), E046963F (Lenovo), Realtek, Synaptics, Dolby, NVIDIA, AMD, ELAN
+#                                              -- OEM and driver companion publishers. Previously
+#      only Dell and WavesAudio were protected.
+#  MicrosoftWindows.CrossDevice, Microsoft.ZuneMusic, Microsoft.ApplicationCompatibilityEnhancements
+#                                              -- team decision; kept here by default.
+
+$GoodApps = "AppUp.IntelOptaneMemoryandStorageManagement|AppUp.IntelGraphicsExperience|AppUp.IntelArcSoftware|AppUp.IntelManagementandSecurityStatus|Windows.PrintDialog|NotepadPlusPlus|MicrosoftWindows.Client|MicrosoftCorporationII.QuickAssist|Microsoft.Winget.Source|Microsoft.WindowsAppRuntime|Microsoft.Windows.PrintQueueActionCenter|Microsoft.Win32WebViewHost|Microsoft.Todos|Microsoft.CredDialogHost|Microsoft.CompanyPortal|Microsoft.PowerShell|Microsoft.GetHelp|Microsoft.ApplicationCompatibilityEnhancements|MSTeams|Microsoft.OutlookForWindows|Microsoft.MicrosoftOfficeHub|MicrosoftCorporationII.MicrosoftRemoteDesktop|MicrosoftCorporationII.Windows365|Microsoft.RemoteDesktop|MicrosoftWindows.CrossDevice|Microsoft.ZuneMusic|Dell|AD2F1837|E046963F|RealtekSemiconductorCorp|SynapticsIncorporated|DolbyLaboratories|NVIDIACorp|AdvancedMicroDevicesInc|ELANMicroelectronics|WindowsTerminal|WavesAudio|store|calculator|camera|sticky|windows.photos|soundrecorder|mspaint|microsoft.paint|windowsnotepad|screensketch|Microsoft.HEIFImageExtension|Microsoft.WindowsNotepad|Microsoft.HEVCVideoExtension|Microsoft.VP9VideoExtensions|Microsoft.WebMediaExtensions|Microsoft.WebpImageExtension|Extension|Microsoft.YourPhone|Microsoft.MicrosoftEdge|Alarms"
+
+#------End editable variables------
+
+
+#---Setup---
+
+$Global:MTDecrap = @{
+	AppsRemoved  = 0
+	AppsRefused  = 0
+	ProvRemoved  = 0
+	RegChanges   = 0
+	RegFailures  = 0
+	RegFailed    = New-Object System.Collections.ArrayList
+	VerifyPass   = 0
+	VerifyFail   = 0
+}
+
+Function Test-Elevated {
+	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+	return $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+Function Test-Windows11 {
+	#Windows 11 reports as 10.0 with a build of 22000 or higher.
+	try {
+		$Build = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber
+		return ($Build -ge 22000)
+	} catch {
+		return $false
+	}
+}
+
+
+#Detail output. On by default; -Quiet turns it off. Everything printed through here is
+#confirmation of what the script actually did, so it is worth having on for a test build.
+Function Write-Detail {
+	param([string]$Message, [string]$Color = "Gray")
+	If (-not $Quiet) { Write-Host $Message -ForegroundColor $Color }
+}
+
+
+#Environment banner. Proves which OS gate was hit and which switches are actually in effect,
+#which is the first thing you want in a transcript when something looks wrong.
+Function Show-DecrapBanner {
+	$OS = $null
+	Try { $OS = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } Catch { }
+
+	Write-Host ""
+	Write-Host "=====================================================" -ForegroundColor Cyan
+	Write-Host " Windows 11 Decrapifier (Maule Techs)" -ForegroundColor Cyan
+	Write-Host "=====================================================" -ForegroundColor Cyan
+	If ($OS) {
+		Write-Detail ("  OS             : {0}" -f $OS.Caption)
+		Write-Detail ("  Build          : {0}" -f $OS.BuildNumber)
+	} Else {
+		Write-Detail "  OS             : could not be determined" "Yellow"
+	}
+	Write-Detail ("  Computer       : {0}" -f $env:COMPUTERNAME)
+	Write-Detail ("  Running as     : {0}\{1} (elevated)" -f $env:USERDOMAIN, $env:USERNAME)
+	Write-Detail ("  PowerShell     : {0}" -f $PSVersionTable.PSVersion)
+	Write-Detail ("  Started        : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+
+	$Mode = If ($AppsOnly) { "Apps only" } ElseIf ($SettingsOnly) { "Settings only" } Else { "Apps and settings" }
+	Write-Detail ("  Mode           : {0}" -f $Mode)
+
+	#Only list switches that are actually on, so the line is short and meaningful.
+	$On = @()
+	ForEach ($S in "AllApps","LeaveTasks","LeaveServices","RestrictAppAccess","RestrictLocation",
+	                "DisableOneDrive","Xbox","Cortana","LeaveAI","DisableTelemetryService","Force","NoLog") {
+		If ((Get-Variable -Name $S -ValueOnly -ErrorAction SilentlyContinue)) { $On += "-$S" }
+	}
+	If ($On.Count) {
+		Write-Detail ("  Switches on    : {0}" -f ($On -join " "))
+	} Else {
+		Write-Detail "  Switches on    : none (default workforce build)"
+	}
+
+	#Call out the two switches that change something a tech would want to know about.
+	If ($DisableTelemetryService) {
+		Write-Host "  [WARN] -DisableTelemetryService will break Intune/Defender reporting." -ForegroundColor Red
+	}
+	If ($RestrictAppAccess) {
+		Write-Host "  [WARN] -RestrictAppAccess will break Teams camera and microphone." -ForegroundColor Yellow
+	}
+	Write-Host ""
+}
+
+
+#Writes a registry value quietly and records the result, instead of emitting
+#"The operation completed successfully." for every one of the ~100 writes.
+Function Set-DecrapReg {
+	param(
+		[Parameter(Mandatory=$true)][string]$Path,
+		[Parameter(Mandatory=$true)][string]$Name,
+		[Parameter(Mandatory=$true)][string]$Value,
+		[ValidateSet("REG_DWORD","REG_SZ","REG_BINARY")][string]$Type = "REG_DWORD",
+		[string]$Comment = ""
+	)
+	$null = & reg.exe add "$Path" /T $Type /V "$Name" /D "$Value" /F 2>&1
+	if ($LASTEXITCODE -eq 0) {
+		$Global:MTDecrap.RegChanges++
+		#Strip the hive prefix so the lines stay readable; the pass header already says which hive.
+		$Short = $Path -replace '^(HKCU|HKLM\\AllProfile|HKLM|HKCR)\\', ''
+		$Note  = If ($Comment) { "   # $Comment" } Else { "" }
+		Write-Detail ("      {0} = {1}{2}" -f "$Short\$Name", $Value, $Note) "DarkGray"
+	} else {
+		$Global:MTDecrap.RegFailures++
+		$null = $Global:MTDecrap.RegFailed.Add("$Path -> $Name")
+		Write-Host "    [FAIL] $Path -> $Name" -ForegroundColor Yellow
+	}
+}
+
+
+#Appx removal.
+#
+#The Windows 10 script took every installed package and removed anything not on a keep-list. That
+#is why brand new Windows 11 inbox components ended up in the removal loop. Here, inbox system
+#packages are excluded structurally:
+#   SignatureKind 'System'  -- inbox shell components under C:\Windows\SystemApps (including the
+#                              SxS packages that ship with the Feature Experience Pack)
+#   IsFramework             -- VCLibs, .NET Native, WinUI/XAML runtimes
+#   NonRemovable            -- packages Windows refuses to uninstall (populated when elevated)
+#The name-based $SafeApps list is kept as belt and braces in case a given build reports these
+#properties differently.
+Function RemoveApps {
+	$SafeApps = "1527c705|c5e2524a|E2A4F912|F46D4000|AAD.brokerplugin|accountscontrol|AIFabric|apprep.chxapp|assignedaccess|asynctext|AugLoop|bioenrollment|capturepicker|CBSPreview|cloudexperience|contentdelivery|desktopappinstaller|ecapp|edge|extension|Filons|GameCallableUI|getstarted|immersivecontrolpanel|InpApp|LanguageExperiencePack|Livtop|lockapp|MdOdr|NarratorQuickStart|net.native|oobenet|parentalcontrols|PeopleExperienceHost|PinningConfirmationDialog|PPIProjection|search|sechealth|secureas|shellexperience|Speion|startmenuexperience|terminal|UndockedDevKit|vclibs|Voiess|xaml|XGpuEject|MicrosoftWindows.Speech|MicrosoftWindows.Voice"
+
+	If ($Xbox) {
+		$SafeApps = "$SafeApps|Xbox"
+	}
+	If (-not $AllApps) {
+		$SafeApps = "$SafeApps|$GoodApps"
+	}
+
+	Write-Host "***Removing app packages...***" -ForegroundColor Cyan
+
+	#Classify every package once, so the transcript shows WHY each one was spared. On a test
+	#build this is the evidence that the SignatureKind guard is doing its job: the SystemApps\SxS
+	#packages, AI components and shell components should all land in the "system" bucket.
+	$AllPkgs = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+	$SysPkgs = @($AllPkgs | Where-Object { $_.SignatureKind -eq 'System' })
+	$FwPkgs  = @($AllPkgs | Where-Object { $_.SignatureKind -ne 'System' -and $_.IsFramework })
+	$LockPkg = @($AllPkgs | Where-Object { $_.SignatureKind -ne 'System' -and -not $_.IsFramework -and $_.NonRemovable })
+	$Cand    = @($AllPkgs | Where-Object { $_.SignatureKind -ne 'System' -and -not $_.IsFramework -and -not $_.NonRemovable })
+	$KeptPkg = @($Cand | Where-Object { $_.Name -match $SafeApps })
+	$RemoveApps = @($Cand | Where-Object { $_.Name -notmatch $SafeApps })
+
+	Write-Detail ("    {0,4} packages installed" -f $AllPkgs.Count) "White"
+	Write-Detail ("    {0,4} skipped: inbox system components (SignatureKind System)" -f $SysPkgs.Count)
+	Write-Detail ("    {0,4} skipped: frameworks (VCLibs, .NET Native, WinUI)" -f $FwPkgs.Count)
+	Write-Detail ("    {0,4} skipped: flagged NonRemovable by Windows" -f $LockPkg.Count)
+	Write-Detail ("    {0,4} protected by the keep-list" -f $KeptPkg.Count)
+	Write-Detail ("    {0,4} targeted for removal" -f $RemoveApps.Count) "White"
+
+	If ($SysPkgs.Count -eq 0 -and $AllPkgs.Count -gt 0) {
+		#Every Windows 11 build has system packages. Zero means the property did not populate,
+		#which would put the old deny-by-default behaviour back in play.
+		Write-Host "    [WARN] No packages reported SignatureKind 'System'. The structural guard" -ForegroundColor Yellow
+		Write-Host "           may not be working on this build; only the name list is protecting" -ForegroundColor Yellow
+		Write-Host "           system components. Check the removal list below before continuing." -ForegroundColor Yellow
+	}
+
+	If ($KeptPkg.Count) {
+		Write-Detail "    Protected by the keep-list:"
+		ForEach ($K in ($KeptPkg | Sort-Object Name)) {
+			Write-Detail ("      [KEEP]    {0}" -f $K.Name) "DarkGray"
+		}
+	}
+
+	If ($RemoveApps.Count) { Write-Detail "    Removing:" }
+	ForEach ($RemovedApp in $RemoveApps) {
+		Remove-AppxPackage -Package $RemovedApp.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+		#Verify rather than assume. The Windows 10 script printed a removal line before every
+		#attempt and never checked, which made the transcript look far more destructive than it was.
+		If (Get-AppxPackage -Name $RemovedApp.Name -AllUsers -ErrorAction SilentlyContinue) {
+			Write-Host "    [KEPT]    $($RemovedApp.Name) (system refused removal)" -ForegroundColor DarkGray
+			$Global:MTDecrap.AppsRefused++
+		} Else {
+			Write-Host "    [REMOVED] $($RemovedApp.Name)" -ForegroundColor Green
+			$Global:MTDecrap.AppsRemoved++
+		}
+	}
+
+	Write-Host "***Removing provisioned packages (stops them returning for new profiles)...***" -ForegroundColor Cyan
+
+	$AllPrApps   = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+	$RemovePrApps = @($AllPrApps | Where-Object { $_.DisplayName -notmatch $SafeApps })
+	$KeptPrApps   = @($AllPrApps | Where-Object { $_.DisplayName -match $SafeApps })
+
+	Write-Detail ("    {0,4} provisioned, {1} protected, {2} targeted" -f $AllPrApps.Count, $KeptPrApps.Count, $RemovePrApps.Count) "White"
+	ForEach ($K in ($KeptPrApps | Sort-Object DisplayName)) {
+		Write-Detail ("      [KEEP]    {0}" -f $K.DisplayName) "DarkGray"
+	}
+
+	ForEach ($RemovedPrApp in $RemovePrApps) {
+		Try {
+			$null = Remove-AppxProvisionedPackage -Online -PackageName $RemovedPrApp.PackageName -ErrorAction Stop
+			Write-Host "    [REMOVED] $($RemovedPrApp.DisplayName)" -ForegroundColor Green
+			$Global:MTDecrap.ProvRemoved++
+		} Catch {
+			Write-Host "    [KEPT]    $($RemovedPrApp.DisplayName) (provisioning removal refused)" -ForegroundColor DarkGray
+		}
+	}
+}
+
+
+#Disable scheduled tasks. Various CEIP and information gathering tasks.
+#NOTE: these are DISABLED, not deleted, so they can be turned back on.
+Function DisableTasks {
+	If ($LeaveTasks) {
+		Write-Host "***LeaveTasks set - leaving scheduled tasks alone.***" -ForegroundColor Yellow
+		return
+	}
+	Write-Host "***Disabling unnecessary scheduled tasks...***" -ForegroundColor Cyan
+	$Tasks = @(
+		"Microsoft Compatibility Appraiser",
+		"ProgramDataUpdater",
+		"Consolidator",
+		"KernelCeipTask",
+		"UsbCeip",
+		"Microsoft-Windows-DiskDiagnosticDataCollector"
+	)
+	#GatherNetworkInfo and QueueReporting are deliberately NOT disabled here. GatherNetworkInfo
+	#feeds network diagnostics, and QueueReporting is Windows Error Reporting, which is useful
+	#signal on a machine we are responsible for supporting.
+	ForEach ($Task in $Tasks) {
+		$T = Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
+		If (-not $T) {
+			Write-Detail "    [ABSENT]   $Task (not present on this build)" "DarkGray"
+		} ElseIf ($T.State -eq 'Disabled') {
+			Write-Detail "    [ALREADY]  $Task was already disabled" "DarkGray"
+		} Else {
+			$null = $T | Disable-ScheduledTask -ErrorAction SilentlyContinue
+			$After = (Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue).State
+			If ($After -eq 'Disabled') {
+				Write-Host "    [DISABLED] $Task" -ForegroundColor Green
+			} Else {
+				Write-Host "    [FAILED]   $Task is still '$After'" -ForegroundColor Yellow
+			}
+		}
+	}
+}
+
+
+#Disable services.
+Function DisableServices {
+	If ($LeaveServices) {
+		Write-Host "***LeaveServices set - leaving services alone.***" -ForegroundColor Yellow
+		return
+	}
+	Write-Host "***Stopping and disabling services...***" -ForegroundColor Cyan
+
+	#Windows Media Player Network Sharing. Safe to disable on a workstation.
+	Set-DecrapService -Name WMPNetworkSvc -Reason "Media sharing, not needed on a workstation"
+
+	#DiagTrack (Connected User Experiences and Telemetry) is intentionally left running.
+	#Intune Endpoint Analytics lists it as a hard prerequisite, Windows Update for Business
+	#reports need it, and Defender for Endpoint logs Event 62 when it cannot start.
+	If ($DisableTelemetryService) {
+		Write-Host "    [WARN] -DisableTelemetryService set. Disabling DiagTrack." -ForegroundColor Red
+		Write-Host "    [WARN] This breaks Intune Endpoint Analytics, WUfB reports and MDE reporting." -ForegroundColor Red
+		Set-DecrapService -Name Diagtrack -Reason "-DisableTelemetryService was supplied"
+	} Else {
+		$DT = Get-Service Diagtrack -ErrorAction SilentlyContinue
+		If ($DT) {
+			Write-Host ("    [KEPT] DiagTrack is '{0}' / '{1}' - required by Intune and Defender reporting." -f $DT.Status, $DT.StartType) -ForegroundColor DarkGray
+			If ($DT.Status -ne 'Running') {
+				Write-Host "    [WARN] DiagTrack is not running. Something else on this image disabled it;" -ForegroundColor Yellow
+				Write-Host "           Endpoint Analytics and Defender reporting will be degraded." -ForegroundColor Yellow
+			}
+		} Else {
+			Write-Host "    [WARN] DiagTrack service not found on this machine." -ForegroundColor Yellow
+		}
+	}
+
+	#Xbox services
+	If (-not $Xbox) {
+		ForEach ($Svc in "XblAuthManager","XblGameSave","XboxNetApiSvc") {
+			Set-DecrapService -Name $Svc -Reason "Xbox service"
+		}
+	}
+}
+
+
+#Stop and disable one service, reporting the state it actually ended in.
+Function Set-DecrapService {
+	param([Parameter(Mandatory=$true)][string]$Name, [string]$Reason = "")
+	$Svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+	If (-not $Svc) {
+		Write-Detail "    [ABSENT]   $Name (not present on this build)" "DarkGray"
+		return
+	}
+	If ($Svc.StartType -eq 'Disabled' -and $Svc.Status -ne 'Running') {
+		Write-Detail "    [ALREADY]  $Name was already stopped and disabled" "DarkGray"
+		return
+	}
+	$Svc | Stop-Service -Force -ErrorAction SilentlyContinue
+	Set-Service -Name $Name -StartupType Disabled -ErrorAction SilentlyContinue
+	$After = Get-Service -Name $Name -ErrorAction SilentlyContinue
+	If ($After -and $After.StartType -eq 'Disabled') {
+		$Note = If ($Reason) { " ($Reason)" } Else { "" }
+		Write-Host ("    [DISABLED] {0} -> {1} / {2}{3}" -f $Name, $After.Status, $After.StartType, $Note) -ForegroundColor Green
+	} Else {
+		Write-Host ("    [FAILED]   {0} is still '{1}' / '{2}'" -f $Name, $After.Status, $After.StartType) -ForegroundColor Yellow
+	}
+}
+
+
+#Load / unload the default user hive
+Function LoadDefaultHive {
+	param([string]$RegLocation)
+	$DefaultProfile = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' Default).Default
+	$null = & reg.exe load "$RegLocation" "$DefaultProfile\ntuser.dat" 2>&1
+	return ($LASTEXITCODE -eq 0)
+}
+
+Function UnloadDefaultHive {
+	param([string]$RegLocation)
+	[gc]::Collect()
+	$null = & reg.exe unload "$RegLocation" 2>&1
+}
+
+
+#Cycle registry locations - 1st pass HKCU, 2nd pass default NTUSER.dat, 3rd pass HKLM
+Function RegChange {
+	Write-Host "***Applying user settings to HKCU...***" -ForegroundColor Cyan
+	RegSetUser -RegLocation "HKCU"
+
+	Write-Host "***Applying user settings to the default profile (new accounts)...***" -ForegroundColor Cyan
+	If (LoadDefaultHive -RegLocation "HKLM\AllProfile") {
+		RegSetUser -RegLocation "HKLM\AllProfile"
+		UnloadDefaultHive -RegLocation "HKLM\AllProfile"
+	} Else {
+		Write-Host "    [FAIL] Could not load the default user hive. New profiles will not get these settings." -ForegroundColor Yellow
+	}
+
+	Write-Host "***Applying machine settings and policies to HKLM...***" -ForegroundColor Cyan
+	RegSetMachine
+}
+
+
+#Per-user settings. Applied to the current user and to the default profile.
+Function RegSetUser {
+	param([Parameter(Mandatory=$true)][string]$RegLocation)
+
+	$CDM  = "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+	$ADV  = "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+	$SRCH = "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"
+
+	#--Content delivery, suggestions and built-in advertising--
+	Set-DecrapReg $CDM "SystemPaneSuggestionsEnabled"     0   #Start menu suggestions
+	Set-DecrapReg $CDM "SubscribedContent-338393Enabled"  0   #Suggested content in Settings
+	Set-DecrapReg $CDM "SubscribedContent-353694Enabled"  0
+	Set-DecrapReg $CDM "SubscribedContent-338388Enabled"  0   #Occasional suggestions
+	Set-DecrapReg $CDM "SubscribedContent-353698Enabled"  0   #Timeline suggestions
+	Set-DecrapReg $CDM "SoftLandingEnabled"               0
+	Set-DecrapReg $CDM "RotatingLockScreenEnabled"        0   #Lock screen rotating pictures
+	Set-DecrapReg $CDM "RotatingLockScreenOverlayEnabled" 0
+	Set-DecrapReg $CDM "PreInstalledAppsEnabled"          0
+	Set-DecrapReg $CDM "PreInstalledAppsEverEnabled"      0
+	Set-DecrapReg $CDM "OEMPreInstalledAppsEnabled"       0
+	Set-DecrapReg $CDM "SilentInstalledAppsEnabled"       0   #Apps quietly pushed into the profile
+	Set-DecrapReg $CDM "ContentDeliveryAllowed"           0
+	Set-DecrapReg $CDM "SubscribedContentEnabled"         0
+	Set-DecrapReg $CDM "SubscribedContent-310093Enabled"  0   #Welcome experience after updates
+	Set-DecrapReg $CDM "SubscribedContent-338389Enabled"  0   #Tips, tricks and suggestions
+	Set-DecrapReg $CDM "SubscribedContent-314563Enabled"  0   #App suggestions
+
+	#Ads in File Explorer
+	Set-DecrapReg $ADV "ShowSyncProviderNotifications" 0
+
+	#"Finish setting up your device" / "Get even more out of Windows" nag after sign-in
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+
+	#--Privacy--
+	#Feedback frequency
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" 0
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Siuf\Rules" "PeriodInNanoSeconds"  0
+	#Advertising ID
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
+	#Tailored experiences with diagnostic data
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" 0
+	#Shared experiences / cross-device open
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\CDP" "RomeSdkChannelUserAuthzPolicy" 0
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\CDP" "CdpSessionUserAuthzPolicy"     0
+
+	#Speech, inking and typing personalization
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\SettingSync\Groups\Language" "Enabled" 0
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 1
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection"  1
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\InputPersonalization\TrainedDataStore" "HarvestContacts" 0
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Personalization\Settings" "AcceptedPrivacyPolicy" 0
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Input\TIPC" "Enabled" 0
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\PenWorkspace" "PenWorkspaceAppSuggestionsEnabled" 0
+
+	#--Shell / usability--
+	#Autoplay off
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers" "DisableAutoplay" 1
+	#Taskbar search: 0 = hidden, 1 = icon only, 2 = search box
+	Set-DecrapReg $SRCH "SearchboxTaskbarMode" 0
+	Set-DecrapReg $SRCH "AllowSearchToUseLocation" 0
+	#Show file extensions. This is a security control, not a preference: hidden extensions are a
+	#standard trick for making an executable look like a document.
+	Set-DecrapReg $ADV "HideFileExt" 0
+	#File Explorer opens to This PC rather than Home
+	Set-DecrapReg $ADV "LaunchTo" 1
+	#Hide the Widgets button on the taskbar. Belt and braces behind the machine policies: if a
+	#build ignores DisableWidgetsBoard, this still removes the thing you would hover over.
+	#Applied to the current user and the default profile, so every future account inherits it.
+	Set-DecrapReg $ADV "TaskbarDa" 0
+	#Different feature, same class of annoyance: opening SEARCH on hover over the search
+	#highlight. This is the Feeds\DSB key, not a widgets one. If it comes back access-denied the
+	#run names it in the summary rather than failing silently.
+	Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\Feeds\DSB" "OpenOnHover" 0
+
+	#--Windows 11 AI features (per-user half; machine policies are in RegSetMachine)--
+	If (-not $LeaveAI) {
+		#Turn off saving snapshots for Recall. Documented CSP/GPO, user scope supported.
+		Set-DecrapReg "$RegLocation\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+		Set-DecrapReg "$RegLocation\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableClickToDo"      1
+		#TurnOffWindowsCopilot is user scope only and is deprecated by Microsoft. It does not cover
+		#the current Copilot app, which is handled by app removal instead. Set anyway; it is free.
+		Set-DecrapReg "$RegLocation\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+	}
+
+	#--Optional: Store app permissions (Settings > Privacy). OFF by default.--
+	If ($RestrictAppAccess) {
+		$CAM = "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore"
+		Write-Host "    [WARN] -RestrictAppAccess set. This denies camera and microphone to Store apps." -ForegroundColor Yellow
+		Set-DecrapReg "$CAM\webcam"                "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\microphone"            "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\userAccountInformation" "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\contacts"              "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\appointments"          "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\phoneCallHistory"      "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\email"                 "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\userDataTasks"         "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\chat"                  "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\cellularData"          "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\documentsLibrary"      "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\picturesLibrary"       "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\videosLibrary"         "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$CAM\broadFileSystemAccess" "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 1
+		Set-DecrapReg $SRCH "BackgroundAppGlobalToggle" 0
+	}
+
+	#--Optional: location and sensors. OFF by default.--
+	If ($RestrictLocation) {
+		Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Sensor\Permissions\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}" "SensorPermissionState" 0
+		Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceAccess\Global\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}" "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceAccess\Global\{E6AD100E-5F4E-44CD-BE0F-2265D88D14F5}" "Value" "Deny" -Type REG_SZ
+		Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location" "Value" "Deny" -Type REG_SZ
+	}
+
+	#--Legacy Cortana / Bing search keys.--
+	#Cortana was retired in 2023 so most of this is a no-op on Windows 11, but BingSearchEnabled
+	#still suppresses web results in Start on some builds and costs nothing to set.
+	If (-not $Cortana) {
+		Set-DecrapReg $SRCH "CortanaEnabled"       0
+		Set-DecrapReg $SRCH "CanCortanaBeEnabled"  0
+		Set-DecrapReg $SRCH "DeviceHistoryEnabled" 0
+		Set-DecrapReg $SRCH "CortanaConsent"       0
+		Set-DecrapReg $SRCH "BingSearchEnabled"    0
+		Set-DecrapReg $SRCH "HistoryViewEnabled"   0
+		Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Speech_OneCore\Preferences" "VoiceActivationEnableAboveLockscreen" 0
+		#Suppress web/Bing suggestions in the search box
+		Set-DecrapReg "$RegLocation\SOFTWARE\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
+	}
+
+	#--Game DVR--
+	If (-not $Xbox) {
+		Set-DecrapReg "$RegLocation\System\GameConfigStore" "GameDVR_Enabled" 0
+	}
+
+	#--Optional: OneDrive. OFF by default (OneDrive is left working).--
+	If ($DisableOneDrive) {
+		Set-DecrapReg "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "OneDrive" "0300000021B9DEB396D7D001" -Type REG_BINARY
+		If ($RegLocation -ne "HKCU") {
+			$null = & reg.exe delete "$RegLocation\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /V "OneDriveSetup" /F 2>&1
+		}
+	}
+
+	#REMOVED from the Windows 10 script, all dead on Windows 11:
+	#  Explorer\Advanced\People\ShoulderTap and People\PeopleBand  -- My People does not exist.
+	#  CurrentVersion\Feeds\ShellFeedsTaskbarViewMode              -- obsolete AND access-denied;
+	#      this is what produced the two "ERROR: Access is denied." lines every run. Replaced by
+	#      the Dsh\AllowNewsAndInterests machine policy in RegSetMachine.
+	#  microsoft.microsoftedge_8wekyb3d8bbwe DoNotTrack            -- legacy EdgeHTML is retired.
+	#  Internet Explorer\Main DoNotTrack                           -- IE is retired.
+}
+
+
+#Machine settings and local policies.
+Function RegSetMachine {
+	#--Application compatibility telemetry--
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "AITEnable"        0
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "DisableInventory" 1
+
+	#--Cloud content--
+	#Turn off Microsoft consumer experiences (auto-installed suggested apps, Candy Crush et al)
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
+
+	#--Diagnostic data--
+	#1 = Required (previously "Basic"). This is the MINIMUM that Windows Update for Business
+	#reports supports, and Intune Endpoint Analytics needs the DiagTrack service running on top of
+	#it. The Windows 10 script set this to 0, which is why it is called out as F1 in the review.
+	If ($DisableTelemetryService) {
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 0
+	} Else {
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 1
+	}
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "DoNotShowFeedbackNotifications" 1
+
+	#--Widgets / news feed--
+	#There is NO machine-wide policy for the "Open Widgets board on hover" toggle. Microsoft does
+	#not ship one: the NewsAndInterests CSP has exactly the three settings below and none of them
+	#is hover. The Windows 10 key some guides still recommend for this,
+	#HKCU\...\CurrentVersion\Feeds\ShellFeedsTaskbarOpenOnHover, has no effect on Windows 11.
+	#
+	#The answer is to remove the entry point instead. With no widgets button on the taskbar there
+	#is nothing to hover over, and both policies below say exactly that.
+	#
+	#AllowNewsAndInterests: "applies to the entire widgets experience, including content on the
+	#taskbar". Released policy, Pro supported, Windows 11 21H2 and later.
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+	#DisableWidgetsBoard: "you won't be able to invoke the Widgets board and its entry point will
+	#no longer appear on the taskbar". Same ADMX, same key. Microsoft still lists this one as
+	#preview, so it may be a no-op on some builds. An unrecognised policy value is ignored, so
+	#setting it costs nothing and it starts working when the build catches up.
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsBoard" 1
+	#Lock screen widgets. Also preview, same caveat.
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsOnLockScreen" 1
+
+	#--Consumer Teams "Chat" taskbar icon (3 = disabled and hidden)--
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon" 3
+
+	#--Windows 11 AI features--
+	If (-not $LeaveAI) {
+		#Recall: stop snapshots, and remove the component entirely.
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis"  1
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "AllowRecallEnablement"  0
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableClickToDo"       1
+		#Paint generative AI
+		Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint" "DisableImageCreator"   1
+		Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint" "DisableCocreator"      1
+		Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint" "DisableGenerativeFill" 1
+	}
+
+	#--Explorer--
+	#"Run as different user" in Start
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer" "ShowRunasDifferentuserinStart" 1
+	#No Edge desktop shortcut on new profiles
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "DisableEdgeDesktopShortcutCreation" 1
+
+	#--Windows Update--
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "EnableFeaturedSoftware" 0
+
+	#--Delivery Optimization: 1 = LAN peers only, 0 = off--
+	#The supported policy path first, then the legacy paths the Windows 10 script used.
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode" 1
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"   "DownloadMode"   1
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings" "DownloadMode"   1
+
+	#--Advertising and device metadata--
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo"  "Enabled" 0
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata" "PreventDeviceMetadataFromNetwork" 1
+
+	#--CEIP--
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\SQMClient\Windows" "CEIPEnable" 0
+
+	#--Do not use sign-in info to auto finish setup after an update (ARSO)--
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "ARSOUserConsent" 0
+
+	#--Diagnostic data viewer--
+	Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack\EventTranscriptKey" "EnableEventTranscript" 1
+
+	#--Cortana machine policy--
+	If (-not $Cortana) {
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "AllowCortana" 0
+	}
+
+	#--Location, machine wide--
+	If ($RestrictLocation) {
+		Set-DecrapReg "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location" "Value" "Deny" -Type REG_SZ
+	}
+
+	#--Xbox--
+	If (-not $Xbox) {
+		Set-DecrapReg "HKLM\SYSTEM\CurrentControlSet\Services\xbgm" "Start" 4
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+	}
+
+	#--OneDrive, optional--
+	If ($DisableOneDrive) {
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" 1
+		Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSync"     1
+		Set-DecrapReg "HKCR\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}"              "System.IsPinnedToNameSpaceTree" 0
+		Set-DecrapReg "HKCR\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" "System.IsPinnedToNameSpaceTree" 0
+	}
+
+	#REMOVED from the Windows 10 script:
+	#  Policies\Explorer HideSCAMeetNow -- Meet Now does not exist on Windows 11.
+}
+
+
+#Post-run verification. Reads the settings back rather than trusting that the writes landed,
+#and confirms the packages we promised to protect are still installed. This is the automated
+#version of the checklist in Scripts\Win-11-DeCrapifier\README.md.
+Function Assert-DecrapValue {
+	param(
+		[Parameter(Mandatory=$true)][string]$Label,
+		[Parameter(Mandatory=$true)][string]$Path,
+		[Parameter(Mandatory=$true)][string]$Name,
+		[Parameter(Mandatory=$true)]$Expected
+	)
+	$Actual = $null
+	Try { $Actual = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } Catch { }
+
+	If ("$Actual" -eq "$Expected") {
+		Write-Host ("  [PASS] {0,-34} {1}" -f $Label, $Actual) -ForegroundColor Green
+		$Global:MTDecrap.VerifyPass++
+	} Else {
+		$Shown = If ($null -eq $Actual) { "<not set>" } Else { $Actual }
+		Write-Host ("  [FAIL] {0,-34} got '{1}', expected '{2}'" -f $Label, $Shown, $Expected) -ForegroundColor Red
+		$Global:MTDecrap.VerifyFail++
+	}
+}
+
+Function Assert-DecrapApp {
+	param([Parameter(Mandatory=$true)][string]$Name)
+	If (Get-AppxPackage -Name $Name -AllUsers -ErrorAction SilentlyContinue) {
+		Write-Host ("  [PASS] {0,-34} still installed" -f $Name) -ForegroundColor Green
+		$Global:MTDecrap.VerifyPass++
+	} Else {
+		#Not every machine ships every one of these, so this is informational rather than a hard fail.
+		Write-Host ("  [n/a ] {0,-34} not installed on this machine" -f $Name) -ForegroundColor DarkGray
+	}
+}
+
+Function Test-DecrapResult {
+	Write-Host ""
+	Write-Host "***Verifying (reading settings back)...***" -ForegroundColor Cyan
+
+	If (-not $AppsOnly) {
+		#--- Services ---
+		$DT = Get-Service Diagtrack -ErrorAction SilentlyContinue
+		$WantRunning = -not $DisableTelemetryService
+		If ($DT) {
+			$IsRunning = ($DT.Status -eq 'Running')
+			If ($IsRunning -eq $WantRunning) {
+				Write-Host ("  [PASS] {0,-34} {1} / {2}" -f "DiagTrack service", $DT.Status, $DT.StartType) -ForegroundColor Green
+				$Global:MTDecrap.VerifyPass++
+			} Else {
+				Write-Host ("  [FAIL] {0,-34} {1} / {2}" -f "DiagTrack service", $DT.Status, $DT.StartType) -ForegroundColor Red
+				$Global:MTDecrap.VerifyFail++
+			}
+		}
+
+		#--- Machine policies ---
+		$Want = If ($DisableTelemetryService) { 0 } Else { 1 }
+		Assert-DecrapValue "AllowTelemetry" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" $Want
+		Assert-DecrapValue "DisableWindowsConsumerFeatures" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
+		Assert-DecrapValue "Widgets off" "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+		Assert-DecrapValue "Widgets board disabled" "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsBoard" 1
+		Assert-DecrapValue "Consumer Chat icon hidden" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon" 3
+
+		If (-not $LeaveAI) {
+			Assert-DecrapValue "Recall snapshots off" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+			Assert-DecrapValue "Recall component removed" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "AllowRecallEnablement" 0
+			Assert-DecrapValue "Click to Do off" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableClickToDo" 1
+			Assert-DecrapValue "Paint Image Creator off" "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint" "DisableImageCreator" 1
+		}
+
+		#--- Current user ---
+		Assert-DecrapValue "File extensions visible" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
+		Assert-DecrapValue "Explorer opens to This PC" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
+		Assert-DecrapValue "Widgets taskbar button hidden" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0
+		Assert-DecrapValue "Setup nag suppressed" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+		Assert-DecrapValue "Content delivery off" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "ContentDeliveryAllowed" 0
+		Assert-DecrapValue "Advertising ID off" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
+
+		#--- Default profile. This is what new users inherit, and the only way to check it
+		#    without creating an account is to mount the hive again.
+		If (LoadDefaultHive -RegLocation "HKLM\DecrapVerify") {
+			Assert-DecrapValue "New profiles: file extensions" "HKLM:\DecrapVerify\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
+			Assert-DecrapValue "New profiles: content delivery" "HKLM:\DecrapVerify\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "ContentDeliveryAllowed" 0
+			UnloadDefaultHive -RegLocation "HKLM\DecrapVerify"
+		} Else {
+			Write-Host "  [WARN] Could not mount the default profile to verify it." -ForegroundColor Yellow
+		}
+	}
+
+	If (-not $SettingsOnly) {
+		#--- Packages we promised to keep ---
+		Write-Host "  Packages that must survive:" -ForegroundColor Cyan
+		ForEach ($A in "MSTeams","Microsoft.OutlookForWindows","Microsoft.MicrosoftOfficeHub",
+		                "Microsoft.GetHelp","Microsoft.PowerShell","Microsoft.CompanyPortal",
+		                "Microsoft.WindowsStore","Microsoft.SecHealthUI","Microsoft.DesktopAppInstaller",
+		                "AppUp.IntelArcSoftware","MicrosoftCorporationII.QuickAssist") {
+			Assert-DecrapApp -Name $A
+		}
+	}
+}
+
+
+Function Goodbye {
+	$S = $Global:MTDecrap
+	Write-Host ""
+	Write-Host "=====================================================" -ForegroundColor Cyan
+	Write-Host " Windows 11 Decrapification complete." -ForegroundColor Cyan
+	Write-Host "=====================================================" -ForegroundColor Cyan
+	Write-Host ("  Apps removed              : {0}" -f $S.AppsRemoved) -ForegroundColor Green
+	Write-Host ("  Apps Windows refused      : {0}" -f $S.AppsRefused) -ForegroundColor DarkGray
+	Write-Host ("  Provisioned pkgs removed  : {0}" -f $S.ProvRemoved) -ForegroundColor Green
+	Write-Host ("  Registry values written   : {0}" -f $S.RegChanges)  -ForegroundColor Green
+	If (($S.VerifyPass + $S.VerifyFail) -gt 0) {
+		If ($S.VerifyFail -gt 0) {
+			Write-Host ("  Verification              : {0} passed, {1} FAILED" -f $S.VerifyPass, $S.VerifyFail) -ForegroundColor Red
+		} Else {
+			Write-Host ("  Verification              : {0} passed, 0 failed" -f $S.VerifyPass) -ForegroundColor Green
+		}
+	}
+	If ($S.RegFailures -gt 0) {
+		Write-Host ("  Registry values FAILED    : {0}" -f $S.RegFailures) -ForegroundColor Yellow
+		ForEach ($F in $S.RegFailed) { Write-Host "      $F" -ForegroundColor Yellow }
+	} Else {
+		Write-Host  "  Registry values failed    : 0" -ForegroundColor Green
+	}
+	Write-Host ""
+	If (-not $DisableTelemetryService) {
+		Write-Host "  DiagTrack was left running on purpose. Do not disable it on a" -ForegroundColor DarkGray
+		Write-Host "  device managed by Intune, Action1 reporting or Defender." -ForegroundColor DarkGray
+	}
+	Write-Host "  Reboot this computer now." -ForegroundColor Yellow
+	Write-Host ""
+}
+
+
+#---Main---
+
+If (-not (Test-Elevated)) {
+	Write-Host "This script must be run from an elevated PowerShell session. Aborting." -ForegroundColor Red
+	return
+}
+
+If (-not (Test-Windows11) -and -not $Force) {
+	Write-Host "This machine does not report a Windows 11 build (22000 or higher)." -ForegroundColor Red
+	Write-Host "Use Invoke-Win10Decrap for Windows 10, or re-run with -Force to override." -ForegroundColor Red
+	return
+}
+
+If (-not $NoLog) {
+	Start-Transcript "$ENV:SYSTEMDRIVE\Windows11DCtranscript.txt" -Force | Out-Null
+}
+
+Show-DecrapBanner
+
+Try {
+	If ($AppsOnly) {
+		RemoveApps
+	} ElseIf ($SettingsOnly) {
+		DisableTasks
+		DisableServices
+		RegChange
+	} Else {
+		RemoveApps
+		DisableTasks
+		DisableServices
+		RegChange
+	}
+	If (-not $Quiet) { Test-DecrapResult }
+	Goodbye
+} Finally {
+	Remove-Variable -Name MTDecrap -Scope Global -ErrorAction SilentlyContinue
+	If (-not $NoLog) {
+		Stop-Transcript | Out-Null
+	}
+}

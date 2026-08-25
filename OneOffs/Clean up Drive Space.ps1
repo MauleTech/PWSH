@@ -1,4 +1,4 @@
-#[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192 ; Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/master/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
+#[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192 ; Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
 #Clean up Drive Space
 #Enable SSL/TLS
 Try {

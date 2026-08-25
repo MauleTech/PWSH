@@ -108,12 +108,6 @@ function Update-ClaudeCode {
 	return $result
 }
 
-Function Update-DattoAgent {
-	Enable-SSL
-	$progressPreference = 'silentlyContinue'
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Datto-Agent-Update/DattoAgentUpdate.txt -usebasicparsing | Invoke-Expression
-}
-
 Function Update-DellPackages {
 	<#
 	.SYNOPSIS
@@ -840,31 +834,6 @@ Function Update-Everything {
 # Update-ITFunctions is defined in LoadFunctions.txt using Sync-PWSHRepository
 # (with Invoke-Git timeout protection, GIT_TERMINAL_PROMPT=0, and remote-branch fallback).
 # Do NOT redefine it here - this module loads after the bootstrap and would shadow the better version.
-
-Function Update-ITS247Agent {
-	$DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion
-	$TYPE = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).TYPE
-	$AvailableVersion = ((Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/ITS247Agent/DPMAVersion.txt -UseBasicParsing).Content).Trim()
-
-	If(($DisplayVersion -ne $AvailableVersion) -and ($TYPE -eq "DPMA")) {
-	 WRITE-HOST "Updating Agent from $DisplayVersion to $AvailableVersion"
-		 $SaveFolder = '$ITFolder'
-		 New-Item -ItemType Directory -Force -Path $SaveFolder
-		 $PatchPath = $SaveFolder + '\DPMAPatch' + $AvailableVersion + '.exe'
-		 Invoke-ValidatedDownload -Uri 'https://update.itsupport247.net/agtupdt/DPMAPatch.exe' -OutFile $PatchPath
-		 & $PatchPath | Wait-Process
-		 $DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion
-	 WRITE-HOST "Agent is now version $DisplayVersion"
-	}
-
-	If(($DisplayVersion -eq $AvailableVersion) -and ($TYPE -eq "DPMA")) {
-	 WRITE-HOST "Agent appears to be up to date at version $DisplayVersion"
-	}
-<#
-	.SYNOPSIS
-		Updates the Continuum ITS247 Desktop agent to the latest available. No parameters are needed.
-#>
-}
 
 Function Update-NiniteApps {
 	<#
@@ -3217,3 +3186,4 @@ Function Update-WindowTitle ([String] $PassNumber) {
 # OYDutSft9NQ2N2699owsfqAvuxysyxuASv0fY+yee+v9RoggqH5y8UJVbNyhopzA
 # D1VUtlK/HVYpd/lx7NDSy1IcWScd3mas74RSExFh
 # SIG # End signature block
+

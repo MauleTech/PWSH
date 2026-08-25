@@ -146,7 +146,7 @@ function Start-ClaudeCode {
 }
 
 Function Start-CleanupOfSystemDrive {
-	Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/master/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
+	Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
 }
 
 Function Start-ImperialMarch {
@@ -288,9 +288,9 @@ Function Start-PSWinGet {
 Function Start-ServerMaintenance {
 	If ($PSVersionTable.PSEdition -eq "Desktop") {
 		If (-Not (Get-Command "pwsh" -ErrorAction SilentlyContinue)) { Update-PWSH }
-		pwsh -Command {(Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Maintenance-Checks/Server-Maintenance-Checks.txt -UseBasicParsing).Content | Invoke-Expression}
+		pwsh -Command {(Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Maintenance-Checks/Server-Maintenance-Checks.txt -UseBasicParsing).Content | Invoke-Expression}
 	} Else {
-		(Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Maintenance-Checks/Server-Maintenance-Checks.txt -UseBasicParsing).Content | Invoke-Expression
+		(Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Maintenance-Checks/Server-Maintenance-Checks.txt -UseBasicParsing).Content | Invoke-Expression
 	}
 }
 

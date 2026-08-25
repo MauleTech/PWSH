@@ -50,7 +50,7 @@ Function Debug-ServerRebootScript {
 		$progressPreference = 'silentlyContinue'
 		[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
 		Set-ExecutionPolicy Bypass -Scope Process -Force
-		(Invoke-WebRequest "https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Server-Reboots/ServerReboots_WhatIf.txt" -UseBasicParsing).Content | Invoke-Expression
+		(Invoke-WebRequest "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Server-Reboots/ServerReboots_WhatIf.txt" -UseBasicParsing).Content | Invoke-Expression
 	}
 }
 

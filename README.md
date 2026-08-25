@@ -136,7 +136,6 @@ Enable-SSL #Enables SSL Permanently
   Install-Action1
   Install-AppDefaults
   Install-Choco
-  Install-ITS247Agent
   Install-NetExtender
   Install-NiniteApps
   Install-NinitePro
@@ -240,14 +239,12 @@ Enable-SSL #Enables SSL Permanently
 
 [Update]
 --------
-  Update-DattoAgent
   Update-DellPackages
   Update-DellServer
   Update-DnsServerRootHints
   Update-Edge
   Update-Everything
   Update-ITFunctions
-  Update-ITS247Agent
   Update-NiniteApps
   Update-NTPDateTime
   Update-O365Apps

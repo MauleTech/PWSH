@@ -1792,8 +1792,394 @@ Function Invoke-Win10Decrap {
 	$progressPreference = 'silentlyContinue'
 	Set-ExecutionPolicy Bypass -Scope Process -Force
 	Enable-SSL
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Win-10-DeCrapifier/Windows10Decrapifier.txt -UseBasicParsing | Invoke-Expression
+	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Win-10-DeCrapifier/Windows10Decrapifier.txt -UseBasicParsing | Invoke-Expression
 }
+
+Function Invoke-Win11Decrap {
+<#
+	.SYNOPSIS
+		Runs the Maule Techs Windows 11 Decrapifier against the local machine.
+
+	.DESCRIPTION
+		Windows 11 rework of the Spiceworks Windows 10 Decrapifier, scoped for devices that are
+		going to be managed workforce endpoints (Microsoft 365, Intune and/or Action1, Defender).
+
+		This is a SEPARATE command from Invoke-Win10Decrap, which still runs the original
+		unmodified Windows 10 script. Use this one on Windows 11 builds.
+
+		Key differences from Invoke-Win10Decrap, all documented in
+		Scripts\Win-10-DeCrapifier\WINDOWS11-REVIEW.md:
+
+		  * DiagTrack (Connected User Experiences and Telemetry) is left running and
+		    AllowTelemetry is set to 1 (Required) rather than 0. Intune Endpoint Analytics
+		    requires DiagTrack running, Windows Update for Business reports require diagnostic
+		    data at Required minimum, and Defender for Endpoint logs Event 62 when the service
+		    cannot start.
+		  * The Start menu section is gone. Import-StartLayout is deprecated on Windows 11 and
+		    threw a terminating error on every run of the old script.
+		  * The keep-list covers Teams, new Outlook, Office Hub, Company Portal, Get Help,
+		    PowerShell 7, the Remote Desktop family and current OEM driver companions.
+		  * App removal skips inbox system packages by SignatureKind rather than relying on a
+		    hand-maintained keep-list, so new Windows components are not swept in.
+		  * Adds Windows 11 era controls: Recall, Click to Do, Paint generative AI, Copilot,
+		    Widgets, show file extensions, and the post-sign-in setup nag.
+
+		The script is taken from the local clone of this repository when one is present, and
+		downloaded from GitHub otherwise. A transcript is written to
+		SYSTEMDRIVE\Windows11DCtranscript.txt unless -NoLog is used.
+
+		Output is verbose by default so a run can be checked rather than assumed: an environment
+		banner, a package triage showing what was skipped and why, every registry value written,
+		and a closing pass that reads the important settings back and reports PASS/FAIL. Pass
+		-Quiet for the summary only.
+
+		Requires an elevated session. Reboot the machine when it finishes.
+
+	.PARAMETER AllApps
+		Remove ALL removable app packages including the Microsoft Store. Rarely what you want.
+
+	.PARAMETER LeaveTasks
+		Leave scheduled tasks alone.
+
+	.PARAMETER LeaveServices
+		Leave services alone.
+
+	.PARAMETER RestrictAppAccess
+		Deny camera, microphone, contacts, calendar and library access to Store apps. Off by
+		default. Turning this on will break camera and microphone for Store-app callers, which
+		on most workforce builds means Teams.
+
+	.PARAMETER RestrictLocation
+		Deny location and sensor access. Off by default.
+
+	.PARAMETER DisableOneDrive
+		Disable OneDrive by policy and remove it from File Explorer. Off by default, because
+		OneDrive is normally wanted on a Microsoft 365 workstation.
+
+	.PARAMETER Xbox
+		Leave Xbox apps, Xbox services and Game DVR alone.
+
+	.PARAMETER Cortana
+		Leave the legacy Cortana and Bing search keys alone.
+
+	.PARAMETER LeaveAI
+		Leave Recall, Click to Do, Copilot and the Paint generative AI features alone.
+
+	.PARAMETER DisableTelemetryService
+		Stop and disable DiagTrack and set AllowTelemetry to 0. DO NOT USE on anything managed
+		by Intune, Action1 reporting or Defender for Endpoint. Present only for genuinely
+		unmanaged standalone machines.
+
+	.PARAMETER NoLog
+		Do not write a transcript.
+
+	.PARAMETER AppsOnly
+		Only remove app packages.
+
+	.PARAMETER SettingsOnly
+		Only apply settings, services and scheduled task changes.
+
+	.PARAMETER Force
+		Run even if the machine does not report a Windows 11 build.
+
+	.PARAMETER Quiet
+		Suppress the detailed per-item output. Verbose is the DEFAULT: the script prints an
+		environment banner, the full package triage (what was skipped and why), every registry
+		value it writes, and a post-run pass that reads the important settings back and reports
+		PASS/FAIL. Use -Quiet only once a build process is trusted and you want the summary alone.
+
+	.EXAMPLE
+		Invoke-Win11Decrap
+
+		Standard workforce build. Removes consumer apps, disables CEIP tasks, applies privacy,
+		advertising and AI settings to the current user, the default profile and the machine.
+
+	.EXAMPLE
+		Invoke-Win11Decrap -SettingsOnly
+
+		Apply the settings to a machine whose apps have already been handled, for example one
+		that was run through Invoke-Win11Debloat first.
+
+	.EXAMPLE
+		Invoke-Win11Decrap -Quiet
+
+		Same work, summary output only. For trusted build automation, not for a first run.
+
+	.EXAMPLE
+		Invoke-Win11Decrap -RestrictAppAccess -RestrictLocation -DisableOneDrive
+
+		Locked-down kiosk or shared device. Note this breaks Teams camera and microphone.
+#>
+	[CmdletBinding(DefaultParameterSetName = "Decrapifier")]
+	param(
+		[switch]$AllApps,
+		[switch]$LeaveTasks,
+		[switch]$LeaveServices,
+		[switch]$RestrictAppAccess,
+		[switch]$RestrictLocation,
+		[switch]$DisableOneDrive,
+		[switch]$Xbox,
+		[switch]$Cortana,
+		[switch]$LeaveAI,
+		[switch]$DisableTelemetryService,
+		[switch]$NoLog,
+		[switch]$Force,
+		[switch]$Quiet,
+		[Parameter(ParameterSetName = "AppsOnly")]
+		[switch]$AppsOnly,
+		[Parameter(ParameterSetName = "SettingsOnly")]
+		[switch]$SettingsOnly
+	)
+
+	$RelativePath = "Scripts\Win-11-DeCrapifier\Windows11Decrapifier.txt"
+	$ScriptUrl    = "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Win-11-DeCrapifier/Windows11Decrapifier.txt"
+
+	Write-Host "Windows 11 Decrapifier (Maule Techs)" -ForegroundColor Cyan
+
+	# Prefer the local clone so a machine that has already run LoadFunctions does not re-download.
+	$ScriptBody = $null
+	if ($Global:PWSHFolder) {
+		$LocalPath = Join-Path $Global:PWSHFolder $RelativePath
+		if (Test-Path $LocalPath) {
+			Write-Host "  Using local copy: $LocalPath" -ForegroundColor DarkGray
+			$ScriptBody = Get-Content -Path $LocalPath -Raw
+		}
+	}
+
+	if (-not $ScriptBody) {
+		Write-Host "  Downloading from GitHub..." -ForegroundColor DarkGray
+		try {
+			if (Get-Command Enable-SSL -ErrorAction SilentlyContinue) { Enable-SSL }
+			$ProgressPreference = 'SilentlyContinue'
+			$ScriptBody = (Invoke-WebRequest -Uri $ScriptUrl -UseBasicParsing -ErrorAction Stop).Content
+		} catch {
+			Write-Host "  Failed to retrieve the Decrapifier script: $_" -ForegroundColor Red
+			return
+		}
+	}
+
+	if ([string]::IsNullOrWhiteSpace($ScriptBody)) {
+		Write-Host "  Retrieved an empty script. Aborting." -ForegroundColor Red
+		return
+	}
+
+	# A scriptblock is used rather than Invoke-Expression so the script's own param() block
+	# actually binds. Invoke-Expression cannot take arguments, which is why Invoke-Win10Decrap
+	# has never been able to pass switches through.
+	try {
+		$DecrapBlock = [scriptblock]::Create($ScriptBody)
+	} catch {
+		Write-Host "  Could not parse the Decrapifier script: $_" -ForegroundColor Red
+		return
+	}
+
+	& $DecrapBlock @PSBoundParameters
+}
+
+
+Function Invoke-Win11Debloat {
+<#
+	.SYNOPSIS
+		Runs Andrew Taylor's RemoveBloat.ps1 with a Maule Techs keep-list, after verifying the
+		script's Authenticode signature.
+
+	.DESCRIPTION
+		Wrapper around the community RemoveBloat.ps1 maintained by Andrew Taylor
+		(https://github.com/andrew-s-taylor/public/tree/main/De-Bloat). It is the closest
+		maintained equivalent to our Decrapifier and is built for MSP deployment.
+
+		Why this exists alongside Invoke-Win11Decrap:
+
+		  * Taylor's script removes apps from an explicit removal list, so it can never sweep in
+		    a Windows component nobody has whitelisted. Our Decrapifier keeps a deny-by-default
+		    model with a SignatureKind guard.
+		  * It handles OEM Win32 crapware (HP, Dell, Lenovo, McAfee) which our script does not
+		    touch at all.
+		  * It already leaves DiagTrack and telemetry alone for Endpoint Analytics, matching our
+		    F1 finding.
+
+		This wrapper adds three things:
+
+		  1. Authenticode verification. The upstream script is signed by "Open Source Developer
+		     Andrew Taylor" through the Certum CA. Because the script is fetched over the
+		     internet and run with full privilege, the signature is checked before execution and
+		     the run aborts if it does not validate. A pinned SHA256 is deliberately not used;
+		     upstream ships changes frequently and a pinned hash would fail constantly.
+		  2. A keep-list. Taylor's default bloat list removes several packages we want on a
+		     workforce build, notably Get Help, Quick Assist, Remote Desktop, Alarms, Intel
+		     Graphics, Media Player and the cross-device stack.
+		  3. AllowStartMenuReset defaults to false. When enabled on Windows 11, upstream
+		     downloads a start2.bin binary from its own GitHub repository into the default user
+		     profile. That is an unsigned third-party binary in a user's shell state, so it is
+		     opt-in here.
+
+		CAUTION: the OEM Win32 removal is aggressive. Validate on a test build for each vendor
+		you deploy, especially Dell, where management tooling shares naming with the crapware.
+
+		Logs to C:\ProgramData\Debloat\Debloat.log (upstream behaviour).
+
+	.PARAMETER AdditionalKeep
+		Extra EXACT package or program names to protect, added to the built-in keep-list.
+		Upstream matches these exactly, not as substrings, so use full names such as
+		"Microsoft.WindowsCamera", not "camera".
+
+	.PARAMETER AdditionalRemove
+		Extra app names to remove, passed through to upstream's custombloatlist.
+
+	.PARAMETER TasksToRemove
+		Scheduled tasks to DELETE. Left empty by default; deleting tasks is harder to reverse
+		than disabling them, and Invoke-Win11Decrap disables the CEIP tasks instead.
+
+	.PARAMETER AllowStartMenuReset
+		Let upstream reset the Start menu. On Windows 11 this downloads a start2.bin from
+		upstream's GitHub repository into the default profile. Off by default.
+
+	.PARAMETER ExpectedSigner
+		Substring required in the signing certificate subject. Defaults to
+		"Open Source Developer Andrew Taylor". Change this only if upstream re-keys.
+
+	.PARAMETER SkipSignatureCheck
+		Run even if the Authenticode signature is missing or does not validate. Intended for
+		break-glass use on a machine with no path to the revocation lists; it removes the only
+		integrity control on a script that runs with full privilege.
+
+	.PARAMETER ScriptUrl
+		Override the upstream URL, for example to run a vendored copy.
+
+	.EXAMPLE
+		Invoke-Win11Debloat
+
+		Standard run: upstream bloat removal plus OEM crapware, with the Maule Techs keep-list
+		applied and the Start menu left alone.
+
+	.EXAMPLE
+		Invoke-Win11Debloat -AdditionalKeep 'Microsoft.WindowsMaps','Notepad++'
+
+		Protect two more items on top of the built-in keep-list.
+
+	.EXAMPLE
+		Invoke-Win11Debloat; Invoke-Win11Decrap -SettingsOnly
+
+		Recommended combination while both are being evaluated: Taylor's script does app and OEM
+		removal, ours applies the privacy, telemetry and Windows 11 AI settings.
+#>
+	[CmdletBinding()]
+	param(
+		[string[]]$AdditionalKeep,
+		[string[]]$AdditionalRemove,
+		[string[]]$TasksToRemove,
+		[switch]$AllowStartMenuReset,
+		[string]$ExpectedSigner = "Open Source Developer Andrew Taylor",
+		[switch]$SkipSignatureCheck,
+		[string]$ScriptUrl = "https://raw.githubusercontent.com/andrew-s-taylor/public/main/De-Bloat/RemoveBloat.ps1"
+	)
+
+	# Packages upstream would remove that a Maule Techs workforce build should keep.
+	# These must be EXACT names: upstream matches with -in / -notin, not wildcards.
+	$MauleKeepList = @(
+		# Microsoft 365 and management
+		'MSTeams',
+		'Microsoft.OutlookForWindows',
+		'Microsoft.MicrosoftOfficeHub',
+		'Microsoft.CompanyPortal',
+		'Microsoft.Todos',
+		# Support and admin tooling
+		'Microsoft.GetHelp',
+		'MicrosoftCorporationII.QuickAssist',
+		'Microsoft.PowerShell',
+		'Microsoft.WindowsTerminal',
+		'Microsoft.SysinternalsSuite',
+		'Microsoft.RemoteDesktop',
+		'MicrosoftCorporationII.MicrosoftRemoteDesktop',
+		'MicrosoftCorporationII.Windows365',
+		# Inbox apps users expect
+		'Microsoft.WindowsAlarms',
+		'Microsoft.WindowsSoundRecorder',
+		'Microsoft.WindowsCamera',
+		'Microsoft.ZuneMusic',
+		'Microsoft.YourPhone',
+		'MicrosoftWindows.CrossDevice',
+		# Vendor companion apps and drivers
+		'AppUp.IntelGraphicsExperience',
+		'AppUp.IntelArcSoftware',
+		'AppUp.IntelManagementandSecurityStatus',
+		'AppUp.IntelOptaneMemoryandStorageManagement',
+		'NotepadPlusPlus'
+	)
+
+	$KeepList = $MauleKeepList
+	if ($AdditionalKeep) { $KeepList += $AdditionalKeep }
+
+	Write-Host "Windows 11 Debloat (Andrew Taylor RemoveBloat.ps1)" -ForegroundColor Cyan
+
+	$WorkFolder = if ($Global:ITFolder) { Join-Path $Global:ITFolder "Debloat" } else { Join-Path $env:ProgramData "Debloat" }
+	if (-not (Test-Path $WorkFolder)) {
+		New-Item -ItemType Directory -Path $WorkFolder -Force | Out-Null
+	}
+	$ScriptPath = Join-Path $WorkFolder "RemoveBloat.ps1"
+
+	Write-Host "  Downloading $ScriptUrl" -ForegroundColor DarkGray
+	try {
+		if (Get-Command Enable-SSL -ErrorAction SilentlyContinue) { Enable-SSL }
+		$ProgressPreference = 'SilentlyContinue'
+		Invoke-WebRequest -Uri $ScriptUrl -OutFile $ScriptPath -UseBasicParsing -ErrorAction Stop
+	} catch {
+		Write-Host "  Download failed: $_" -ForegroundColor Red
+		return
+	}
+
+	# Integrity gate. This script runs with full privilege, so verify who signed it before
+	# handing it the machine. Any failure here fails closed.
+	$Signature = $null
+	try {
+		$Signature = Get-AuthenticodeSignature -FilePath $ScriptPath -ErrorAction Stop
+	} catch {
+		Write-Host "  [WARN] Could not evaluate the Authenticode signature: $_" -ForegroundColor Yellow
+	}
+
+	$Status  = if ($Signature) { $Signature.Status } else { "<not evaluated>" }
+	$Subject = if ($Signature -and $Signature.SignerCertificate) { $Signature.SignerCertificate.Subject } else { "<unsigned>" }
+
+	Write-Host "  Signature status : $Status" -ForegroundColor DarkGray
+	Write-Host "  Signed by        : $Subject" -ForegroundColor DarkGray
+
+	$SignatureOk = ($Status -eq 'Valid') -and ($Subject -like "*$ExpectedSigner*")
+
+	if (-not $SignatureOk) {
+		if ($SkipSignatureCheck) {
+			Write-Host "  [WARN] Signature check failed but -SkipSignatureCheck was supplied. Continuing." -ForegroundColor Red
+		} else {
+			Write-Host "  [ABORT] Signature did not validate as '$ExpectedSigner'." -ForegroundColor Red
+			Write-Host "          Expected status 'Valid' from that publisher. Investigate before running." -ForegroundColor Red
+			Write-Host "          Use -SkipSignatureCheck only if you have verified the file another way." -ForegroundColor Red
+			return
+		}
+	} else {
+		Write-Host "  [OK] Publisher verified." -ForegroundColor Green
+	}
+
+	$Arguments = @{
+		customwhitelist     = ($KeepList -join ',')
+		AllowStartMenuReset = if ($AllowStartMenuReset) { "true" } else { "false" }
+	}
+	if ($AdditionalRemove) { $Arguments['custombloatlist'] = ($AdditionalRemove -join ',') }
+	if ($TasksToRemove)    { $Arguments['TasksToRemove']   = ($TasksToRemove -join ',') }
+
+	Write-Host "  Protecting $($KeepList.Count) packages/programs from removal." -ForegroundColor DarkGray
+	if (-not $AllowStartMenuReset) {
+		Write-Host "  Start menu reset disabled (upstream would fetch a start2.bin from GitHub)." -ForegroundColor DarkGray
+	}
+	Write-Host "  Upstream log: C:\ProgramData\Debloat\Debloat.log" -ForegroundColor DarkGray
+	Write-Host ""
+
+	& $ScriptPath @Arguments
+
+	Write-Host ""
+	Write-Host "Debloat finished. Reboot this computer." -ForegroundColor Yellow
+	Write-Host "Follow with 'Invoke-Win11Decrap -SettingsOnly' to apply the privacy," -ForegroundColor DarkGray
+	Write-Host "telemetry and Windows 11 AI settings." -ForegroundColor DarkGray
+}
+
 
 Function Invoke-OneDriveFreeUpSpace {
 <#
@@ -1997,219 +2383,3 @@ Function Invoke-OneDriveFreeUpSpace {
 	}
 }
 
-# SIG # Begin signature block
-# MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
-# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDTmsSsEGpiZ3LE
-# WlEoAv/Hne3bkUuPiWnA92xocBhSMKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
-# 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
-# EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
-# BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
-# Fw0zMTExMDkyMzU5NTlaMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2Vy
-# dCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lD
-# ZXJ0IFRydXN0ZWQgUm9vdCBHNDCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoC
-# ggIBAL/mkHNo3rvkXUo8MCIwaTPswqclLskhPfKK2FnC4SmnPVirdprNrnsbhA3E
-# MB/zG6Q4FutWxpdtHauyefLKEdLkX9YFPFIPUh/GnhWlfr6fqVcWWVVyr2iTcMKy
-# unWZanMylNEQRBAu34LzB4TmdDttceItDBvuINXJIB1jKS3O7F5OyJP4IWGbNOsF
-# xl7sWxq868nPzaw0QF+xembud8hIqGZXV59UWI4MK7dPpzDZVu7Ke13jrclPXuU1
-# 5zHL2pNe3I6PgNq2kZhAkHnDeMe2scS1ahg4AxCN2NQ3pC4FfYj1gj4QkXCrVYJB
-# MtfbBHMqbpEBfCFM1LyuGwN1XXhm2ToxRJozQL8I11pJpMLmqaBn3aQnvKFPObUR
-# WBf3JFxGj2T3wWmIdph2PVldQnaHiZdpekjw4KISG2aadMreSx7nDmOu5tTvkpI6
-# nj3cAORFJYm2mkQZK37AlLTSYW3rM9nF30sEAMx9HJXDj/chsrIRt7t/8tWMcCxB
-# YKqxYxhElRp2Yn72gLD76GSmM9GJB+G9t+ZDpBi4pncB4Q+UDCEdslQpJYls5Q5S
-# UUd0viastkF13nqsX40/ybzTQRESW+UQUOsxxcpyFiIJ33xMdT9j7CFfxCBRa2+x
-# q4aLT8LWRV+dIPyhHsXAj6KxfgommfXkaS+YHS312amyHeUbAgMBAAGjggE6MIIB
-# NjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBTs1+OC0nFdZEzfLmc/57qYrhwP
-# TzAfBgNVHSMEGDAWgBRF66Kv9JLLgjEtUYunpyGd823IDzAOBgNVHQ8BAf8EBAMC
-# AYYweQYIKwYBBQUHAQEEbTBrMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdp
-# Y2VydC5jb20wQwYIKwYBBQUHMAKGN2h0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNv
-# bS9EaWdpQ2VydEFzc3VyZWRJRFJvb3RDQS5jcnQwRQYDVR0fBD4wPDA6oDigNoY0
-# aHR0cDovL2NybDMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0QXNzdXJlZElEUm9vdENB
-# LmNybDARBgNVHSAECjAIMAYGBFUdIAAwDQYJKoZIhvcNAQEMBQADggEBAHCgv0Nc
-# Vec4X6CjdBs9thbX979XB72arKGHLOyFXqkauyL4hxppVCLtpIh3bb0aFPQTSnov
-# Lbc47/T/gLn4offyct4kvFIDyE7QKt76LVbP+fT3rDB6mouyXtTP0UNEm0Mh65Zy
-# oUi0mcudT6cGAxN3J0TU53/oWajwvy8LpunyNDzs9wPHh6jSTEAZNUZqaVSwuKFW
-# juyk1T3osdz9HNj0d1pcVIxv76FQPfx2CWiEn2/K2yCNNWAcAgPLILCsWKAOQGPF
-# mCLBsln1VWvPJ6tsds5vIy30fnFqI2si/xK4VC0nftg62fC2h5b9W9FcrBjDTZ9z
-# twGpn1eqXijiuZQwggahMIIEiaADAgECAhAHhD2tAcEVwnTuQacoIkZ5MA0GCSqG
-# SIb3DQEBCwUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMx
-# GTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lDZXJ0IFRy
-# dXN0ZWQgUm9vdCBHNDAeFw0yMjA2MjMwMDAwMDBaFw0zMjA2MjIyMzU5NTlaMFox
-# CzAJBgNVBAYTAkxWMRkwFwYDVQQKExBFblZlcnMgR3JvdXAgU0lBMTAwLgYDVQQD
-# EydHb0dldFNTTCBHNCBDUyBSU0E0MDk2IFNIQTI1NiAyMDIyIENBLTEwggIiMA0G
-# CSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCtHvQHskNmiqJndyWVCqX4FtYp5FfJ
-# LO9Sh0BuwXuvBeNYt21xf8h/pLJ/7YzeKcNq9z4zEhecqtD0xhbvSB8ksBAfWBMZ
-# O0NLfOT0j7WyNuD7rv+ZFza+mxIQ79s1dCiwUMwGonaoDK7mqZfDpKEExR6UyKBh
-# 3aatT73U2Imx/x+fYTmQFq+N8FrLs6Fh6YEGWJTgsxyw1fAChCfgtEcZkdtcgK7q
-# uqskHtW6PJ9l5VNJ7T3WXpznsOOxrz3qx0CzWjwK8+3Kv2X6piWvd8YRfAOycSrT
-# 4/PM0cHLFc5xs/4m/ek4FCnYSem43doFftBxZBQkHKoPW3Bt6VIrhVIwvO7hrUjh
-# chJJZYdSld3bANDviJ5/ToP7ENv97U9MtKFvmC5dzd1p4HxFR0p5wWmYQbW+y3RF
-# m0np6H9m57MUMNp0ysmdJjb0f7+dVLX3OEBUb6H+r1LRLZT/xEOTuwOxGg2S4w25
-# KGL9SCBUW4nkBljPHeJToU+THt0P8ZQf4B9IFlGxtLK0g3uOAnwSFgKtmNjhkTl8
-# caLAQwbgEINCqrhc0b6k2Z8+QwgVAL0nIuzM9ckKP8xtIcWg85L3/l0cTkHQde+j
-# KGDG2CdxBHtflLIUtwqD7JA2uCxWlIzRNgwT0kH2en0+QV8KziSGaqO2r06kwboq
-# 2/xy4e98CEfSYwIDAQABo4IBWTCCAVUwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNV
-# HQ4EFgQUyfwQ71DIy2t/vQhE7zpik+1bXpowHwYDVR0jBBgwFoAU7NfjgtJxXWRM
-# 3y5nP+e6mK4cD08wDgYDVR0PAQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMD
-# MHcGCCsGAQUFBwEBBGswaTAkBggrBgEFBQcwAYYYaHR0cDovL29jc3AuZGlnaWNl
-# cnQuY29tMEEGCCsGAQUFBzAChjVodHRwOi8vY2FjZXJ0cy5kaWdpY2VydC5jb20v
-# RGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNydDBDBgNVHR8EPDA6MDigNqA0hjJodHRw
-# Oi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNybDAc
-# BgNVHSAEFTATMAcGBWeBDAEDMAgGBmeBDAEEATANBgkqhkiG9w0BAQsFAAOCAgEA
-# C9sK17IdmKTCUatEs7+yewhJnJ4tyrLwNEnfl6HrG8Pm7HZ0b+5Jc+GGqJT8kRc7
-# mihuVrdsYNHdicueDL9imhtCusI/rUmjwhtflp+XgLkmgLGrmsEho1b+lGiRp7LC
-# /10di8SAOilDkHj5Zx142xRvBrrWj9eOdSGHwYubAsEd6CDojwcaVz9pfXMzYO3k
-# c0O6PXg1TkcgkYlCUAuDHuk/sZx68W0FVj1P2iMh+VUq9lL1puroAydoeWVUh/+c
-# MXeqfgpBqlAW+r8ma5F6yKL0stVQH8vYb1ES0mJSIPyIfkIjC1V0pbZS3p0QWsKa
-# afEor8fLfLNfSxntVI/ugut0+6ekluPWRpEXH+JAiNdRjbLbZchCREe3/Xl0Ylwk
-# A+eQVJfM0A7XiuFtY/mOpK2AN+E25t5mQYFhpdxZX5LTDKWgDnb+A6QnEt4iNyuk
-# cLaJuS8IPgPz0E2ALZLt3Rqs+lXifK/GwnNIWQNbf7FmLDB9ph8i8dvsR1hsjc2K
-# PEW4bAsbvLcz8hN1zE1/QbOV92vDGoFjwZOi2koQ+UyEh0e8jDFHAKJeTI+p8EPE
-# /mqvojLFAnt31yXIA2tjt0ERtsjkhBNmZY6SEOfnIoOwvyqavLPya1Ut3/2cOFLu
-# NQ8Ql6HaZsNQErnnzn+ZEAaUTkPZaeVyoHIkODECLzkwgga0MIIEnKADAgECAhAN
-# x6xXBf8hmS5AQyIMOkmGMA0GCSqGSIb3DQEBCwUAMGIxCzAJBgNVBAYTAlVTMRUw
-# EwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20x
-# ITAfBgNVBAMTGERpZ2lDZXJ0IFRydXN0ZWQgUm9vdCBHNDAeFw0yNTA1MDcwMDAw
-# MDBaFw0zODAxMTQyMzU5NTlaMGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdp
-# Q2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3Rh
-# bXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTEwggIiMA0GCSqGSIb3DQEBAQUA
-# A4ICDwAwggIKAoICAQC0eDHTCphBcr48RsAcrHXbo0ZodLRRF51NrY0NlLWZloMs
-# VO1DahGPNRcybEKq+RuwOnPhof6pvF4uGjwjqNjfEvUi6wuim5bap+0lgloM2zX4
-# kftn5B1IpYzTqpyFQ/4Bt0mAxAHeHYNnQxqXmRinvuNgxVBdJkf77S2uPoCj7GH8
-# BLuxBG5AvftBdsOECS1UkxBvMgEdgkFiDNYiOTx4OtiFcMSkqTtF2hfQz3zQSku2
-# Ws3IfDReb6e3mmdglTcaarps0wjUjsZvkgFkriK9tUKJm/s80FiocSk1VYLZlDwF
-# t+cVFBURJg6zMUjZa/zbCclF83bRVFLeGkuAhHiGPMvSGmhgaTzVyhYn4p0+8y9o
-# HRaQT/aofEnS5xLrfxnGpTXiUOeSLsJygoLPp66bkDX1ZlAeSpQl92QOMeRxykvq
-# 6gbylsXQskBBBnGy3tW/AMOMCZIVNSaz7BX8VtYGqLt9MmeOreGPRdtBx3yGOP+r
-# x3rKWDEJlIqLXvJWnY0v5ydPpOjL6s36czwzsucuoKs7Yk/ehb//Wx+5kMqIMRvU
-# BDx6z1ev+7psNOdgJMoiwOrUG2ZdSoQbU2rMkpLiQ6bGRinZbI4OLu9BMIFm1UUl
-# 9VnePs6BaaeEWvjJSjNm2qA+sdFUeEY0qVjPKOWug/G6X5uAiynM7Bu2ayBjUwID
-# AQABo4IBXTCCAVkwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU729TSunk
-# Bnx6yuKQVvYv1Ensy04wHwYDVR0jBBgwFoAU7NfjgtJxXWRM3y5nP+e6mK4cD08w
-# DgYDVR0PAQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMIMHcGCCsGAQUFBwEB
-# BGswaTAkBggrBgEFBQcwAYYYaHR0cDovL29jc3AuZGlnaWNlcnQuY29tMEEGCCsG
-# AQUFBzAChjVodHRwOi8vY2FjZXJ0cy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVz
-# dGVkUm9vdEc0LmNydDBDBgNVHR8EPDA6MDigNqA0hjJodHRwOi8vY3JsMy5kaWdp
-# Y2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNybDAgBgNVHSAEGTAXMAgG
-# BmeBDAEEAjALBglghkgBhv1sBwEwDQYJKoZIhvcNAQELBQADggIBABfO+xaAHP4H
-# PRF2cTC9vgvItTSmf83Qh8WIGjB/T8ObXAZz8OjuhUxjaaFdleMM0lBryPTQM2qE
-# JPe36zwbSI/mS83afsl3YTj+IQhQE7jU/kXjjytJgnn0hvrV6hqWGd3rLAUt6vJy
-# 9lMDPjTLxLgXf9r5nWMQwr8Myb9rEVKChHyfpzee5kH0F8HABBgr0UdqirZ7bowe
-# 9Vj2AIMD8liyrukZ2iA/wdG2th9y1IsA0QF8dTXqvcnTmpfeQh35k5zOCPmSNq1U
-# H410ANVko43+Cdmu4y81hjajV/gxdEkMx1NKU4uHQcKfZxAvBAKqMVuqte69M9J6
-# A47OvgRaPs+2ykgcGV00TYr2Lr3ty9qIijanrUR3anzEwlvzZiiyfTPjLbnFRsjs
-# Yg39OlV8cipDoq7+qNNjqFzeGxcytL5TTLL4ZaoBdqbhOhZ3ZRDUphPvSRmMThi0
-# vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
-# Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
-# xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
-# RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
-# ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
-# B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
-# CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
-# UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
-# bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
-# UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
-# aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
-# c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
-# EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
-# OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
-# NTlaMHkxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpOZXcgTWV4aWNvMREwDwYDVQQH
-# EwhDb3JyYWxlczEgMB4GA1UEChMXTWF1bGUgVGVjaG5vbG9naWVzLCBMTEMxIDAe
-# BgNVBAMTF01hdWxlIFRlY2hub2xvZ2llcywgTExDMIICIjANBgkqhkiG9w0BAQEF
-# AAOCAg8AMIICCgKCAgEA405RMEf+gTALcHgTvYpBVK47g85sfrdA7AcQMhlEgvnQ
-# D0CKFGJslMouuo6t1kJho1IGE+w+JILQ11wz9TNaGq20eTPuC6dtXaZe8mIHMiOQ
-# /gXQiDgP/b74T0xZzUe8PvK8ZVH+CRxGmgvY3Gwd+UkFe+XlA5WW7FZJljriACEY
-# +FJay6Gk9y16Ghb6J5utjQJEeKXGAsjJp+GDx9LNhMZEW2mKw10warcZmzU6PAk6
-# Bj/huN5h99RrV3s+4IpazdQmjlI5nuvF1BaH4XP6/nMzRVSqGYV7ANekkZTaa5Fu
-# QUppuj2FgM7sIVZkzqEF1uQJrxSK0/loEWtefCAgXil8ZIFWl/PUMnO/ks2uPLoa
-# EgPWeEjNZT8yN9SmgCfNESpb9voJFOw8NMIR6IqWM5UEQYU0A5xnAeBhibtP2BOa
-# 4bH9s8KdGG+DsZpuCPMDv/9LS2YUsnGwNLtzvfnOx81O34OceAMT4Eo5wAfxYGlP
-# Tsl4KHmtP0jaoD9RXI8VQhQvCSA49naI/Zahn1DdVf7ix64792CMqveW/LFY/FYl
-# lLV4F96t8jcvi23bOasqPIPHxO1SDHhO4tGTbS5tq50AYZOLWrb7U899LEn/LfTU
-# XcToPN4RfW/Pg3SB7Q+pI5V2vemteIZuVLBJ9yh70PrChpY0O8T3LzPkwmIReCkC
-# AwEAAaOCAdQwggHQMB8GA1UdIwQYMBaAFMn8EO9QyMtrf70IRO86YpPtW16aMB0G
-# A1UdDgQWBBS4gw5O24Kh4dLnb/qbH2fxlwUijjA+BgNVHSAENzA1MDMGBmeBDAEE
-# ATApMCcGCCsGAQUFBwIBFhtodHRwOi8vd3d3LmRpZ2ljZXJ0LmNvbS9DUFMwDgYD
-# VR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMDMIGXBgNVHR8EgY8wgYww
-# RKBCoECGPmh0dHA6Ly9jcmwzLmRpZ2ljZXJ0LmNvbS9Hb0dldFNTTEc0Q1NSU0E0
-# MDk2U0hBMjU2MjAyMkNBLTEuY3JsMESgQqBAhj5odHRwOi8vY3JsNC5kaWdpY2Vy
-# dC5jb20vR29HZXRTU0xHNENTUlNBNDA5NlNIQTI1NjIwMjJDQS0xLmNybDCBgwYI
-# KwYBBQUHAQEEdzB1MCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5j
-# b20wTQYIKwYBBQUHMAKGQWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9Hb0dl
-# dFNTTEc0Q1NSU0E0MDk2U0hBMjU2MjAyMkNBLTEuY3J0MAkGA1UdEwQCMAAwDQYJ
-# KoZIhvcNAQELBQADggIBAACeH7mDMx2b2AunxE/pho1rcPKjLwGv2WECIUXDOF7M
-# 7P9nPsZNuE1u93ztEFFxc8tkYwIXRoXweQ7tW8BlJoVHxA4Bxi7ZozZPMEUrhUc2
-# SdJAPXBd/k0UIl+Zj1KzpBkWiFV5MyXNv0N0YpBGt36GB2v9yOfUIxDk6y95rs7k
-# 8oQZ/HdELvnoUPhIN+65H01japtITcGO13/cvFcE2lAuSXyy+oT7qRV4QQyp1ykx
-# AGK3uS+lTqCcojTTm1lw2MgtVpA2TzK80P7XBWA62cSu1PtULULTCNibKvHimYSI
-# wcboxm4Lqe6dF8MYkAO0n1zUeI3dxq4DtKc1JsZ7xF9mQevuso299AfuCeD35sRo
-# FVcdx4OxrULLIaelOEv4xap5wjQZLaNEI7N354AQfBucgohvytE2sQ7vcPomaJEM
-# V0+vc0TvZ/qwY2vnWPBqw8Q7SMidZ+7sk6YQ5IiyILphytDVTBz/878UqNofpn5D
-# RHxt6EaBao81BX9EgbAnPKbsFAzVcm/uzt2oBYlrGccG+DQi0/k+6XzylWmQVu3y
-# oAtIOSF7UClzvRae6JsWEUi/4KFNGA9zxQRQD+IEjhv2nSxQQDlKGWzoMqGM+aGR
-# 9nEGH6cXzRujUpFBlKxNupzobg9gjDXSLkP234HOeDCS2WGSU2C1CQvjybdp/rxZ
-# MYIGSjCCBkYCAQEwbjBaMQswCQYDVQQGEwJMVjEZMBcGA1UEChMQRW5WZXJzIEdy
-# b3VwIFNJQTEwMC4GA1UEAxMnR29HZXRTU0wgRzQgQ1MgUlNBNDA5NiBTSEEyNTYg
-# MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
-# CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
-# AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IAx9bRuGN2TFfZmJ9iwq8ARtDM1J7FPwXjKrDLq5okPxMA0GCSqGSIb3DQEBAQUA
-# BIICAMio5b308B3TUmRrqxYahnGrT020kMf8p7o7UuZPUHogy0LIxyi62O3I0Vui
-# Jedwls3EjHQwl8c7CfLJZbrNPu2ldgfq+6txlk8cnrY+JM70QMB99v4NZSeg7flJ
-# uXpi08pztJWKBiY+Gm5RrIVgZ45qAI4YGCxRykIV7wh7WVM66pGqe6uFayP3J/Z/
-# 3+ajaUhE/1qZgc8raxOeenSqp0810b2DlMrOv6aoz9Bc81CFUAUFzWSoHUnnlhkB
-# XSklSqrHlHv+wUfH9YfRg4Bbolw02Z3pQMQYSk5vJBO0plC36p+6SKvzbd4m+ow0
-# 9te7mRE72sVPgDyD5FWXWC442B5wha8vgfI1ZuBrC3qvU/FV/amrkOFy2sLauwPT
-# EbzzM0FC+5txD8kjrol6YgTJL4i0KqlvIglA1M1bDWx+2dQoIOYeaxQgqxgIMFUN
-# SkL0yFG7FFrh2koJGta339qKvrcFNkwnqzyEkUwrhgFS73pZVMSCOSSGo51W4DyV
-# GrUrjmT1ztiklO1q1HyAmdBH6skmKfxh8ZGl0pMTUhvdvD5yNi5BtOFJ2Y1tfCHD
-# eyyayEkhva7vMXw+QaJnOAml2TQ8pgnlXv0wMjbcE64UfptBdeM5PD5MgbXaub5M
-# G4H/N4JIJb8D5WdI6MSruBra9h6WIjrkXbwGnxPtN/541uL6oYIDJjCCAyIGCSqG
-# SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
-# Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDgyNDIxNTY1NFowLwYJKoZIhvcNAQkEMSIEIAWwA6E6
-# /u9axSWOO6T4F9FL4Oy3elvxRMK8c1/M4WDlMA0GCSqGSIb3DQEBAQUABIICAGSW
-# sGkMQTKuHD+u2pPEquV/ZoUNEhV/rglct8Dj2dDBr8lMsn98GgKswl6NuTS+k/ux
-# WRnTkw7lyFw/X1L3rYLamjqkCZX3ZSGu2Ccm4dvGoZ7TUTpgRqyQmDKQ4GK1NB6x
-# Ec4vj7BIx0s8MHKh+6IwVfOoAF6vyuV5cM+O4eTw/FAACMX2vUtb5Yyx2M63qXoD
-# t7dk5HP/sP1rfQ4eula8xN0eYqou4cvxWOKHKQ1G4y0dphpFU1DrkpSZR62EvlcG
-# gagb7JBpaamYo1lZrHMhjtWcSjDXOJj8A+6SjhXg3MtfmaHu2ipBbp6ssXG7LA4M
-# E5Lk9LTR0lXuDgNPWJznA6yhAWi3jsrYd+DYG6XOIENDEDMChqlmI6M+Q4hh+L/u
-# 3HzeMBJFKfQLiF7Pow5H4xOatGS4fAr/wK/RNoZHa4k8apA/N1P7QoDNd0mY4thv
-# 8AJF92PgRsU4auHD72vGa1NGuYQZZhehKvhNViQ35YDu0Eb7IeAzk/z6B9wj97Kd
-# wwHvRiU/6OCj/3YKGqhIU70/kgcgnQkes2bMdSreWOASPtyLjpOVeeyu9kPgIG3w
-# 2c8JXNYhcMuYIcnnFSn9SjlfTGqOhyX7HF2ezga+SPxMKIothbyvcCB9M5vGPcDI
-# ERavErqW430PYr0gRQSBpoc8lCQfvicsgZcPJmU6
-# SIG # End signature block

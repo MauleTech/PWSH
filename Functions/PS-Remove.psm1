@@ -914,6 +914,12 @@ Function Remove-StaleProfiles {
 		Remove-PathForcefully. Profile registry entries whose folder no longer exists on disk are
 		treated as orphans and removed. Profiles that cannot be assessed are left alone.
 
+		Also removes that profile's per-user scheduled tasks. Windows suffixes the task name with
+		the profile's SID for several tasks it creates automatically (OneDrive's Startup,
+		Reporting, and Standalone Update tasks are the common ones); once the profile is gone
+		these become orphaned entries that clutter Task Scheduler and can error on their next
+		scheduled run.
+
 		Deleting a profile permanently destroys any data stored only in that profile. Supports
 		-WhatIf to preview, and prompts for confirmation on each profile when run interactively.
 		Pass -Confirm:$false for unattended use. Requires an elevated (Administrator) session.
@@ -985,6 +991,23 @@ Function Remove-StaleProfiles {
 		Try { Return [datetime]::FromFileTime($FileTime) } Catch { Return $null }
 	}
 
+	Function Remove-ProfileScheduledTasks {
+		# Windows suffixes the task name with the profile's SID for several per-user tasks it
+		# creates automatically (OneDrive's Startup, Reporting, and Standalone Update tasks are
+		# the common ones). Once the profile is gone these become orphaned entries that clutter
+		# Task Scheduler and can error on their next scheduled run.
+		param ([string] $ProfileSID)
+		If (-not $ProfileSID) { Return }
+		ForEach ($OrphanedTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "*-$ProfileSID" })) {
+			Try {
+				Unregister-ScheduledTask -InputObject $OrphanedTask -ErrorAction Stop
+				Write-Host "Removed orphaned scheduled task $($OrphanedTask.TaskName)." -ForegroundColor Green
+			} Catch {
+				Write-Host "Failed to remove scheduled task $($OrphanedTask.TaskName): $($_.Exception.Message)" -ForegroundColor Red
+			}
+		}
+	}
+
 	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
 	If (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -1046,6 +1069,7 @@ Function Remove-StaleProfiles {
 					Remove-CimInstance -InputObject $StaleProfile -ErrorAction Stop
 					Write-Host "Removed orphaned profile entry for $ProfilePath (no folder on disk)." -ForegroundColor Green
 					$Action = 'RemovedOrphan'
+					Remove-ProfileScheduledTasks -ProfileSID $ProfileSID
 				} Catch {
 					Write-Host "Failed to remove orphaned profile entry for ${ProfilePath}: $($_.Exception.Message)" -ForegroundColor Red
 					$Action = 'Failed'
@@ -1096,6 +1120,7 @@ Function Remove-StaleProfiles {
 						Remove-CimInstance -InputObject $StaleProfile -ErrorAction Stop
 						Write-Host "Removed profile $ProfilePath (SID: $ProfileSID)." -ForegroundColor Green
 						$Action = 'Removed'
+						Remove-ProfileScheduledTasks -ProfileSID $ProfileSID
 						If (Test-Path -LiteralPath $ProfilePath) {
 							Write-Host "Folder still present after profile removal. Force-removing leftovers..." -ForegroundColor Yellow
 							Remove-PathForcefully -Path $ProfilePath
@@ -1373,6 +1398,11 @@ Function Remove-UserProfile {
 		  - Removes leftover ProfileList entries for the same SID or folder, including the
 			<SID>.bak entry left behind by a failed profile load.
 		  - Removes orphaned ProfileGuid entries that referenced the deleted SID.
+		  - Removes that user's per-user scheduled tasks. Windows suffixes the task name with
+			the profile's SID for several tasks it creates automatically (OneDrive's Startup,
+			Reporting, and Standalone Update tasks are the common ones); once the profile is
+			gone these become orphaned entries that clutter Task Scheduler and can error on
+			their next scheduled run.
 		  - Handles the half-deleted states too: a ProfileList entry whose folder is already
 			gone, and a profile folder that no ProfileList entry points at.
 
@@ -1532,6 +1562,23 @@ Function Remove-UserProfile {
 		} Catch {
 			Write-Host "Robocopy could not be run: $($_.Exception.Message)" -ForegroundColor Red
 			Return 16
+		}
+	}
+
+	Function Remove-ProfileScheduledTasks {
+		# Windows suffixes the task name with the profile's SID for several per-user tasks it
+		# creates automatically (OneDrive's Startup, Reporting, and Standalone Update tasks are
+		# the common ones). Once the profile is gone these become orphaned entries that clutter
+		# Task Scheduler and can error on their next scheduled run.
+		param ([string] $ProfileSID)
+		If (-not $ProfileSID) { Return }
+		ForEach ($OrphanedTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "*-$ProfileSID" })) {
+			Try {
+				Unregister-ScheduledTask -InputObject $OrphanedTask -ErrorAction Stop
+				Write-Host "Removed orphaned scheduled task $($OrphanedTask.TaskName)." -ForegroundColor Green
+			} Catch {
+				Write-Host "Failed to remove scheduled task $($OrphanedTask.TaskName): $($_.Exception.Message)" -ForegroundColor Red
+			}
 		}
 	}
 
@@ -1776,6 +1823,8 @@ Function Remove-UserProfile {
 					}
 				}
 			}
+
+			Remove-ProfileScheduledTasks -ProfileSID $ItemSID
 
 			# Whatever is still on disk.
 			If ($ItemPath -and (Test-Path -LiteralPath $ItemPath)) {

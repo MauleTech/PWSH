@@ -117,7 +117,7 @@ param (
 #  MicrosoftWindows.CrossDevice, Microsoft.ZuneMusic, Microsoft.ApplicationCompatibilityEnhancements
 #                                              -- team decision; kept here by default.
 
-$GoodApps = "AppUp.IntelOptaneMemoryandStorageManagement|AppUp.IntelGraphicsExperience|AppUp.IntelArcSoftware|AppUp.IntelManagementandSecurityStatus|Windows.PrintDialog|NotepadPlusPlus|MicrosoftWindows.Client|MicrosoftCorporationII.QuickAssist|Microsoft.Winget.Source|Microsoft.WindowsAppRuntime|Microsoft.Windows.PrintQueueActionCenter|Microsoft.Win32WebViewHost|Microsoft.Todos|Microsoft.CredDialogHost|Microsoft.CompanyPortal|Microsoft.PowerShell|Microsoft.GetHelp|Microsoft.ApplicationCompatibilityEnhancements|MSTeams|Microsoft.OutlookForWindows|Microsoft.MicrosoftOfficeHub|MicrosoftCorporationII.MicrosoftRemoteDesktop|MicrosoftCorporationII.Windows365|Microsoft.RemoteDesktop|MicrosoftWindows.CrossDevice|Microsoft.ZuneMusic|Dell|AD2F1837|E046963F|RealtekSemiconductorCorp|SynapticsIncorporated|DolbyLaboratories|NVIDIACorp|AdvancedMicroDevicesInc|ELANMicroelectronics|WindowsTerminal|WavesAudio|store|calculator|camera|sticky|windows.photos|soundrecorder|mspaint|microsoft.paint|windowsnotepad|screensketch|Microsoft.HEIFImageExtension|Microsoft.WindowsNotepad|Microsoft.HEVCVideoExtension|Microsoft.VP9VideoExtensions|Microsoft.WebMediaExtensions|Microsoft.WebpImageExtension|Extension|Microsoft.YourPhone|Microsoft.MicrosoftEdge|Alarms"
+$GoodApps = "AppUp.IntelOptaneMemoryandStorageManagement|AppUp.IntelGraphicsExperience|AppUp.IntelArcSoftware|AppUp.IntelManagementandSecurityStatus|Windows.PrintDialog|NotepadPlusPlus|MicrosoftWindows.Client|MicrosoftCorporationII.QuickAssist|Microsoft.Winget.|Microsoft.WindowsAppRuntime|Microsoft.Windows.PrintQueueActionCenter|Microsoft.Win32WebViewHost|Microsoft.Todos|Microsoft.CredDialogHost|Microsoft.CompanyPortal|Microsoft.PowerShell|Microsoft.GetHelp|Microsoft.ApplicationCompatibilityEnhancements|MSTeams|Microsoft.OutlookForWindows|Microsoft.MicrosoftOfficeHub|MicrosoftCorporationII.MicrosoftRemoteDesktop|MicrosoftCorporationII.Windows365|Microsoft.RemoteDesktop|MicrosoftWindows.CrossDevice|Microsoft.ZuneMusic|Dell|AD2F1837|E046963F|RealtekSemiconductorCorp|SynapticsIncorporated|DolbyLaboratories|NVIDIACorp|AdvancedMicroDevicesInc|ELANMicroelectronics|WindowsTerminal|WavesAudio|store|calculator|camera|sticky|windows.photos|soundrecorder|mspaint|microsoft.paint|windowsnotepad|screensketch|Microsoft.HEIFImageExtension|Microsoft.WindowsNotepad|Microsoft.HEVCVideoExtension|Microsoft.VP9VideoExtensions|Microsoft.WebMediaExtensions|Microsoft.WebpImageExtension|Extension|Microsoft.YourPhone|Microsoft.MicrosoftEdge|Alarms"
 
 #------End editable variables------
 
@@ -133,6 +133,7 @@ $Global:MTDecrap = @{
 	RegFailed    = New-Object System.Collections.ArrayList
 	VerifyPass   = 0
 	VerifyFail   = 0
+	RegBlocked   = 0
 }
 
 Function Test-Elevated {
@@ -215,20 +216,71 @@ Function Set-DecrapReg {
 		[Parameter(Mandatory=$true)][string]$Name,
 		[Parameter(Mandatory=$true)][string]$Value,
 		[ValidateSet("REG_DWORD","REG_SZ","REG_BINARY")][string]$Type = "REG_DWORD",
-		[string]$Comment = ""
+		[string]$Comment = "",
+		#Set this for a value that recent Windows builds refuse to let anyone write, where the
+		#script already applies a documented replacement. Such a value is reported as [BLOCKED]
+		#rather than [FAIL], because there is nothing an operator can do about it and it is not
+		#a defect in this script. Never use it to quieten a write that genuinely should work.
+		[string]$Superseded = ""
 	)
-	$null = & reg.exe add "$Path" /T $Type /V "$Name" /D "$Value" /F 2>&1
+	#Keep reg.exe's own output. A failure needs to say WHY, not just that it happened.
+	$RegOut = (& reg.exe add "$Path" /T $Type /V "$Name" /D "$Value" /F 2>&1 | Out-String).Trim()
+	$Short  = $Path -replace '^(HKCU|HKLM\\AllProfile|HKLM|HKCR)\\', ''
+
 	if ($LASTEXITCODE -eq 0) {
 		$Global:MTDecrap.RegChanges++
-		#Strip the hive prefix so the lines stay readable; the pass header already says which hive.
-		$Short = $Path -replace '^(HKCU|HKLM\\AllProfile|HKLM|HKCR)\\', ''
-		$Note  = If ($Comment) { "   # $Comment" } Else { "" }
+		$Note = If ($Comment) { "   # $Comment" } Else { "" }
 		Write-Detail ("      {0} = {1}{2}" -f "$Short\$Name", $Value, $Note) "DarkGray"
-	} else {
-		$Global:MTDecrap.RegFailures++
-		$null = $Global:MTDecrap.RegFailed.Add("$Path -> $Name")
-		Write-Host "    [FAIL] $Path -> $Name" -ForegroundColor Yellow
+		return
 	}
+
+	#reg.exe refused. Retry through the .NET registry API before giving up: it succeeds in some
+	#cases where reg.exe does not, and when it fails it raises a typed exception that names the
+	#real reason instead of reg.exe's one-line "ERROR:" text.
+	$FallbackNote = "not attempted"
+	Try {
+		$Hive, $SubPath = $Path -split '\\', 2
+		$Base = switch ($Hive) {
+			"HKCU" { [Microsoft.Win32.Registry]::CurrentUser }
+			"HKLM" { [Microsoft.Win32.Registry]::LocalMachine }
+			"HKCR" { [Microsoft.Win32.Registry]::ClassesRoot }
+			default { $null }
+		}
+		#REG_BINARY takes a hex string here, which the .NET path would need converting; that value
+		#is only used by -DisableOneDrive, so leave it to reg.exe rather than add a second parser.
+		If (-not $Base) {
+			$FallbackNote = "unrecognised hive '$Hive'"
+		} ElseIf ($Type -eq "REG_BINARY") {
+			$FallbackNote = "skipped for REG_BINARY"
+		} Else {
+			$Kind = If ($Type -eq "REG_DWORD") { [Microsoft.Win32.RegistryValueKind]::DWord }
+			        Else { [Microsoft.Win32.RegistryValueKind]::String }
+			$Data = If ($Type -eq "REG_DWORD") { [int]$Value } Else { $Value }
+			$Key  = $Base.CreateSubKey($SubPath)
+			$Key.SetValue($Name, $Data, $Kind)
+			$Key.Close()
+
+			$Global:MTDecrap.RegChanges++
+			$Note = If ($Comment) { "   # $Comment" } Else { "" }
+			Write-Detail ("      {0} = {1}{2}   (via .NET; reg.exe refused)" -f "$Short\$Name", $Value, $Note) "DarkGray"
+			return
+		}
+	} Catch {
+		$FallbackNote = $_.Exception.Message
+	}
+
+	If ($Superseded) {
+		$Global:MTDecrap.RegBlocked++
+		Write-Host "    [BLOCKED] $Short\$Name - Windows refused the write" -ForegroundColor DarkGray
+		Write-Host "              $Superseded" -ForegroundColor DarkGray
+		return
+	}
+
+	$Global:MTDecrap.RegFailures++
+	$null = $Global:MTDecrap.RegFailed.Add("$Path -> $Name")
+	Write-Host "    [FAIL] $Path -> $Name" -ForegroundColor Yellow
+	If ($RegOut)       { Write-Host "           reg.exe: $RegOut" -ForegroundColor Yellow }
+	If ($FallbackNote) { Write-Host "           .NET   : $FallbackNote" -ForegroundColor Yellow }
 }
 
 
@@ -525,10 +577,16 @@ Function RegSetUser {
 	Set-DecrapReg $ADV "HideFileExt" 0
 	#File Explorer opens to This PC rather than Home
 	Set-DecrapReg $ADV "LaunchTo" 1
-	#Hide the Widgets button on the taskbar. Belt and braces behind the machine policies: if a
-	#build ignores DisableWidgetsBoard, this still removes the thing you would hover over.
-	#Applied to the current user and the default profile, so every future account inherits it.
-	Set-DecrapReg $ADV "TaskbarDa" 0
+	#Hide the Widgets button on the taskbar.
+	#
+	#Windows 11 25H2 (build 26200) refuses this write even for an elevated administrator, and
+	#refuses it through the .NET registry API too, so it is not a reg.exe quirk and taking
+	#ownership does not help: the shell now enforces this one at runtime. Confirmed on our own
+	#hardware and independently by winutil issue 2886, where Set-ItemProperty on TaskbarDa raises
+	#UnauthorizedAccessException. It still works on 23H2 and 24H2, so it stays for those builds
+	#and is marked superseded rather than removed. DisableWidgetsBoard in RegSetMachine is the
+	#control that actually applies on 25H2.
+	Set-DecrapReg $ADV "TaskbarDa" 0 -Superseded "Blocked on 25H2 and later; Dsh\DisableWidgetsBoard covers it."
 	#Different feature, same class of annoyance: opening SEARCH on hover over the search
 	#highlight. This is the Feeds\DSB key, not a widgets one. If it comes back access-denied the
 	#run names it in the summary rather than failing silently.
@@ -644,7 +702,11 @@ Function RegSetMachine {
 	#
 	#AllowNewsAndInterests: "applies to the entire widgets experience, including content on the
 	#taskbar". Released policy, Pro supported, Windows 11 21H2 and later.
-	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+	#Same story as TaskbarDa: 25H2 refuses this write even elevated, while DisableWidgetsBoard
+	#and DisableWidgetsOnLockScreen in the same key write fine in the same pass. Registry ACLs
+	#are per key, not per value, so this is enforcement above the ACL layer, not a permissions
+	#problem. Kept for 23H2 and 24H2 where it still applies.
+	Set-DecrapReg "HKLM\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0 -Superseded "Blocked on 25H2 and later; DisableWidgetsBoard below covers it."
 	#DisableWidgetsBoard: "you won't be able to invoke the Widgets board and its entry point will
 	#no longer appear on the taskbar". Same ADMX, same key. Microsoft still lists this one as
 	#preview, so it may be a no-op on some builds. An unrecognised policy value is ignored, so
@@ -733,7 +795,10 @@ Function Assert-DecrapValue {
 		[Parameter(Mandatory=$true)][string]$Label,
 		[Parameter(Mandatory=$true)][string]$Path,
 		[Parameter(Mandatory=$true)][string]$Name,
-		[Parameter(Mandatory=$true)]$Expected
+		[Parameter(Mandatory=$true)]$Expected,
+		#As per Set-DecrapReg: a value newer Windows refuses to let anyone set, where a
+		#documented replacement is already applied and separately verified.
+		[string]$Superseded = ""
 	)
 	$Actual = $null
 	Try { $Actual = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } Catch { }
@@ -741,6 +806,9 @@ Function Assert-DecrapValue {
 	If ("$Actual" -eq "$Expected") {
 		Write-Host ("  [PASS] {0,-34} {1}" -f $Label, $Actual) -ForegroundColor Green
 		$Global:MTDecrap.VerifyPass++
+	} ElseIf ($Superseded) {
+		Write-Host ("  [n/a ] {0,-34} not settable on this build" -f $Label) -ForegroundColor DarkGray
+		Write-Host ("         {0}" -f $Superseded) -ForegroundColor DarkGray
 	} Else {
 		$Shown = If ($null -eq $Actual) { "<not set>" } Else { $Actual }
 		Write-Host ("  [FAIL] {0,-34} got '{1}', expected '{2}'" -f $Label, $Shown, $Expected) -ForegroundColor Red
@@ -782,7 +850,7 @@ Function Test-DecrapResult {
 		$Want = If ($DisableTelemetryService) { 0 } Else { 1 }
 		Assert-DecrapValue "AllowTelemetry" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" $Want
 		Assert-DecrapValue "DisableWindowsConsumerFeatures" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
-		Assert-DecrapValue "Widgets off" "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+		Assert-DecrapValue "Widgets off (legacy policy)" "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0 -Superseded "Blocked on 25H2; DisableWidgetsBoard below is the one that counts."
 		Assert-DecrapValue "Widgets board disabled" "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsBoard" 1
 		Assert-DecrapValue "Consumer Chat icon hidden" "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon" 3
 
@@ -796,7 +864,7 @@ Function Test-DecrapResult {
 		#--- Current user ---
 		Assert-DecrapValue "File extensions visible" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
 		Assert-DecrapValue "Explorer opens to This PC" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
-		Assert-DecrapValue "Widgets taskbar button hidden" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0
+		Assert-DecrapValue "Widgets button hidden (legacy)" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0 -Superseded "Blocked on 25H2; DisableWidgetsBoard is the one that counts."
 		Assert-DecrapValue "Setup nag suppressed" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
 		Assert-DecrapValue "Content delivery off" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "ContentDeliveryAllowed" 0
 		Assert-DecrapValue "Advertising ID off" "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
@@ -835,6 +903,9 @@ Function Goodbye {
 	Write-Host ("  Apps Windows refused      : {0}" -f $S.AppsRefused) -ForegroundColor DarkGray
 	Write-Host ("  Provisioned pkgs removed  : {0}" -f $S.ProvRemoved) -ForegroundColor Green
 	Write-Host ("  Registry values written   : {0}" -f $S.RegChanges)  -ForegroundColor Green
+	If ($S.RegBlocked -gt 0) {
+		Write-Host ("  Values Windows blocked    : {0} (superseded, not a fault)" -f $S.RegBlocked) -ForegroundColor DarkGray
+	}
 	If (($S.VerifyPass + $S.VerifyFail) -gt 0) {
 		If ($S.VerifyFail -gt 0) {
 			Write-Host ("  Verification              : {0} passed, {1} FAILED" -f $S.VerifyPass, $S.VerifyFail) -ForegroundColor Red

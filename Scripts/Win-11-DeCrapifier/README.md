@@ -81,9 +81,8 @@ The manual cross-checks below still hold if you want to confirm independently af
 | Teams survived | package present | `Get-AppxPackage MSTeams` |
 | Get Help survived | package present | `Get-AppxPackage Microsoft.GetHelp` |
 | Intel graphics panel survived | package present | `Get-AppxPackage AppUp.IntelArcSoftware` |
-| Widgets policy applied | `0` | `Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' AllowNewsAndInterests` |
 | Widgets board disabled | `1` | `Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' DisableWidgetsBoard` |
-| Widgets taskbar button hidden | `0` | `Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarDa` |
+| Widgets actually gone | no widgets button on the taskbar after reboot | look at the taskbar |
 | Recall off | `1` | `Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' DisableAIDataAnalysis` |
 | File extensions visible | `0` | `Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' HideFileExt` |
 | No Start menu errors | transcript has no `Import-StartLayout` | `Select-String -Path C:\Windows11DCtranscript.txt -Pattern 'StartLayout'` |
@@ -132,7 +131,40 @@ on does.
 `-LeaveTasks`, `-LeaveServices`, `-Xbox`, `-Cortana`, `-AllApps`, `-NoLog`, `-AppsOnly` and
 `-SettingsOnly` behave as they did.
 
-## A note on the widgets "Open on hover" behaviour
+## A note on widgets, hover, and what 25H2 blocks
+
+**Two of the widgets registry values cannot be written at all on Windows 11 25H2 (build 26200),
+even by an elevated administrator.** Confirmed on our own hardware:
+
+| Value | 23H2 / 24H2 | 25H2 |
+|---|---|---|
+| `Dsh\AllowNewsAndInterests` | writes | **Access is denied** |
+| `Explorer\Advanced\TaskbarDa` | writes | **Access is denied** |
+| `Dsh\DisableWidgetsBoard` | writes | writes |
+| `Dsh\DisableWidgetsOnLockScreen` | writes | writes |
+
+This is not a permissions problem and taking ownership does not help. Registry ACLs are per key,
+not per value, and `DisableWidgetsBoard` writes successfully to the *same key* in the *same pass*
+where `AllowNewsAndInterests` is refused. The shell enforces these two above the ACL layer. It is
+not a `reg.exe` quirk either: winutil
+[issue 2886](https://github.com/ChrisTitusTech/winutil/issues/2886) shows `Set-ItemProperty` on
+`TaskbarDa` raising `UnauthorizedAccessException`, so the .NET API is blocked the same way.
+
+The script still sets both, because they work on 23H2 and 24H2 and most of the fleet is not on
+25H2 yet. They are marked as superseded, so on a 25H2 machine they report as `[BLOCKED]` with the
+reason rather than as failures, and the summary counts them separately:
+
+```
+  Values Windows blocked    : 3 (superseded, not a fault)
+  Registry values failed    : 0
+```
+
+**`DisableWidgetsBoard` is the control that matters now.** Microsoft documents it as "you won't be
+able to invoke the Widgets board and its entry point will no longer appear on the taskbar", and it
+writes cleanly on every build we have tried. Confirm on the test machine after a reboot that the
+taskbar widget is actually gone; that is the real check, not the registry read-back.
+
+### On "Open on hover" specifically
 
 There is **no machine-wide policy for the "Open Widgets board on hover" toggle**, and no working
 per-user registry value for it either. Microsoft does not ship one: the `NewsAndInterests` CSP

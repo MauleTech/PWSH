@@ -2099,6 +2099,14 @@ Function Invoke-Win11Debloat {
 		'Microsoft.ZuneMusic',
 		'Microsoft.YourPhone',
 		'MicrosoftWindows.CrossDevice',
+		# Vendor tooling we actually drive. Taylor's script removes Dell Command | Update by
+		# default; Update-DellPackages in PS-Update.psm1 installs it and shells out to dcu-cli,
+		# so debloating a Dell would break driver updates until the next Update-DellPackages run
+		# reinstalled it.
+		'Dell Command | Update',
+		'Dell Command | Update for Windows Universal',
+		'Dell Command | Update for Windows 10',
+		'DellInc.DellCommandUpdate',
 		# Vendor companion apps and drivers
 		'AppUp.IntelGraphicsExperience',
 		'AppUp.IntelArcSoftware',

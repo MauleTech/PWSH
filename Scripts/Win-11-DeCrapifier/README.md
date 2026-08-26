@@ -205,7 +205,11 @@ shipping changes to make Widgets "quiet by default".
   to reverse than disabling them; `Invoke-Win11Decrap` disables the CEIP tasks instead.
 * The OEM Win32 removal (HP, Dell, Lenovo, McAfee) is aggressive. Validate per vendor on a test
   build before fleet use, particularly on Dell where management tooling shares naming with the
-  crapware.
+  crapware. One case is already handled: upstream removes **Dell Command | Update**, which
+  `Update-DellPackages` installs and drives through `dcu-cli`, so all four of its names are in
+  the keep-list. Upstream already protects Dell Display Manager, Dell Pair, Dell Peripheral
+  Manager, Dell Optimizer Core and the SupportAssist remediation plugins. SupportAssist itself is
+  removed, which matches what we do elsewhere.
 * Use `-AdditionalKeep` with EXACT package or program names. Upstream matches exactly, not as
   substrings, so `Microsoft.WindowsCamera` works and `camera` does not. This is the opposite of
   `$GoodApps` in our own script, which is substring matched.

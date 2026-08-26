@@ -117,7 +117,7 @@ param (
 #  MicrosoftWindows.CrossDevice, Microsoft.ZuneMusic, Microsoft.ApplicationCompatibilityEnhancements
 #                                              -- team decision; kept here by default.
 
-$GoodApps = "AppUp.IntelOptaneMemoryandStorageManagement|AppUp.IntelGraphicsExperience|AppUp.IntelArcSoftware|AppUp.IntelManagementandSecurityStatus|Windows.PrintDialog|NotepadPlusPlus|MicrosoftWindows.Client|MicrosoftCorporationII.QuickAssist|Microsoft.Winget.Source|Microsoft.WindowsAppRuntime|Microsoft.Windows.PrintQueueActionCenter|Microsoft.Win32WebViewHost|Microsoft.Todos|Microsoft.CredDialogHost|Microsoft.CompanyPortal|Microsoft.PowerShell|Microsoft.GetHelp|Microsoft.ApplicationCompatibilityEnhancements|MSTeams|Microsoft.OutlookForWindows|Microsoft.MicrosoftOfficeHub|MicrosoftCorporationII.MicrosoftRemoteDesktop|MicrosoftCorporationII.Windows365|Microsoft.RemoteDesktop|MicrosoftWindows.CrossDevice|Microsoft.ZuneMusic|Dell|AD2F1837|E046963F|RealtekSemiconductorCorp|SynapticsIncorporated|DolbyLaboratories|NVIDIACorp|AdvancedMicroDevicesInc|ELANMicroelectronics|WindowsTerminal|WavesAudio|store|calculator|camera|sticky|windows.photos|soundrecorder|mspaint|microsoft.paint|windowsnotepad|screensketch|Microsoft.HEIFImageExtension|Microsoft.WindowsNotepad|Microsoft.HEVCVideoExtension|Microsoft.VP9VideoExtensions|Microsoft.WebMediaExtensions|Microsoft.WebpImageExtension|Extension|Microsoft.YourPhone|Microsoft.MicrosoftEdge|Alarms"
+$GoodApps = "AppUp.IntelOptaneMemoryandStorageManagement|AppUp.IntelGraphicsExperience|AppUp.IntelArcSoftware|AppUp.IntelManagementandSecurityStatus|Windows.PrintDialog|NotepadPlusPlus|MicrosoftWindows.Client|MicrosoftCorporationII.QuickAssist|Microsoft.Winget.|Microsoft.WindowsAppRuntime|Microsoft.Windows.PrintQueueActionCenter|Microsoft.Win32WebViewHost|Microsoft.Todos|Microsoft.CredDialogHost|Microsoft.CompanyPortal|Microsoft.PowerShell|Microsoft.GetHelp|Microsoft.ApplicationCompatibilityEnhancements|MSTeams|Microsoft.OutlookForWindows|Microsoft.MicrosoftOfficeHub|MicrosoftCorporationII.MicrosoftRemoteDesktop|MicrosoftCorporationII.Windows365|Microsoft.RemoteDesktop|MicrosoftWindows.CrossDevice|Microsoft.ZuneMusic|Dell|AD2F1837|E046963F|RealtekSemiconductorCorp|SynapticsIncorporated|DolbyLaboratories|NVIDIACorp|AdvancedMicroDevicesInc|ELANMicroelectronics|WindowsTerminal|WavesAudio|store|calculator|camera|sticky|windows.photos|soundrecorder|mspaint|microsoft.paint|windowsnotepad|screensketch|Microsoft.HEIFImageExtension|Microsoft.WindowsNotepad|Microsoft.HEVCVideoExtension|Microsoft.VP9VideoExtensions|Microsoft.WebMediaExtensions|Microsoft.WebpImageExtension|Extension|Microsoft.YourPhone|Microsoft.MicrosoftEdge|Alarms"
 
 #------End editable variables------
 
@@ -217,18 +217,57 @@ Function Set-DecrapReg {
 		[ValidateSet("REG_DWORD","REG_SZ","REG_BINARY")][string]$Type = "REG_DWORD",
 		[string]$Comment = ""
 	)
-	$null = & reg.exe add "$Path" /T $Type /V "$Name" /D "$Value" /F 2>&1
+	#Keep reg.exe's own output. A failure needs to say WHY, not just that it happened.
+	$RegOut = (& reg.exe add "$Path" /T $Type /V "$Name" /D "$Value" /F 2>&1 | Out-String).Trim()
+	$Short  = $Path -replace '^(HKCU|HKLM\\AllProfile|HKLM|HKCR)\\', ''
+
 	if ($LASTEXITCODE -eq 0) {
 		$Global:MTDecrap.RegChanges++
-		#Strip the hive prefix so the lines stay readable; the pass header already says which hive.
-		$Short = $Path -replace '^(HKCU|HKLM\\AllProfile|HKLM|HKCR)\\', ''
-		$Note  = If ($Comment) { "   # $Comment" } Else { "" }
+		$Note = If ($Comment) { "   # $Comment" } Else { "" }
 		Write-Detail ("      {0} = {1}{2}" -f "$Short\$Name", $Value, $Note) "DarkGray"
-	} else {
-		$Global:MTDecrap.RegFailures++
-		$null = $Global:MTDecrap.RegFailed.Add("$Path -> $Name")
-		Write-Host "    [FAIL] $Path -> $Name" -ForegroundColor Yellow
+		return
 	}
+
+	#reg.exe refused. Retry through the .NET registry API before giving up: it succeeds in some
+	#cases where reg.exe does not, and when it fails it raises a typed exception that names the
+	#real reason instead of reg.exe's one-line "ERROR:" text.
+	$FallbackNote = "not attempted"
+	Try {
+		$Hive, $SubPath = $Path -split '\\', 2
+		$Base = switch ($Hive) {
+			"HKCU" { [Microsoft.Win32.Registry]::CurrentUser }
+			"HKLM" { [Microsoft.Win32.Registry]::LocalMachine }
+			"HKCR" { [Microsoft.Win32.Registry]::ClassesRoot }
+			default { $null }
+		}
+		#REG_BINARY takes a hex string here, which the .NET path would need converting; that value
+		#is only used by -DisableOneDrive, so leave it to reg.exe rather than add a second parser.
+		If (-not $Base) {
+			$FallbackNote = "unrecognised hive '$Hive'"
+		} ElseIf ($Type -eq "REG_BINARY") {
+			$FallbackNote = "skipped for REG_BINARY"
+		} Else {
+			$Kind = If ($Type -eq "REG_DWORD") { [Microsoft.Win32.RegistryValueKind]::DWord }
+			        Else { [Microsoft.Win32.RegistryValueKind]::String }
+			$Data = If ($Type -eq "REG_DWORD") { [int]$Value } Else { $Value }
+			$Key  = $Base.CreateSubKey($SubPath)
+			$Key.SetValue($Name, $Data, $Kind)
+			$Key.Close()
+
+			$Global:MTDecrap.RegChanges++
+			$Note = If ($Comment) { "   # $Comment" } Else { "" }
+			Write-Detail ("      {0} = {1}{2}   (via .NET; reg.exe refused)" -f "$Short\$Name", $Value, $Note) "DarkGray"
+			return
+		}
+	} Catch {
+		$FallbackNote = $_.Exception.Message
+	}
+
+	$Global:MTDecrap.RegFailures++
+	$null = $Global:MTDecrap.RegFailed.Add("$Path -> $Name")
+	Write-Host "    [FAIL] $Path -> $Name" -ForegroundColor Yellow
+	If ($RegOut)       { Write-Host "           reg.exe: $RegOut" -ForegroundColor Yellow }
+	If ($FallbackNote) { Write-Host "           .NET   : $FallbackNote" -ForegroundColor Yellow }
 }
 
 

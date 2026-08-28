@@ -893,26 +893,52 @@ Function Remove-StaleProfiles {
 		  - The profile is not a special system profile (systemprofile, LocalService, NetworkService).
 		  - The profile path does not match ExcludePattern (default: 'Remote Support|admin').
 		  - The profile was created before the staleness cutoff.
+		  - No other ProfileList entry points at the same folder.
+		  - The SID has no mounted registry hive and no logon session.
+		  - The folder's NTUSER.DAT can be opened exclusively, proving nothing has it loaded.
 		  - The most recent activity on the profile is older than the staleness cutoff.
 
+		The four in-use tests run before any timestamp is consulted, because age is an argument
+		about the past and those are about the present. Win32_UserProfile.Loaded alone is not
+		enough: it describes one SID's hive at one instant, and it says nothing about a folder
+		that a second ProfileList entry also claims. Two entries pointing at one folder is a
+		routine repair artifact (an account deleted and recreated keeps the folder but gets a new
+		SID, and the usual hand fix for a temporary profile is to repoint ProfileImagePath at the
+		live folder), and the abandoned entry then ages out on its own timestamps while the
+		current user is still working out of that folder.
+
 		Activity is determined the way Windows itself has aged profiles since Windows 10 1809 and
-		Server 2019: from the profile service's load, unload, and cleanup-check timestamps stored
-		under HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID>. These values
-		only change when the profile is genuinely loaded or unloaded (logon/logoff), so Windows
-		Update servicing and antivirus hive scans do not inflate them. On builds where those
-		values are absent, activity falls back to the newest LastWriteTime found among the
-		profile folder itself, its NTUSER.DAT registry hive, and its first-level subfolders
-		(hidden folders such as AppData included). The fallback can be inflated by servicing
-		activity, which errs toward keeping profiles.
+		Server 2019: from the profile service's unload and cleanup-check timestamps stored under
+		HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID>. These values only
+		change when the profile is genuinely unloaded or checked for cleanup, so Windows Update
+		servicing and antivirus hive scans do not inflate them.
+
+		LocalProfileLoadTime is NOT one of them. A load time newer than both of the others means
+		the profile was loaded and never came back down: the session is still open, or the machine
+		lost power mid-session. Microsoft's reference script (see .LINK) excludes it for that
+		reason, noting that a winning load time "would most likely indicate profile currently
+		loaded or machine crashed", and falls back to the NTUSER.DAT timestamp. Treating a load
+		time as activity reports a user signed in continuously since that date as idle since that
+		date, which deletes a profile that is in daily use. A load time inside the threshold is
+		still proof of a recent sign-in, so it keeps the profile.
+
+		Where the profile service timestamps are absent or describe an earlier session, activity
+		falls back to the newest LastWriteTime found among the profile folder itself, its
+		NTUSER.DAT registry hive, and its first-level subfolders (hidden folders such as AppData
+		included). The fallback can be inflated by servicing activity, which errs toward keeping
+		profiles.
 
 		Win32_UserProfile.LastUseTime is deliberately not used as the activity signal because
 		Windows servicing and antivirus scans update it, making profiles untouched for years
 		appear recently used.
 
 		Removal is performed with Remove-CimInstance, which deletes both the ProfileList registry
-		entry and the profile folder. If files remain afterwards they are force-removed with
-		Remove-PathForcefully. Profile registry entries whose folder no longer exists on disk are
-		treated as orphans and removed. Profiles that cannot be assessed are left alone.
+		entry and the profile folder. Files remaining afterwards are force-removed with
+		Remove-PathForcefully only if the folder re-tests as idle; a folder still locked at that
+		point is left alone, because Remove-PathForcefully deletes what it can and queues the rest
+		for delete-on-reboot, which would destroy data belonging to whoever holds the lock.
+		Profile registry entries whose folder no longer exists on disk are treated as orphans and
+		removed. Profiles that cannot be assessed are left alone.
 
 		Also removes that profile's per-user scheduled tasks. Windows suffixes the task name with
 		the profile's SID for several tasks it creates automatically (OneDrive's Startup,
@@ -939,7 +965,8 @@ Function Remove-StaleProfiles {
 
 	.PARAMETER PassThru
 		Outputs a result object for each assessed profile (ProfilePath, SID, LastActivity,
-		ActivitySource, Action).
+		ActivitySource, Action). Action is one of Removed, RemovedOrphan, Kept, InUse, Declined,
+		Unreadable or Failed.
 
 	.EXAMPLE
 		Remove-StaleProfiles -WhatIf
@@ -991,6 +1018,28 @@ Function Remove-StaleProfiles {
 		Try { Return [datetime]::FromFileTime($FileTime) } Catch { Return $null }
 	}
 
+	Function Test-ProfileFolderInUse {
+		# Decides whether anyone is working out of a profile folder right now, without
+		# trusting any bookkeeping that can be stale or can describe a different account.
+		# A loaded profile holds an exclusive kernel lock on NTUSER.DAT, so if the hive
+		# cannot be opened for exclusive read/write the folder is live no matter what
+		# Win32_UserProfile.Loaded and the ProfileList timestamps say about it.
+		# Returns $true when the folder is in use and $true when the answer cannot be
+		# determined, so an unreadable profile is kept rather than deleted.
+		param ([string] $ProfileFolder)
+		$HivePath = Join-Path -Path $ProfileFolder -ChildPath 'NTUSER.DAT'
+		If (-not (Test-Path -LiteralPath $HivePath)) { Return $false }
+		$Stream = $null
+		Try {
+			$Stream = [System.IO.File]::Open($HivePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+			Return $false
+		} Catch {
+			Return $true
+		} Finally {
+			If ($Stream) { $Stream.Dispose() }
+		}
+	}
+
 	Function Remove-ProfileScheduledTasks {
 		# Windows suffixes the task name with the profile's SID for several per-user tasks it
 		# creates automatically (OneDrive's Startup, Reporting, and Standalone Update tasks are
@@ -1034,9 +1083,10 @@ Function Remove-StaleProfiles {
 	Write-Host "Checking for user profiles with no activity since $($CutoffDate.ToString('yyyy-MM-dd')) ($ThresholdText)..." -ForegroundColor Cyan
 
 	Try {
+		$AllProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)
 		# A null CreationTime (seen on damaged profiles) passes the age gate; the activity
 		# check below is still required before anything is removed.
-		$Candidates = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object {
+		$Candidates = $AllProfiles | Where-Object {
 			($_.Loaded -eq $false) -and
 			($_.Special -ne $true) -and
 			($_.LocalPath) -and
@@ -1051,6 +1101,53 @@ Function Remove-StaleProfiles {
 	If (-not $Candidates) {
 		Write-Host "No unloaded user profiles older than $ThresholdText found." -ForegroundColor Green
 		Return
+	}
+
+	# SIDs whose registry hive is mounted right now. This is the state
+	# Win32_UserProfile.Loaded is meant to report, read straight from HKEY_USERS so a stale
+	# or wrong WMI snapshot cannot green-light a profile whose owner is signed in.
+	$InUseSIDs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+	ForEach ($HiveKey in @(Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+		$HiveSID = $HiveKey.PSChildName -replace '_Classes$', ''
+		# Any SID shape counts. An Entra ID account on an Entra-joined machine is S-1-12-1,
+		# not S-1-5-21, and matching only the latter would leave that user unprotected.
+		If ($HiveSID -match '^S-1-') { [void]$InUseSIDs.Add($HiveSID) }
+	}
+
+	# SIDs holding a logon session. Catches a disconnected session that still owns running
+	# processes, and any build where the hive enumeration above comes back short.
+	ForEach ($LogonLink in @(Get-CimInstance -ClassName Win32_LoggedOnUser -ErrorAction SilentlyContinue)) {
+		Try {
+			$Account = New-Object System.Security.Principal.NTAccount($LogonLink.Antecedent.Domain, $LogonLink.Antecedent.Name)
+			$ResolvedSID = $Account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+			If ($ResolvedSID -match '^S-1-') { [void]$InUseSIDs.Add($ResolvedSID) }
+		} Catch { }
+	}
+
+	# Folder -> every SID that claims it. Two entries pointing at one folder is a real and
+	# common repair artifact: an account deleted and recreated keeps the folder but gets a new
+	# SID, and the usual hand fix for a temporary profile is to repoint ProfileImagePath at the
+	# live folder. The abandoned entry then ages out on its own timestamps while the current
+	# user is still working out of that folder, so no folder may be deleted on the strength of
+	# a single entry's timestamps. The .bak suffix Windows adds to a failed profile load is
+	# stripped first: that is the same account, not a second claimant.
+	$SelfProfilePath = ''
+	If ($env:USERPROFILE) { $SelfProfilePath = $env:USERPROFILE.TrimEnd('\') }
+
+	$FolderClaims = @{}
+	$ClaimList = @()
+	$ClaimList += @($AllProfiles | ForEach-Object { [PSCustomObject]@{ Path = $_.LocalPath; SID = $_.SID } })
+	$ClaimList += @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
+		[PSCustomObject]@{
+			Path = (Get-ItemProperty -Path $_.PSPath -Name 'ProfileImagePath' -ErrorAction SilentlyContinue).ProfileImagePath
+			SID  = $_.PSChildName -replace '\.bak$', ''
+		}
+	})
+	ForEach ($Claim in $ClaimList) {
+		If (-not $Claim.Path -or -not $Claim.SID) { Continue }
+		$ClaimKey = $Claim.Path.TrimEnd('\')
+		If (-not $FolderClaims.ContainsKey($ClaimKey)) { $FolderClaims[$ClaimKey] = @() }
+		If ($FolderClaims[$ClaimKey] -notcontains $Claim.SID) { $FolderClaims[$ClaimKey] += $Claim.SID }
 	}
 
 	$Results = [System.Collections.ArrayList]::new()
@@ -1083,24 +1180,94 @@ Function Remove-StaleProfiles {
 				Write-Host "Unable to read $ProfilePath. Leaving the profile alone." -ForegroundColor Yellow
 				$Action = 'Unreadable'
 			} Else {
-				# Primary signal: profile service load/unload/cleanup timestamps. These only
-				# change on a real profile load or unload, unlike file timestamps, which
-				# Windows Update servicing and antivirus hive scans inflate.
+				# Prove the folder is idle before any timestamp is even consulted. Age is an
+				# argument about the past; these three are about right now, and any one of them
+				# firing means deleting would destroy data somebody is still using.
+				$OtherClaimants = @()
+				$ClaimKey = $ProfilePath.TrimEnd('\')
+				If ($FolderClaims.ContainsKey($ClaimKey)) {
+					$OtherClaimants = @($FolderClaims[$ClaimKey] | Where-Object { $_ -ne $ProfileSID })
+				}
+				$InUseReason = $null
+				If ($OtherClaimants) {
+					$InUseReason = "another profile entry ($($OtherClaimants -join ', ')) points at the same folder, so these timestamps do not describe whoever is using it"
+				} ElseIf ($InUseSIDs.Contains($ProfileSID)) {
+					$InUseReason = 'its registry hive is loaded or it holds a logon session, so the account is signed in'
+				} ElseIf ($SelfProfilePath -and ($ClaimKey -eq $SelfProfilePath)) {
+					$InUseReason = 'it is the profile of the account running this command'
+				} ElseIf (Test-ProfileFolderInUse -ProfileFolder $ProfilePath) {
+					$InUseReason = 'its NTUSER.DAT hive is locked, so the profile is loaded right now'
+				}
+
+				If ($InUseReason) {
+					Write-Host "Keeping $ProfilePath ($InUseReason)." -ForegroundColor Yellow
+					$Action = 'InUse'
+					$ActivitySource = 'In use'
+					[void]$Results.Add([PSCustomObject]@{
+						ProfilePath    = $ProfilePath
+						SID            = $ProfileSID
+						LastActivity   = $LastActivity
+						ActivitySource = $ActivitySource
+						Action         = $Action
+					})
+					Continue
+				}
+
+				# Primary signal: the profile service's unload and cleanup-check timestamps, the
+				# two values Windows itself ages profiles from since Windows 10 1809 and Server
+				# 2019. They only move on a real unload or cleanup check, unlike file timestamps,
+				# which Windows Update servicing and antivirus hive scans inflate.
+				#
+				# LocalProfileLoadTime is deliberately not one of them. A load time newer than
+				# both of the others means the profile was loaded and never came back down, which
+				# is either a session that is still open or a machine that lost power mid-session.
+				# Microsoft's reference script (see .LINK) excludes it for that exact reason, with
+				# the note that a winning load time "would most likely indicate profile currently
+				# loaded or machine crashed". Ageing a profile from its load time reports a user
+				# who has been signed in continuously since that date as idle since that date,
+				# which is how a profile in daily use gets deleted as stale.
+				$LoadTime = $null
 				$RegInfo = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$ProfileSID" -ErrorAction SilentlyContinue
 				If ($RegInfo) {
+					$LoadTime = Convert-ProfileListTime -High $RegInfo.LocalProfileLoadTimeHigh -Low $RegInfo.LocalProfileLoadTimeLow
 					$RegTimes = @()
-					ForEach ($ValueName in 'LocalProfileLoadTime', 'LocalProfileUnLoadTime', 'LocalProfileCleanupCheckTime') {
+					ForEach ($ValueName in 'LocalProfileUnLoadTime', 'LocalProfileCleanupCheckTime') {
 						$Converted = Convert-ProfileListTime -High $RegInfo."$($ValueName)High" -Low $RegInfo."$($ValueName)Low"
 						If ($Converted) { $RegTimes += $Converted }
 					}
+					# Only trust the unload/cleanup pair while the load that produced them has
+					# already been accounted for. Once the load time is the newest of the three the
+					# pair describes an earlier session, not the last one, and Windows falls back to
+					# the NTUSER.DAT timestamp instead.
 					If ($RegTimes) {
-						$LastActivity = $RegTimes | Sort-Object -Descending | Select-Object -First 1
-						$ActivitySource = 'Profile service registry'
+						$NewestRegTime = $RegTimes | Sort-Object -Descending | Select-Object -First 1
+						If ((-not $LoadTime) -or ($LoadTime -le $NewestRegTime)) {
+							$LastActivity = $NewestRegTime
+							$ActivitySource = 'Profile service registry'
+						}
 					}
 				}
 
+				# A load with no matching unload is not activity, but a recent one is still proof
+				# the profile was signed into inside the threshold, so it keeps the profile.
+				If ((-not $LastActivity) -and $LoadTime -and ($LoadTime -ge $CutoffDate)) {
+					Write-Host "Keeping $ProfilePath (signed in on $($LoadTime.ToString('yyyy-MM-dd')) and never unloaded, which is within $ThresholdText)." -ForegroundColor Yellow
+					$Action = 'InUse'
+					$ActivitySource = 'Profile service registry (load time)'
+					[void]$Results.Add([PSCustomObject]@{
+						ProfilePath    = $ProfilePath
+						SID            = $ProfileSID
+						LastActivity   = $LoadTime
+						ActivitySource = $ActivitySource
+						Action         = $Action
+					})
+					Continue
+				}
+
 				If (-not $LastActivity) {
-					# Fallback for builds without profile service timestamps.
+					# Fallback for builds without usable profile service timestamps, and for the
+					# abandoned-mid-session case above. Inflated by servicing, which errs toward
+					# keeping profiles.
 					$ActivityTimes = @($ProfileRoot.LastWriteTime)
 					$Hive = Get-Item -LiteralPath (Join-Path -Path $ProfilePath -ChildPath 'NTUSER.DAT') -Force -ErrorAction SilentlyContinue
 					If ($Hive) { $ActivityTimes += $Hive.LastWriteTime }
@@ -1122,8 +1289,17 @@ Function Remove-StaleProfiles {
 						$Action = 'Removed'
 						Remove-ProfileScheduledTasks -ProfileSID $ProfileSID
 						If (Test-Path -LiteralPath $ProfilePath) {
-							Write-Host "Folder still present after profile removal. Force-removing leftovers..." -ForegroundColor Yellow
-							Remove-PathForcefully -Path $ProfilePath
+							# Files surviving the profile service's own delete are usually transient
+							# handles from the search indexer or antivirus. A locked hive is not that:
+							# it means something is still working out of this folder, and
+							# Remove-PathForcefully would delete what it can and queue the rest for
+							# delete-on-reboot, destroying live data. Re-test before touching anything.
+							If (Test-ProfileFolderInUse -ProfileFolder $ProfilePath) {
+								Write-Host "Folder $ProfilePath is still in use after profile removal. Leaving the files in place; clear them once the machine has been rebooted and the folder is idle." -ForegroundColor Red
+							} Else {
+								Write-Host "Folder still present after profile removal. Force-removing leftovers..." -ForegroundColor Yellow
+								Remove-PathForcefully -Path $ProfilePath
+							}
 						}
 					} Catch {
 						# Do not force-delete files when profile removal failed; a ProfileList entry
@@ -1148,7 +1324,8 @@ Function Remove-StaleProfiles {
 
 	$RemovedCount = @($Results | Where-Object { $_.Action -in @('Removed', 'RemovedOrphan') }).Count
 	$FailedCount = @($Results | Where-Object { $_.Action -eq 'Failed' }).Count
-	Write-Host "Stale profile cleanup complete. Removed: $RemovedCount. Failed: $FailedCount. Assessed: $($Results.Count)." -ForegroundColor Cyan
+	$InUseCount = @($Results | Where-Object { $_.Action -eq 'InUse' }).Count
+	Write-Host "Stale profile cleanup complete. Removed: $RemovedCount. Failed: $FailedCount. Held back as in use: $InUseCount. Assessed: $($Results.Count)." -ForegroundColor Cyan
 	If ($PassThru) {
 		Write-Output $Results
 	}

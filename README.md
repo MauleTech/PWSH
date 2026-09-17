@@ -32,6 +32,7 @@ Enable-SSL #Enables SSL Permanently
 [Add]
 -----
   Add-ChromeShortcut
+  Add-EdgeShortcut
   Add-FileFolderShortcut
   Add-IEShortcut
   Add-WebShortcut

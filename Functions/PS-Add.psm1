@@ -39,6 +39,47 @@ Function Add-ChromeShortcut{
 	#>
 }
 
+Function Add-EdgeShortcut{
+	param
+	(
+		[Parameter(Mandatory=$true)]
+		[string]$Label,
+
+		[Parameter(Mandatory=$true)]
+		[string]$Url
+	)
+
+	If (Test-Path -Path 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe') {
+		$TargetFile = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+	} ElseIf (Test-Path -Path 'C:\Program Files\Microsoft\Edge\Application\msedge.exe') {
+		$TargetFile = "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+	} Else {
+		Write-Host "Microsoft Edge was not found. Please install manually or with Chocolatey:"
+		Write-Host "   Install-Choco"
+		Write-Host "   choco install microsoft-edge"
+	}
+
+	If ($TargetFile) {
+		$ShortcutFile = "$env:Public\Desktop\" + $Label + ".lnk"
+		$WScriptShell = New-Object -ComObject WScript.Shell
+		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+		$Shortcut.TargetPath = $TargetFile
+		$Shortcut.Arguments = $Url
+		$Shortcut.Save()
+	}
+	<#
+	.SYNOPSIS
+		Creates a Microsoft Edge Shortcut on the "All Users" Desktop.
+		If Microsoft Edge is not found, prompts to install the program using Chocolatey.
+	.PARAMETER Label
+		The file name of the shortcut; ".lnk" is automatically appended.
+	.PARAMETER Url
+		The full URL that the shortcut intends to open: "https://www.google.com/"
+	.EXAMPLE
+		Add-EdgeShortcut -Label "Github PWSH" -Url "https://github.com/MauleTech/PWSH/"
+	#>
+}
+
 Function Add-FileFolderShortcut {
 	param
 	(

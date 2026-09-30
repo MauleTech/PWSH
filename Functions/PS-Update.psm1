@@ -1769,14 +1769,51 @@ Function Update-PWSH {
 }
 
 Function Update-Windows {
+	<#
+	.SYNOPSIS
+	Installs Windows software and driver updates using PSWindowsUpdate.
+	.DESCRIPTION
+	Installs Microsoft Update software and driver updates via PSWindowsUpdate, installing or
+	repairing the module first if needed. Updates listed in the $ExcludedKBs array near the top
+	of this function are never installed. Edit that list to permanently add or remove exclusions.
+	.PARAMETER NoSoftware
+	Skip software updates.
+	.PARAMETER NoDrivers
+	Skip driver updates.
+	.PARAMETER ExcludeKB
+	Additional KB article IDs (for example "KB1234567") to skip for this run only. These are
+	combined with the permanent $ExcludedKBs list.
+	.EXAMPLE
+	Update-Windows
+	Installs all available updates except those in the permanent exclusion list.
+	.EXAMPLE
+	Update-Windows -ExcludeKB "KB1234567"
+	Installs all available updates except the permanent exclusions and KB1234567.
+	#>
+	[CmdletBinding()]
 	param
 	(
 		[Parameter(Mandatory=$False)]
 		[switch]$NoSoftware,
-		
+
 		[Parameter(Mandatory=$False)]
-		[switch]$NoDrivers
+		[switch]$NoDrivers,
+
+		[Parameter(Mandatory=$False)]
+		[ValidatePattern('^KB\d{6,8}$')]
+		[string[]]$ExcludeKB
 	)
+
+	# Permanent exclusion list. Add or remove KB IDs here, one per line, in the form 'KB1234567'.
+	$ExcludedKBs = @(
+		'KB5002914'
+	)
+	$NotKB = @($ExcludedKBs + $ExcludeKB | Where-Object { $_ } | Select-Object -Unique)
+	If ($NotKB.Count -gt 0) {
+		Write-Host "Excluding updates: $($NotKB -join ', ')" -ForegroundColor Cyan
+	}
+	$WUExclude = @{}
+	If ($NotKB.Count -gt 0) { $WUExclude['NotKBArticleID'] = $NotKB }
 
 	Function RegMU {
 		Write-Host "Checking Microsoft Update Service"
@@ -1829,26 +1866,26 @@ Function Update-Windows {
 			If ($NoDrivers -ne $True) {
 				Write-Host "Checking for DRIVER Updates..."
 				try {
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 				catch {
 					Write-Warning "Driver update check failed. Running Reset-WUComponents..."
 					Reset-WUComponents
 					Write-Host "Retrying DRIVER Updates..."
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 			}
 
 			If ($NoSoftware -ne $True) {
 				Write-Host "Checking for SOFTWARE Updates..."
 				try {
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 				catch {
 					Write-Warning "Software update check failed. Running Reset-WUComponents..."
 					Reset-WUComponents
 					Write-Host "Retrying SOFTWARE Updates..."
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 			}
 		} Else {

@@ -1806,7 +1806,7 @@ Function Update-Windows {
 
 	# Permanent exclusion list. Add or remove KB IDs here, one per line, in the form 'KB1234567'.
 	$ExcludedKBs = @(
-		'KB500294'
+		'KB5002914'
 	)
 	$NotKB = @($ExcludedKBs + $ExcludeKB | Where-Object { $_ } | Select-Object -Unique)
 	If ($NotKB.Count -gt 0) {

@@ -39,7 +39,7 @@ Function Optimize-Powershell {
 		# prompts in quick succession with no new history entry means input is not being read.
 		# First trip: unload PSReadLine so the host falls back to its built-in line editor.
 		# Second trip: the console input itself is broken, so close the window instead of spinning.
-		$Global:PromptLoopGuard = @{ Count = 0; Last = [datetime]::MinValue; HistoryId = -1; Trips = 0 }
+		$Global:PromptLoopGuard = @{ Count = 0; Last = [datetime]::MinValue; HistoryId = 0; Trips = 0 }
 
 		# Custom prompt function
 		Function prompt {
@@ -91,68 +91,41 @@ Function Optimize-Powershell {
 		$profileErrorActionPreference = $ErrorActionPreference
 		$ErrorActionPreference = 'SilentlyContinue'
 
-		# PSReadLine first: the console host loads it before the profile runs, and AdvancedHistory
-		# depends on it. Only import when missing. Force-reimporting the module that is currently
-		# servicing console input can leave the line editor in a broken state.
-		$stepTimer.Restart()
-		$psrlLoaded = [bool](Get-Module -Name PSReadLine)
-		if (-not $psrlLoaded) {
-		    try {
-		        Import-Module PSReadLine -ErrorAction Stop
-		        $psrlLoaded = $true
-		    } catch {
-		        # Module not installed - ensure PackageManagement is ready
-		        if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
-		            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
-		        }
-		        if ((Get-PSRepository -Name "PSGallery").InstallationPolicy -eq "Untrusted") {
-		            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
-		        }
-		        try {
-		            Install-Module PSReadLine -Force -AllowClobber
-		            Import-Module PSReadLine -ErrorAction Stop
-		            $psrlLoaded = $true
-		        } catch {}
+		# Import a module if it is not already loaded, installing it from PSGallery when missing.
+		# Never force-reimport: reloading PSReadLine while it is servicing console input can leave
+		# the line editor in a broken state. Skips the slow Get-Module -ListAvailable check.
+		$importOrInstallModule = {
+		    param([string]$Name)
+		    if (Get-Module -Name $Name) { return $true }
+		    try { Import-Module $Name -ErrorAction Stop; return $true } catch {}
+		    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
+		        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
 		    }
+		    if ((Get-PSRepository -Name "PSGallery").InstallationPolicy -eq "Untrusted") {
+		        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+		    }
+		    try {
+		        Install-Module $Name -Force -AllowClobber
+		        Import-Module $Name -ErrorAction Stop
+		        return $true
+		    } catch { return $false }
 		}
+
+		# PSReadLine first: AdvancedHistory depends on it
+		$stepTimer.Restart()
+		$psrlLoaded = & $importOrInstallModule PSReadLine
 		$profileTimings.Add("PSReadLine: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
 
 		# Configure PSReadLine prediction source (parameter does not exist in PSReadLine 2.0.x,
 		# which is the version that ships with Windows PowerShell 5.1)
 		if ($psrlLoaded -and (Get-Command Set-PSReadLineOption).Parameters.ContainsKey('PredictionSource')) {
-		    try {
-		        Set-PSReadLineOption -PredictionSource HistoryAndPlugin -ErrorAction Stop
-		    } catch {
-		        try {
-		            Set-PSReadLineOption -PredictionSource History -ErrorAction Stop
-		        } catch {
-		            Set-PSReadLineOption -PredictionSource None
-		        }
+		    foreach ($source in 'HistoryAndPlugin', 'History', 'None') {
+		        try { Set-PSReadLineOption -PredictionSource $source -ErrorAction Stop; break } catch {}
 		    }
 		}
 
-		# Try importing AdvancedHistory directly (skip slow Get-Module -ListAvailable check)
 		$stepTimer.Restart()
-		$advHistoryLoaded = [bool](Get-Module -Name AdvancedHistory)
-		if (-not $advHistoryLoaded) {
-		    try {
-		        Import-Module AdvancedHistory -ErrorAction Stop
-		        $advHistoryLoaded = $true
-		    } catch {
-		        # Module not installed - need PackageManagement for install
-		        if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
-		            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
-		        }
-		        if ((Get-PSRepository -Name "PSGallery").InstallationPolicy -eq "Untrusted") {
-		            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
-		        }
-		        try {
-		            Install-Module AdvancedHistory -Force -AllowClobber
-		            Import-Module AdvancedHistory -ErrorAction Stop
-		            $advHistoryLoaded = $true
-		        } catch {}
-		    }
-		}
+		$advHistoryLoaded = & $importOrInstallModule AdvancedHistory
 		if ($advHistoryLoaded -and $psrlLoaded) {
 		    # Enable-AdvancedHistory throws if the PSReadLine history file does not exist yet (new profiles)
 		    $historyPath = (Get-PSReadLineOption).HistorySavePath
@@ -168,9 +141,7 @@ Function Optimize-Powershell {
 		irm https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
 		$profileTimings.Add("LoadFunctions: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
 
-		# Skip resizing under Windows Terminal (WT_SESSION is set there). The terminal owns the
-		# window and buffer size, and resizing the buffer from inside the session is not supported.
-		if (($PSScriptRoot -notlike "C:\Program Files (x86)\ITSPlatform\tmp\scripting\*") -and -not $env:WT_SESSION) {
+		if ($PSScriptRoot -notlike "C:\Program Files (x86)\ITSPlatform\tmp\scripting\*") {
 		    Expand-Terminal
 		}
 

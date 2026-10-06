@@ -305,6 +305,9 @@ gpt attributes=0x8000000000000001
 }
 
 Function Expand-Terminal {
+	# Windows Terminal (WT_SESSION is set there) owns the window and buffer size; resizing
+	# the buffer from inside the session is not supported, so leave it alone.
+	if ($env:WT_SESSION) { return }
 	mode con: cols=120 lines=60
 	$host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(120,10240)
 }

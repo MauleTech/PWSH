@@ -497,7 +497,8 @@ Function Install-ScreenConnect {
 	.Description
 		Installs ScreenConnect Remote Support Software from MauleTech BinCache
 	.Parameter Force
-		Installs ScreenConnect even if the service is already present.
+		Reinstalls ScreenConnect even if the MauleTech instance is already present.
+		Other ScreenConnect instances on the machine are ignored when deciding whether to install.
 	.NOTES
 		Downloads and installs the ScreenConnect client from:
 		https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi
@@ -509,11 +510,14 @@ Function Install-ScreenConnect {
 
 	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
 
-	# Check if ScreenConnect is already installed by looking for the service
-	$ExistingService = Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue
+	# Only the MauleTech instance counts; other ScreenConnect instances may be installed on the machine
+	$InstanceId = 'f07df9e5f6734da4'
+	$ServiceName = "ScreenConnect Client ($InstanceId)"
+	$ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+	Write-Verbose "Looking for service '$ServiceName'. Found: $([bool]$ExistingService)"
 	If ($Force -or -not $ExistingService) {
 		If ($Force -and $ExistingService) {
-			Write-Host "Force flag specified. Installing ScreenConnect." -ForegroundColor Yellow
+			Write-Host "Force flag specified. Reinstalling ScreenConnect." -ForegroundColor Yellow
 		}
 		Write-Host "Installing ScreenConnect Remote Support Software." -ForegroundColor Green
 
@@ -541,7 +545,7 @@ Function Install-ScreenConnect {
 			Write-Host "Error during ScreenConnect installation: $_" -ForegroundColor Red
 		}
 	} Else {
-		Write-Host "ScreenConnect service is already installed." -ForegroundColor Green
+		Write-Host "ScreenConnect service '$ServiceName' is already installed." -ForegroundColor Green
 	}
 }
 

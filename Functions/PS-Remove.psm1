@@ -305,6 +305,156 @@ Function Remove-ITS247InstallFolder {
 	Remove-PathForcefully -Path "$ITFolder\Apps"
 }
 
+Function Remove-EdgeDefenderExtension {
+	<#
+	.SYNOPSIS
+		Removes the Microsoft Defender browser extension that Edge shows as installed by the organization (work).
+	.DESCRIPTION
+		Edge labels policy-installed extensions as "Installed by your organization" and the user cannot
+		remove them. This function removes the force-install policy entries (ExtensionInstallForcelist)
+		and any external-install registry keys for the extension. Edge uninstalls the extension itself
+		the next time it refreshes policy or restarts.
+
+		If -ExtensionId is not supplied, the function scans every Edge profile on the machine for
+		installed extensions whose name matches -NameMatch (default "Defender") and targets those IDs.
+		Use -WhatIf to see what would be removed.
+
+		If the extension comes back after a policy refresh, the policy is being pushed by Intune, a GPO,
+		or an RMM. Remove it at the source as well. Check edge://policy in Edge to see where it comes from.
+	.PARAMETER ExtensionId
+		One or more 32 character Edge extension IDs to remove. Skips the profile scan.
+	.PARAMETER NameMatch
+		Wildcard pattern matched against installed extension names when -ExtensionId is not supplied.
+		Default is "*Defender*".
+	.PARAMETER Scope
+		Machine (HKLM, all users, requires admin) or User (HKCU, current user only). Default is Machine.
+	.EXAMPLE
+		Remove-EdgeDefenderExtension -WhatIf
+		# Shows which Defender extension entries would be removed
+	.EXAMPLE
+		Remove-EdgeDefenderExtension
+		# Finds and removes the Defender extension policy entries for all users
+	.EXAMPLE
+		Remove-EdgeDefenderExtension -ExtensionId 'abcdefghijklmnopabcdefghijklmnop'
+		# Removes a specific extension ID
+	.NOTES
+		Requires administrative privileges when using -Scope Machine.
+	#>
+	[CmdletBinding(SupportsShouldProcess = $true)]
+	param(
+		[ValidatePattern('^[a-p]{32}$')]
+		[string[]]$ExtensionId,
+		[string]$NameMatch = '*Defender*',
+		[ValidateSet('Machine', 'User')]
+		[string]$Scope = 'Machine'
+	)
+
+	If ($Scope -eq 'Machine') {
+		$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+		If (-not $IsAdmin) {
+			Write-Host "Administrator privileges required for Machine scope. Run PowerShell as Administrator or use -Scope User." -ForegroundColor Red
+			return
+		}
+	}
+
+	# Discover extension IDs by name if none were supplied
+	If (-not $ExtensionId) {
+		$ProfileRoots = If ($Scope -eq 'Machine') {
+			Get-ChildItem -Path "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'AppData\Local\Microsoft\Edge\User Data' }
+		} Else {
+			Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'
+		}
+		$Found = @{}
+		ForEach ($Root in $ProfileRoots) {
+			If (-not (Test-Path -LiteralPath $Root)) { continue }
+			Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+				$ExtRoot = Join-Path $_.FullName 'Extensions'
+				If (-not (Test-Path -LiteralPath $ExtRoot)) { return }
+				Get-ChildItem -Path $ExtRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[a-p]{32}$' } | ForEach-Object {
+					$Id = $_.Name
+					$Manifest = Get-ChildItem -Path $_.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+					If (-not $Manifest) { return }
+					Try {
+						$Json = Get-Content -LiteralPath (Join-Path $Manifest.FullName 'manifest.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+						$Name = [string]$Json.name
+						If ($Name -match '^__MSG_(.+)__$') {
+							$Key = $Matches[1]
+							$Locale = If ($Json.default_locale) { [string]$Json.default_locale } Else { 'en' }
+							$MsgFile = Join-Path $Manifest.FullName "_locales\$Locale\messages.json"
+							If (Test-Path -LiteralPath $MsgFile) {
+								$Msgs = Get-Content -LiteralPath $MsgFile -Raw | ConvertFrom-Json
+								$Prop = $Msgs.PSObject.Properties | Where-Object { $_.Name -ieq $Key } | Select-Object -First 1
+								If ($Prop) { $Name = [string]$Prop.Value.message }
+							}
+						}
+						If ($Name -like $NameMatch) { $Found[$Id] = $Name }
+					} Catch {
+						Write-Verbose "Could not read manifest for $Id : $_"
+					}
+				}
+			}
+		}
+		If ($Found.Count -eq 0) {
+			Write-Host "No installed Edge extension matching '$NameMatch' was found. If you know the ID, rerun with -ExtensionId." -ForegroundColor Yellow
+			return
+		}
+		ForEach ($Entry in $Found.GetEnumerator()) {
+			Write-Host "Found extension: $($Entry.Value) ($($Entry.Key))" -ForegroundColor Cyan
+		}
+		$ExtensionId = @($Found.Keys)
+	}
+
+	$Hive = If ($Scope -eq 'Machine') { 'HKLM:' } Else { 'HKCU:' }
+	$PolicyKey = "$Hive\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist"
+	$SettingsKey = "$Hive\SOFTWARE\Policies\Microsoft\Edge"
+	$ExternalKeys = @("$Hive\SOFTWARE\Microsoft\Edge\Extensions", "$Hive\SOFTWARE\WOW6432Node\Microsoft\Edge\Extensions")
+	$Removed = 0
+
+	ForEach ($Id in $ExtensionId) {
+		# Force-install list: values are named 1,2,3... with data "<id>;<update url>"
+		If (Test-Path -LiteralPath $PolicyKey) {
+			$Item = Get-Item -LiteralPath $PolicyKey
+			ForEach ($ValueName in $Item.GetValueNames()) {
+				$Data = [string]$Item.GetValue($ValueName)
+				If ($Data -match "^$Id(;|$)") {
+					If ($PSCmdlet.ShouldProcess("$PolicyKey\$ValueName", "Remove force-install entry for $Id")) {
+						Remove-ItemProperty -LiteralPath $PolicyKey -Name $ValueName -Force
+						Write-Host "Removed force-install entry $ValueName for $Id" -ForegroundColor Green
+						$Removed++
+					}
+				}
+			}
+		}
+
+		# External install keys
+		ForEach ($ExtKey in $ExternalKeys) {
+			$Path = Join-Path $ExtKey $Id
+			If (Test-Path -LiteralPath $Path) {
+				If ($PSCmdlet.ShouldProcess($Path, "Remove external extension key")) {
+					Remove-Item -LiteralPath $Path -Recurse -Force
+					Write-Host "Removed external extension key $Path" -ForegroundColor Green
+					$Removed++
+				}
+			}
+		}
+
+		# ExtensionSettings is a JSON blob. Report only, do not edit it blindly.
+		If (Test-Path -LiteralPath $SettingsKey) {
+			$Settings = [string](Get-ItemProperty -LiteralPath $SettingsKey -Name ExtensionSettings -ErrorAction SilentlyContinue).ExtensionSettings
+			If ($Settings -and $Settings -match $Id) {
+				Write-Host "$Id is referenced in $SettingsKey\ExtensionSettings (JSON). Edit that value manually or remove it at the policy source." -ForegroundColor Yellow
+			}
+		}
+	}
+
+	If ($Removed -gt 0) {
+		Write-Host "Done. Restart Edge (or run 'gpupdate /force' and restart Edge) for the extension to be removed." -ForegroundColor Green
+		Write-Host "If it returns, the policy is being pushed by Intune, GPO, or an RMM. Check edge://policy for the source." -ForegroundColor Yellow
+	} ElseIf (-not $WhatIfPreference) {
+		Write-Host "No force-install policy entries were found for the target extension(s). It is likely pushed by Intune/GPO/MDM or ExtensionSettings. Check edge://policy for the source." -ForegroundColor Yellow
+	}
+}
+
 function Remove-OrphanedInstallerFiles {
     <#
     .SYNOPSIS

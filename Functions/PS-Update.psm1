@@ -1652,6 +1652,21 @@ Function Update-PowerShellModule {
 }
 
 Function Update-PowershellModules {
+	<#
+	.SYNOPSIS
+		Installs or updates PSReadLine, PowerShellGet and AdvancedHistory, then updates all installed modules.
+	.DESCRIPTION
+		Ensures the NuGet provider is present and PSGallery is trusted, reinstalls the core console
+		modules from PSGallery, and runs Update-Module.
+		Modules already loaded in this session are installed side by side and are NOT unloaded or
+		force-reimported: reloading PSReadLine while it is reading console input can break the prompt.
+		Open a new PowerShell window to use the updated versions of those modules.
+	.EXAMPLE
+		Update-PowershellModules
+	#>
+	[CmdletBinding()]
+	param()
+
 	Set-ExecutionPolicy RemoteSigned -Scope Process -Force
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 	$Providers = (Get-PackageProvider).Name
@@ -1660,22 +1675,20 @@ Function Update-PowershellModules {
 	}
 	Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
 	$ModulesToInstall = @("PSReadline","PowerShellGet","AdvancedHistory")
+	$LoadedModules = @()
 	$ModulesToInstall | ForEach-Object {
 		$Mod = $_
 		Write-Host "Processing $Mod"
-		If (Get-Module -Name $Mod -ListAvailable) {
-			Try {
-				Remove-Module $Mod -Force -ErrorAction Stop -WarningAction SilentlyContinue
-				Uninstall-Module $Mod -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-			} Catch {
-				Uninstall-Module $Mod -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-			}
+		If (Get-Module -Name $Mod) {
+			# Loaded modules cannot be uninstalled and must not be unloaded from the live session
+			Write-Verbose "$Mod is loaded in this session, installing the latest version side by side"
+			$LoadedModules += $Mod
+		} ElseIf (Get-Module -Name $Mod -ListAvailable) {
+			Uninstall-Module $Mod -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 		}
 		Install-Module -Name $Mod -Scope AllUsers -Force -AllowClobber -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-		Try {
-			Import-Module -Name $Mod -Scope AllUsers -Force -ErrorAction Stop -WarningAction SilentlyContinue
-		} Catch {
-			Import-Module -Name $Mod -Force -WarningAction SilentlyContinue
+		If ($LoadedModules -NotContains $Mod) {
+			Import-Module -Name $Mod -WarningAction SilentlyContinue
 		}
 		Clear-Variable -Name Mod -Force
 	}
@@ -1685,11 +1698,17 @@ Function Update-PowershellModules {
 	} Catch {
 		Update-Module -Force -WarningAction SilentlyContinue
 	}
-	Write-Host "Settings Prediction Source"
-	Try {
-		Set-PSReadLineOption -PredictionSource HistoryAndPlugin -ErrorAction Stop
-	} Catch {
-		Set-PSReadLineOption -PredictionSource History
+	# -PredictionSource does not exist in PSReadLine 2.0.x, the version that ships with Windows PowerShell 5.1
+	$SetOption = Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue
+	If ($SetOption -and $SetOption.Parameters.ContainsKey('PredictionSource')) {
+		Write-Host "Setting Prediction Source"
+		ForEach ($Source in 'HistoryAndPlugin', 'History', 'None') {
+			Try { Set-PSReadLineOption -PredictionSource $Source -ErrorAction Stop; Break } Catch {}
+		}
+	}
+	If ($LoadedModules) {
+		Write-Host "Updated modules already loaded in this session: $($LoadedModules -join ', ')." -ForegroundColor Yellow
+		Write-Host "Open a new PowerShell window to use the new versions." -ForegroundColor Yellow
 	}
 	Get-Module | Select-Object Name, Version, Description
 }

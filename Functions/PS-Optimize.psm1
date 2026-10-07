@@ -31,11 +31,45 @@ Function Optimize-Powershell {
 			$remainder = $width - ($InputString.Length * $repetitions)
 			# Make line(s)
 			1..$Count | % {
-				Write-Host ($InputString * $repetitions) + $InputString.Substring(0,$remainder) @ColorSplat
+				Write-Host (($InputString * $repetitions) + $InputString.Substring(0,$remainder)) @ColorSplat
 			}
 		}
+		# Prompt loop guard. If the console line editor (PSReadLine or the built-in one) fails, it
+		# returns without waiting for input and the host redraws the prompt forever. A burst of
+		# prompts in quick succession with no new history entry means input is not being read.
+		# First trip: unload PSReadLine so the host falls back to its built-in line editor.
+		# Second trip: the console input itself is broken, so close the window instead of spinning.
+		$Global:PromptLoopGuard = @{ Count = 0; Last = [datetime]::MinValue; HistoryId = 0; Trips = 0 }
+
 		# Custom prompt function
 		Function prompt {
+		    $guard = $Global:PromptLoopGuard
+		    $now = [datetime]::UtcNow
+		    $lastHistory = Get-History -Count 1
+		    $historyId = if ($lastHistory) { $lastHistory.Id } else { 0 }
+		    if ((($now - $guard.Last).TotalMilliseconds -lt 250) -and ($historyId -eq $guard.HistoryId)) {
+		        $guard.Count++
+		    } else {
+		        $guard.Count = 0
+		    }
+		    $guard.Last = $now
+		    $guard.HistoryId = $historyId
+		    if ($guard.Count -ge 40) {
+		        $guard.Count = 0
+		        $guard.Trips++
+		        if ($guard.Trips -eq 1) {
+		            Write-Host "Prompt loop detected: the line editor is returning without reading input." -ForegroundColor Yellow
+		            Write-Host "Unloading PSReadLine and falling back to the built-in console line editor." -ForegroundColor Yellow
+		            Remove-Item -Path Function:\PSConsoleHostReadLine -Force -ErrorAction SilentlyContinue
+		            Remove-Module -Name PSReadLine -Force -ErrorAction SilentlyContinue
+		        } else {
+		            Write-Host "Prompt loop still detected without PSReadLine. Console input is not readable." -ForegroundColor Red
+		            Write-Host "Closing this window in 15 seconds. Start PowerShell with -NoProfile to troubleshoot." -ForegroundColor Red
+		            Start-Sleep -Seconds 15
+		            [System.Environment]::Exit(1)
+		        }
+		    }
+
 		    $curdir = $ExecutionContext.SessionState.Path.CurrentLocation
 		    if ($curdir.Path.Length -eq 0) {
 		        $curdir = "$($ExecutionContext.SessionState.Drive.Current.Name):\"
@@ -52,17 +86,18 @@ Function Optimize-Powershell {
 		    "[Command]: "
 		}
 
-		# Module installation and configuration
+		# Module installation and configuration. Restored at the end of the profile so the
+		# interactive session does not inherit SilentlyContinue and hide real errors.
+		$profileErrorActionPreference = $ErrorActionPreference
 		$ErrorActionPreference = 'SilentlyContinue'
 
-		# Try importing AdvancedHistory directly (skip slow Get-Module -ListAvailable check)
-		$stepTimer.Restart()
-		$advHistoryLoaded = $false
-		try {
-		    Import-Module AdvancedHistory -Force -ErrorAction Stop
-		    $advHistoryLoaded = $true
-		} catch {
-		    # Module not installed - need PackageManagement for install
+		# Import a module if it is not already loaded, installing it from PSGallery when missing.
+		# Never force-reimport: reloading PSReadLine while it is servicing console input can leave
+		# the line editor in a broken state. Skips the slow Get-Module -ListAvailable check.
+		$importOrInstallModule = {
+		    param([string]$Name)
+		    if (Get-Module -Name $Name) { return $true }
+		    try { Import-Module $Name -ErrorAction Stop; return $true } catch {}
 		    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
 		        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
 		    }
@@ -70,50 +105,36 @@ Function Optimize-Powershell {
 		        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
 		    }
 		    try {
-		        Install-Module AdvancedHistory -Force -AllowClobber
-		        Import-Module AdvancedHistory -Force -ErrorAction Stop
-		        $advHistoryLoaded = $true
-		    } catch {}
+		        Install-Module $Name -Force -AllowClobber
+		        Import-Module $Name -ErrorAction Stop
+		        return $true
+		    } catch { return $false }
 		}
-		if ($advHistoryLoaded) {
+
+		# PSReadLine first: AdvancedHistory depends on it
+		$stepTimer.Restart()
+		$psrlLoaded = & $importOrInstallModule PSReadLine
+		$profileTimings.Add("PSReadLine: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
+
+		# Configure PSReadLine prediction source (parameter does not exist in PSReadLine 2.0.x,
+		# which is the version that ships with Windows PowerShell 5.1)
+		if ($psrlLoaded -and (Get-Command Set-PSReadLineOption).Parameters.ContainsKey('PredictionSource')) {
+		    foreach ($source in 'HistoryAndPlugin', 'History', 'None') {
+		        try { Set-PSReadLineOption -PredictionSource $source -ErrorAction Stop; break } catch {}
+		    }
+		}
+
+		$stepTimer.Restart()
+		$advHistoryLoaded = & $importOrInstallModule AdvancedHistory
+		if ($advHistoryLoaded -and $psrlLoaded) {
+		    # Enable-AdvancedHistory throws if the PSReadLine history file does not exist yet (new profiles)
+		    $historyPath = (Get-PSReadLineOption).HistorySavePath
+		    if ($historyPath -and -not (Test-Path -LiteralPath $historyPath)) {
+		        New-Item -ItemType File -Path $historyPath -Force | Out-Null
+		    }
 		    try { Enable-AdvancedHistory -Unique } catch {}
 		}
 		$profileTimings.Add("AdvancedHistory: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
-
-		# Try importing PSReadLine directly (skip slow Get-Module -ListAvailable check)
-		$stepTimer.Restart()
-		$psrlLoaded = $false
-		try {
-		    Import-Module PSReadline -Force -ErrorAction Stop
-		    $psrlLoaded = $true
-		} catch {
-		    # Module not installed - ensure PackageManagement is ready
-		    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
-		        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
-		    }
-		    if ((Get-PSRepository -Name "PSGallery").InstallationPolicy -eq "Untrusted") {
-		        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
-		    }
-		    try {
-		        Install-Module PSReadline -Force -AllowClobber
-		        Import-Module PSReadline -Force -ErrorAction Stop
-		        $psrlLoaded = $true
-		    } catch {}
-		}
-		$profileTimings.Add("PSReadLine: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
-
-		# Configure PSReadLine prediction source
-		if ($psrlLoaded) {
-		    try {
-		        Set-PSReadLineOption -PredictionSource HistoryAndPlugin
-		    } catch {
-		        try {
-		            Set-PSReadLineOption -PredictionSource History
-		        } catch {
-		            Set-PSReadLineOption -PredictionSource None
-		        }
-		    }
-		}
 
 		# Execute additional configurations
 		$stepTimer.Restart()
@@ -123,6 +144,8 @@ Function Optimize-Powershell {
 		if ($PSScriptRoot -notlike "C:\Program Files (x86)\ITSPlatform\tmp\scripting\*") {
 		    Expand-Terminal
 		}
+
+		$ErrorActionPreference = $profileErrorActionPreference
 
 		$profileTimer.Stop()
 		Write-Host " Profile loaded in $("{0:N1}s" -f $profileTimer.Elapsed.TotalSeconds) [$($profileTimings -join ' | ')]" -ForegroundColor DarkGray

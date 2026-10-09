@@ -660,6 +660,1734 @@ function Get-ClaudeCodeStatus {
 	return $Status
 }
 
+function Get-ClientDiscovery {
+	<#
+	.SYNOPSIS
+		Read-only discovery of a small business Windows server and its LAN for client onboarding documentation.
+
+	.DESCRIPTION
+		Run from an elevated PowerShell window on the client's main server (file server, DC, or Hyper-V host).
+		The function only READS configuration. It does not change settings, install anything, or modify client files.
+		The only things it writes are its own output folder and zip, which it restricts to Administrators and SYSTEM.
+
+		It collects system, disk, network, share, user, Active Directory, DHCP, DNS server, Hyper-V, IIS, software,
+		security, update, backup, SQL, printer, event log, public DNS, and LAN device information. It then writes
+		one CSV per section, discovery.json, findings.csv (prioritized onboarding issues), and summary.txt to
+		<OutputRoot>\<COMPUTERNAME>_<timestamp>\ and zips the folder.
+
+		What it does NOT collect: passwords, product keys, BitLocker recovery keys, LAPS passwords, Wi-Fi keys,
+		or file contents. It DOES collect account names, group memberships, share and folder names, computer names,
+		IP/MAC addresses, and installed software. Treat the zip as confidential client data and delete both the
+		folder and the zip from the server once delivered.
+
+		Network activity:
+		* The public IP lookup sends one HTTPS request to ipinfo.io (falls back to api.ipify.org).
+		* -PublicDomain lookups query 1.1.1.1 directly (so split-brain internal zones do not mask public
+		  records), falling back to the server's own resolver if outbound DNS is blocked.
+		* The optional LAN scan pings the server's own subnet (/24 maximum), runs a short TCP connect test against
+		  about 25 common ports on live hosts, and requests the web page title from any web interface it finds.
+		  Use -SkipSubnetScan to skip it.
+
+	.PARAMETER OutputRoot
+		Folder where the results folder and zip are created. Default: $ITFolder\Discovery (normally C:\IT\Discovery).
+
+	.PARAMETER PublicDomain
+		One or more public email/web domains to look up (MX, SPF, DKIM, DMARC, NS, A, autodiscover, Intune).
+
+	.PARAMETER EventDays
+		How many days of event log history to summarize (1-365). Default 30.
+
+	.PARAMETER SkipSubnetScan
+		Skip the ping/port scan of the local subnet.
+
+	.PARAMETER SkipFileScan
+		Skip share sizing, file type totals, and the search for notable database/backup/PST files.
+		Use this if the shares are very large.
+
+	.PARAMETER SkipUpdateSearch
+		Skip the Windows Update pending-updates search (can take a few minutes).
+
+	.EXAMPLE
+		Get-ClientDiscovery -PublicDomain contoso.com
+		Full discovery including public DNS checks for contoso.com.
+
+	.EXAMPLE
+		Get-ClientDiscovery -PublicDomain contoso.com, contoso.net -SkipFileScan -Verbose
+		Skips the (slow) share sizing and file search and shows verbose detail.
+
+	.EXAMPLE
+		$d = Get-ClientDiscovery -SkipSubnetScan
+		$d.Findings | Where-Object Severity -eq 'High'
+		Runs without the LAN scan and lists the high-severity findings from the returned object.
+
+	.NOTES
+		Requires an elevated session. Domain queries run as the current user, so run it as a domain admin
+		on domain-joined servers to get the Active Directory sections.
+	#>
+	[CmdletBinding()]
+	param(
+		[string]$OutputRoot,
+		[ValidatePattern('^(?=.{1,253}$)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$')]
+		[string[]]$PublicDomain = @(),
+		[ValidateRange(1, 365)]
+		[int]$EventDays = 30,
+		[switch]$SkipSubnetScan,
+		[switch]$SkipFileScan,
+		[switch]$SkipUpdateSearch
+	)
+
+	$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+	if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Write-Host 'Run this from an elevated (Run as administrator) PowerShell window.' -ForegroundColor Red
+		return
+	}
+
+	if (-not $OutputRoot) {
+		if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
+		$OutputRoot = Join-Path $Global:ITFolder 'Discovery'
+	}
+
+	$started = Get-Date
+	$since = $started.AddDays(-1 * $EventDays)
+	$outDir = Join-Path $OutputRoot ('{0}_{1}' -f $env:COMPUTERNAME, $started.ToString('yyyyMMdd-HHmm'))
+	try {
+		New-Item -ItemType Directory -Path $outDir -Force -ErrorAction Stop | Out-Null
+	} catch {
+		Write-Host ('Could not create output folder {0}: {1}' -f $outDir, $_.Exception.Message) -ForegroundColor Red
+		return
+	}
+	$result = [ordered]@{}
+	$errors = New-Object System.Collections.ArrayList
+	$extTable = @{}
+	$userShares = @()
+	$adInfo = $null
+	$zip = $null
+	$transcriptOn = $false
+
+	# ---------------------------------------------------------------- helpers
+	function Protect-DiscoveryPath {
+		# Restrict our own output to Administrators and SYSTEM. It holds account lists and security posture.
+		param([string]$Path, [switch]$Container)
+		$grant = if ($Container) { '(OI)(CI)F' } else { 'F' }
+		$null = & icacls.exe $Path /inheritance:r /grant:r ('*S-1-5-32-544:{0}' -f $grant) ('*S-1-5-18:{0}' -f $grant) 2>&1
+		if ($LASTEXITCODE -ne 0) {
+			Write-Host ('    Could not restrict permissions on {0}. Delete it promptly after delivery.' -f $Path) -ForegroundColor Yellow
+		}
+	}
+
+	function Invoke-Section {
+		param([string]$Name, [scriptblock]$Code)
+		Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Name) -ForegroundColor Cyan
+		try {
+			$data = & $Code
+			$result[$Name] = $data
+			if ($null -ne $data) {
+				$items = @($data)
+				if ($items.Count -gt 0 -and $items[0] -is [System.Management.Automation.PSCustomObject]) {
+					$items | Export-Csv -Path (Join-Path $outDir ('{0}.csv' -f $Name)) -NoTypeInformation -Encoding UTF8
+				}
+			}
+		} catch {
+			[void]$errors.Add(('{0}: {1}' -f $Name, $_.Exception.Message))
+			Write-Host ('    failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+		}
+	}
+
+	function Get-SectionRows {
+		param([string]$Name)
+		if ($result.Contains($Name)) { @($result[$Name] | Where-Object { $null -ne $_ }) } else { @() }
+	}
+
+	function New-NotApplicable {
+		param([string]$Reason)
+		[pscustomobject]@{ Note = $Reason }
+	}
+
+	function Get-Prop {
+		param($Row, [string]$Name)
+		if ($Row.Properties[$Name].Count -gt 0) { $Row.Properties[$Name][0] } else { $null }
+	}
+
+	function Convert-FileTimeValue {
+		param($Value)
+		if ($Value -and [int64]$Value -gt 0 -and [int64]$Value -lt [int64]::MaxValue) { [datetime]::FromFileTime([int64]$Value) } else { $null }
+	}
+
+	function ConvertTo-LdapFilterValue {
+		# RFC 4515 escaping for values placed inside an LDAP filter
+		param([string]$Value)
+		$Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([string][char]0, '\00')
+	}
+
+	function Search-Ad {
+		param([string]$Filter, [string[]]$Props, [string]$Root, [switch]$Base)
+		$s = New-Object System.DirectoryServices.DirectorySearcher
+		if (-not $Root) { $Root = $adInfo.DomainDn }
+		$s.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry ('LDAP://{0}' -f $Root)
+		if ($Base) { $s.SearchScope = [System.DirectoryServices.SearchScope]::Base }
+		$s.Filter = $Filter
+		$s.PageSize = 500
+		foreach ($p in $Props) { [void]$s.PropertiesToLoad.Add($p) }
+		$found = $s.FindAll()
+		try {
+			foreach ($r in $found) { $r }
+		} finally {
+			$found.Dispose()
+			$s.SearchRoot.Dispose()
+			$s.Dispose()
+		}
+	}
+
+	function Get-AdObjectSid {
+		param([string]$Dn)
+		$r = @(Search-Ad -Filter '(objectClass=*)' -Props @('objectsid') -Root $Dn -Base)
+		if ($r.Count -gt 0) { (New-Object System.Security.Principal.SecurityIdentifier ([byte[]](Get-Prop $r[0] 'objectsid'), 0)).Value }
+	}
+
+	function Get-DnLeaf {
+		param([string]$Dn)
+		(($Dn -split '(?<!\\),')[0] -replace '^(CN|OU)=', '') -replace '\\,', ','
+	}
+
+	function ConvertFrom-EventRecord {
+		param($EventRecord)
+		$x = [xml]$EventRecord.ToXml()
+		$d = @{}
+		foreach ($n in $x.Event.EventData.Data) {
+			if ($n.Name) { $d[$n.Name] = $n.'#text' }
+		}
+		$d
+	}
+
+	function ConvertFrom-DbNull {
+		param($Value)
+		if ($Value -is [System.DBNull]) { $null } else { $Value }
+	}
+
+	function Test-PublicIp {
+		# True only for a parseable, routable, non-private address
+		param([string]$Ip)
+		$addr = $null
+		if (-not [System.Net.IPAddress]::TryParse([string]$Ip, [ref]$addr)) { return $false }
+		if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+			if ($addr.IsIPv4MappedToIPv6) { return (Test-PublicIp $addr.MapToIPv4().ToString()) }
+			return -not ($addr.IsIPv6LinkLocal -or $addr.IsIPv6SiteLocal -or [System.Net.IPAddress]::IsLoopback($addr) -or $Ip -match '^(fc|fd)' -or $Ip -eq '::')
+		}
+		$b = $addr.GetAddressBytes()
+		-not ($b[0] -eq 10 -or $b[0] -eq 127 -or $b[0] -eq 0 -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 169 -and $b[1] -eq 254) -or ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) -or $b[0] -ge 224)
+	}
+
+	function ConvertTo-UInt32Ip {
+		param([string]$Ip)
+		$bytes = [System.Net.IPAddress]::Parse($Ip).GetAddressBytes()
+		[Array]::Reverse($bytes)
+		[BitConverter]::ToUInt32($bytes, 0)
+	}
+
+	function ConvertFrom-UInt32Ip {
+		param([uint32]$Number)
+		$bytes = [BitConverter]::GetBytes($Number)
+		[Array]::Reverse($bytes)
+		(New-Object System.Net.IPAddress (, $bytes)).ToString()
+	}
+
+	function Get-OpenPorts {
+		param([string]$Ip, [int[]]$Ports, [int]$TimeoutMs = 1200)
+		$items = foreach ($port in $Ports) {
+			$c = New-Object System.Net.Sockets.TcpClient
+			[pscustomobject]@{ Port = $port; Client = $c; Task = $c.ConnectAsync($Ip, $port) }
+		}
+		try {
+			[void][System.Threading.Tasks.Task]::WaitAll(@($items | ForEach-Object { $_.Task }), $TimeoutMs)
+		} catch {
+			Write-Verbose 'port wait finished with errors (expected for closed ports)'
+		}
+		$open = @()
+		foreach ($i in $items) {
+			if ($i.Task.Status -eq 'RanToCompletion' -and $i.Client.Connected) { $open += $i.Port }
+			$i.Client.Close()
+		}
+		$open
+	}
+
+	function Get-WebBanner {
+		param([string]$Ip, [int]$Port)
+		$scheme = 'http'
+		if ($Port -eq 443 -or $Port -eq 8443 -or $Port -eq 5001 -or $Port -eq 8006) { $scheme = 'https' }
+		$out = [ordered]@{ Url = ('{0}://{1}:{2}/' -f $scheme, $Ip, $Port); Status = $null; Server = $null; AuthRealm = $null; Title = $null }
+		$iwr = @{ Uri = $out.Url; UseBasicParsing = $true; TimeoutSec = 4; ErrorAction = 'Stop' }
+		# PowerShell 7 ignores ServicePointManager, so device self-signed certs need the explicit switch
+		if ($PSVersionTable.PSEdition -eq 'Core') { $iwr['SkipCertificateCheck'] = $true }
+		try {
+			$r = Invoke-WebRequest @iwr
+			$out.Status = [int]$r.StatusCode
+			$out.Server = [string]$r.Headers['Server']
+			if ($r.Content -match '(?is)<title[^>]*>(.*?)</title>') { $out.Title = ($Matches[1] -replace '\s+', ' ').Trim() }
+		} catch {
+			$resp = $_.Exception.Response
+			if ($resp) {
+				try {
+					$out.Status = [int]$resp.StatusCode
+					$out.Server = [string]$resp.Headers['Server']
+					$out.AuthRealm = [string]$resp.Headers['WWW-Authenticate']
+				} catch {
+					Write-Verbose 'banner header read failed'
+				}
+			}
+		}
+		[pscustomobject]$out
+	}
+
+	function Get-LikelyType {
+		param($Open, [bool]$IsGateway)
+		if ($IsGateway) { return 'Router/Firewall (gateway)' }
+		if ($Open -contains 9100 -or $Open -contains 515 -or $Open -contains 631) { return 'Printer/MFP (probable)' }
+		if ($Open -contains 37777 -or $Open -contains 554 -or $Open -contains 8000) { return 'Camera/NVR (probable)' }
+		if ($Open -contains 902) { return 'VMware ESXi host (probable)' }
+		if ($Open -contains 8006) { return 'Proxmox host (probable)' }
+		if ($Open -contains 5000 -or $Open -contains 5001) { return 'NAS (Synology or similar, probable)' }
+		if ($Open -contains 3389 -or $Open -contains 135 -or $Open -contains 445) { return 'Windows host or NAS (probable)' }
+		if ($Open -contains 22) { return 'Linux/NAS/network device (SSH)' }
+		if (@($Open).Count -gt 0) { return 'Web-managed device' }
+		'Unknown (no scanned ports open)'
+	}
+
+	# Lock the folder down before anything sensitive (including the transcript) is written into it
+	Protect-DiscoveryPath -Path $outDir -Container
+	try {
+		Start-Transcript -Path (Join-Path $outDir 'transcript.txt') | Out-Null
+		$transcriptOn = $true
+	} catch {
+		Write-Verbose 'Transcript not started'
+	}
+
+	try {
+		Write-Host ('Discovery started on {0}. Output: {1}' -f $env:COMPUTERNAME, $outDir) -ForegroundColor Green
+		$computerSystem = Get-CimInstance Win32_ComputerSystem
+
+		# ------------------------------------------------------------ system
+		Invoke-Section 'System' {
+			$os = Get-CimInstance Win32_OperatingSystem
+			$cs = $computerSystem
+			$bios = Get-CimInstance Win32_BIOS
+			$cpus = @(Get-CimInstance Win32_Processor)
+			$ver = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+			$tz = $null
+			try { $tz = (Get-TimeZone).Id } catch { $tz = [System.TimeZoneInfo]::Local.Id }
+			$virtual = [bool](($cs.Model -match 'Virtual|VMware|KVM|HVM|Xen|QEMU') -or ($cs.Manufacturer -match 'VMware|QEMU|Xen'))
+			[pscustomobject]@{
+				ComputerName = $env:COMPUTERNAME
+				DnsHostName = $cs.DNSHostName
+				PartOfDomain = $cs.PartOfDomain
+				DomainOrWorkgroup = $cs.Domain
+				DomainRole = $cs.DomainRole
+				ProductType = $os.ProductType
+				OSCaption = $os.Caption
+				OSVersion = $os.Version
+				BuildNumber = $os.BuildNumber
+				ReleaseId = $ver.ReleaseId
+				DisplayVersion = $ver.DisplayVersion
+				UBR = $ver.UBR
+				OSArchitecture = $os.OSArchitecture
+				OSInstallDate = $os.InstallDate
+				LastBoot = $os.LastBootUpTime
+				UptimeDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+				Manufacturer = $cs.Manufacturer
+				Model = $cs.Model
+				SerialNumber = $bios.SerialNumber
+				BiosVersion = $bios.SMBIOSBIOSVersion
+				BiosDate = $bios.ReleaseDate
+				CpuName = ($cpus | Select-Object -First 1).Name
+				CpuSockets = $cpus.Count
+				CpuCores = ($cpus | Measure-Object -Property NumberOfCores -Sum).Sum
+				LogicalProcessors = $cs.NumberOfLogicalProcessors
+				RamGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+				TimeZone = $tz
+				LooksVirtual = $virtual
+				PSVersion = $PSVersionTable.PSVersion.ToString()
+				ScriptRunBy = ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME)
+			}
+		}
+
+		Invoke-Section 'WindowsLicense' {
+			$statusText = @{ 0 = 'Unlicensed'; 1 = 'Licensed'; 2 = 'OOBGrace'; 3 = 'OOTGrace'; 4 = 'NonGenuineGrace'; 5 = 'Notification'; 6 = 'ExtendedGrace' }
+			Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" | ForEach-Object {
+				[pscustomobject]@{ Name = $_.Name; Description = $_.Description; LicenseStatus = $_.LicenseStatus; LicenseStatusText = $statusText[[int]$_.LicenseStatus] }
+			}
+		}
+
+		Invoke-Section 'TimeSync' {
+			$src = (w32tm /query /source 2>&1 | Out-String).Trim()
+			[pscustomobject]@{ TimeSource = $src }
+		}
+
+		Invoke-Section 'EntraJoinStatus' { Get-ComputerEntraStatus }
+
+		# ------------------------------------------------------------ disks
+		Invoke-Section 'Volumes' {
+			Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+				$pct = $null
+				if ($_.Size) { $pct = [math]::Round(100 * $_.FreeSpace / $_.Size, 1) }
+				[pscustomobject]@{
+					Drive = $_.DeviceID
+					Label = $_.VolumeName
+					FileSystem = $_.FileSystem
+					SizeGB = [math]::Round($_.Size / 1GB, 1)
+					FreeGB = [math]::Round($_.FreeSpace / 1GB, 1)
+					PctFree = $pct
+				}
+			}
+		}
+
+		Invoke-Section 'DiskDrives' {
+			Get-CimInstance Win32_DiskDrive | ForEach-Object {
+				[pscustomobject]@{ Model = $_.Model; Serial = ([string]$_.SerialNumber).Trim(); Interface = $_.InterfaceType; MediaType = $_.MediaType; SizeGB = [math]::Round($_.Size / 1GB, 1); Status = $_.Status; Partitions = $_.Partitions }
+			}
+		}
+
+		Invoke-Section 'PhysicalDiskHealth' {
+			Get-PhysicalDisk | ForEach-Object {
+				[pscustomobject]@{ Name = $_.FriendlyName; MediaType = [string]$_.MediaType; BusType = [string]$_.BusType; Health = [string]$_.HealthStatus; Operational = ($_.OperationalStatus -join ','); SizeGB = [math]::Round($_.Size / 1GB, 1) }
+			}
+		}
+
+		Invoke-Section 'StorageControllers' {
+			Get-CimInstance Win32_SCSIController | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Manufacturer = $_.Manufacturer; DriverName = $_.DriverName } }
+		}
+
+		Invoke-Section 'BitLocker' {
+			if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) { return (New-NotApplicable 'BitLocker feature not installed') }
+			Get-BitLockerVolume | ForEach-Object {
+				[pscustomobject]@{ Mount = $_.MountPoint; Status = [string]$_.VolumeStatus; Protection = [string]$_.ProtectionStatus; Method = [string]$_.EncryptionMethod; Protectors = (($_.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType }) -join ',') }
+			}
+		}
+
+		# ------------------------------------------------------------ network
+		Invoke-Section 'NetConfig' {
+			Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled } | ForEach-Object {
+				[pscustomobject]@{
+					Adapter = $_.Description
+					MAC = $_.MACAddress
+					IPAddress = ($_.IPAddress -join ', ')
+					SubnetMask = ($_.IPSubnet -join ', ')
+					DefaultGateway = ($_.DefaultIPGateway -join ', ')
+					DnsServers = ($_.DNSServerSearchOrder -join ', ')
+					DnsDomain = $_.DNSDomain
+					DhcpEnabled = $_.DHCPEnabled
+					DhcpServer = $_.DHCPServer
+					LeaseObtained = $_.DHCPLeaseObtained
+					LeaseExpires = $_.DHCPLeaseExpires
+					NetBIOSOption = $_.TcpipNetbiosOptions
+				}
+			}
+		}
+
+		Invoke-Section 'NetAdapters' {
+			Get-NetAdapter | ForEach-Object {
+				[pscustomobject]@{ Name = $_.Name; Description = $_.InterfaceDescription; Status = [string]$_.Status; LinkSpeed = $_.LinkSpeed; MAC = $_.MacAddress; Virtual = $_.Virtual }
+			}
+		}
+
+		Invoke-Section 'NicTeams' {
+			if (-not (Get-Command Get-NetLbfoTeam -ErrorAction SilentlyContinue)) { return $null }
+			Get-NetLbfoTeam -ErrorAction SilentlyContinue | ForEach-Object {
+				[pscustomobject]@{ Name = $_.Name; Members = ($_.Members -join ','); Mode = [string]$_.TeamingMode; LoadBalancing = [string]$_.LoadBalancingAlgorithm; Status = [string]$_.Status }
+			}
+		}
+
+		Invoke-Section 'Routes' {
+			Get-NetRoute -AddressFamily IPv4 | Where-Object { $_.DestinationPrefix -notmatch '^(127\.|224\.|255\.)' -and $_.DestinationPrefix -notmatch '/32$' } | ForEach-Object {
+				[pscustomobject]@{ Destination = $_.DestinationPrefix; NextHop = $_.NextHop; Metric = $_.RouteMetric; Interface = $_.InterfaceAlias }
+			}
+		}
+
+		Invoke-Section 'HostsFile' {
+			Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') } | ForEach-Object {
+				[pscustomobject]@{ Entry = $_.Trim() }
+			}
+		}
+
+		Invoke-Section 'PublicIP' {
+			$prev = [Net.ServicePointManager]::SecurityProtocol
+			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+			try {
+				try {
+					$r = Invoke-RestMethod -Uri 'https://ipinfo.io/json' -UseBasicParsing -TimeoutSec 10
+					[pscustomobject]@{ Ip = $r.ip; ReverseDns = $r.hostname; Org = $r.org; City = $r.city; Region = $r.region; Source = 'ipinfo.io' }
+				} catch {
+					$ip = Invoke-RestMethod -Uri 'https://api.ipify.org' -UseBasicParsing -TimeoutSec 10
+					[pscustomobject]@{ Ip = $ip; ReverseDns = $null; Org = $null; City = $null; Region = $null; Source = 'ipify.org' }
+				}
+			} finally {
+				[Net.ServicePointManager]::SecurityProtocol = $prev
+			}
+		}
+
+		Invoke-Section 'ListeningPorts' {
+			$procs = @{}
+			Get-Process | ForEach-Object { $procs[[int]$_.Id] = $_.ProcessName }
+			Get-NetTCPConnection -State Listen | Sort-Object LocalPort | ForEach-Object {
+				[pscustomobject]@{ LocalAddress = $_.LocalAddress; LocalPort = $_.LocalPort; ProcessId = $_.OwningProcess; Process = $procs[[int]$_.OwningProcess] }
+			}
+		}
+
+		Invoke-Section 'ExternalConnections' {
+			$procs = @{}
+			Get-Process | ForEach-Object { $procs[[int]$_.Id] = $_.ProcessName }
+			Get-NetTCPConnection -State Established | Where-Object { Test-PublicIp $_.RemoteAddress } | Select-Object -First 200 | ForEach-Object {
+				[pscustomobject]@{ RemoteAddress = $_.RemoteAddress; RemotePort = $_.RemotePort; LocalPort = $_.LocalPort; Process = $procs[[int]$_.OwningProcess] }
+			}
+		}
+
+		# ------------------------------------------------------------ server roles (DHCP, DNS, Hyper-V, IIS)
+		Invoke-Section 'DhcpScopes' {
+			if (-not (Get-Service DHCPServer -ErrorAction SilentlyContinue) -or -not (Get-Command Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)) { return $null }
+			# DNS/router options are often set server-wide, so fall back to server-level values
+			$serverOpt = @{}
+			Get-DhcpServerv4OptionValue -ErrorAction SilentlyContinue | ForEach-Object { $serverOpt[[int]$_.OptionId] = ($_.Value -join ', ') }
+			Get-DhcpServerv4Scope | ForEach-Object {
+				$scope = $_
+				$opt = $serverOpt.Clone()
+				Get-DhcpServerv4OptionValue -ScopeId $scope.ScopeId -All -ErrorAction SilentlyContinue | ForEach-Object { $opt[[int]$_.OptionId] = ($_.Value -join ', ') }
+				$stats = Get-DhcpServerv4ScopeStatistics -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue
+				[pscustomobject]@{
+					ScopeId = [string]$scope.ScopeId
+					Name = $scope.Name
+					SubnetMask = [string]$scope.SubnetMask
+					StartRange = [string]$scope.StartRange
+					EndRange = [string]$scope.EndRange
+					LeaseDuration = [string]$scope.LeaseDuration
+					State = [string]$scope.State
+					Router = $opt[3]
+					DnsServers = $opt[6]
+					DnsDomain = $opt[15]
+					InUse = $stats.InUse
+					Free = $stats.Free
+					PercentInUse = $stats.PercentageInUse
+				}
+			}
+		}
+
+		Invoke-Section 'DhcpReservations' {
+			foreach ($scope in (Get-SectionRows 'DhcpScopes')) {
+				Get-DhcpServerv4Reservation -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue | ForEach-Object {
+					[pscustomobject]@{ ScopeId = $scope.ScopeId; IPAddress = [string]$_.IPAddress; ClientId = $_.ClientId; Name = $_.Name; Description = $_.Description }
+				}
+			}
+		}
+
+		Invoke-Section 'DnsZones' {
+			if (-not (Get-Service DNS -ErrorAction SilentlyContinue) -or -not (Get-Command Get-DnsServerZone -ErrorAction SilentlyContinue)) { return $null }
+			Get-DnsServerZone | Where-Object { -not $_.IsAutoCreated -and $_.ZoneName -ne 'TrustAnchors' } | ForEach-Object {
+				[pscustomobject]@{ Zone = $_.ZoneName; Type = [string]$_.ZoneType; AdIntegrated = $_.IsDsIntegrated; Reverse = $_.IsReverseLookupZone; DynamicUpdate = [string]$_.DynamicUpdate; ReplicationScope = [string]$_.ReplicationScope }
+			}
+		}
+
+		Invoke-Section 'DnsServerSettings' {
+			if (-not (Get-Service DNS -ErrorAction SilentlyContinue) -or -not (Get-Command Get-DnsServerForwarder -ErrorAction SilentlyContinue)) { return $null }
+			$fwd = Get-DnsServerForwarder
+			$scav = $null
+			try { $scav = Get-DnsServerScavenging -ErrorAction Stop } catch { Write-Verbose 'Scavenging settings unavailable' }
+			[pscustomobject]@{
+				Forwarders = (@($fwd.IPAddress | ForEach-Object { [string]$_ }) -join ', ')
+				UseRootHint = $fwd.UseRootHint
+				ScavengingEnabled = $(if ($scav) { $scav.ScavengingState } else { $null })
+				ScavengingInterval = $(if ($scav) { [string]$scav.ScavengingInterval } else { $null })
+			}
+		}
+
+		Invoke-Section 'HyperVVMs' {
+			if (-not (Get-Service vmms -ErrorAction SilentlyContinue) -or -not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { return $null }
+			Get-VM | ForEach-Object {
+				$vm = $_
+				$disks = @(Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {
+					$size = $null
+					try { $size = [math]::Round((Get-VHD -Path $_.Path -ErrorAction Stop).FileSize / 1GB, 1) } catch { $size = '?' }
+					'{0} ({1} GB)' -f $_.Path, $size
+				})
+				[pscustomobject]@{
+					Name = $vm.Name
+					State = [string]$vm.State
+					Generation = $vm.Generation
+					Version = $vm.Version
+					vCPU = $vm.ProcessorCount
+					MemoryStartupGB = [math]::Round($vm.MemoryStartup / 1GB, 1)
+					MemoryAssignedGB = [math]::Round($vm.MemoryAssigned / 1GB, 1)
+					DynamicMemory = $vm.DynamicMemoryEnabled
+					Uptime = [string]$vm.Uptime
+					AutomaticStartAction = [string]$vm.AutomaticStartAction
+					ReplicationState = [string]$vm.ReplicationState
+					Checkpoints = @(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue).Count
+					Switches = ((Get-VMNetworkAdapter -VM $vm -ErrorAction SilentlyContinue | ForEach-Object { $_.SwitchName }) -join ', ')
+					Disks = ($disks -join '; ')
+				}
+			}
+		}
+
+		Invoke-Section 'HyperVSwitches' {
+			if (-not (Get-Service vmms -ErrorAction SilentlyContinue) -or -not (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue)) { return $null }
+			Get-VMSwitch | ForEach-Object {
+				[pscustomobject]@{ Name = $_.Name; Type = [string]$_.SwitchType; Adapter = $_.NetAdapterInterfaceDescription; AllowManagementOS = $_.AllowManagementOS }
+			}
+		}
+
+		Invoke-Section 'IISSites' {
+			$appcmd = Join-Path $env:SystemRoot 'System32\inetsrv\appcmd.exe'
+			if (-not (Get-Service W3SVC -ErrorAction SilentlyContinue) -or -not (Test-Path $appcmd)) { return $null }
+			& $appcmd list site 2>&1 | ForEach-Object { [pscustomobject]@{ Line = ([string]$_).Trim() } } | Where-Object { $_.Line }
+		}
+
+		# ------------------------------------------------------------ shares and file data
+		Invoke-Section 'Shares' {
+			Get-SmbShare | ForEach-Object {
+				[pscustomobject]@{ Name = $_.Name; Path = $_.Path; Description = $_.Description; Special = $_.Special; CurrentUsers = $_.CurrentUsers; EncryptData = $_.EncryptData; FolderEnumerationMode = [string]$_.FolderEnumerationMode; CachingMode = [string]$_.CachingMode }
+			}
+		}
+
+		try {
+			$userShares = @(Get-SmbShare -ErrorAction Stop | Where-Object { -not $_.Special -and $_.Path })
+		} catch {
+			Write-Verbose 'Get-SmbShare unavailable'
+		}
+
+		Invoke-Section 'SharePermissions' {
+			foreach ($s in $userShares) {
+				Get-SmbShareAccess -Name $s.Name | ForEach-Object {
+					[pscustomobject]@{ Share = $s.Name; Account = $_.AccountName; Type = [string]$_.AccessControlType; Right = [string]$_.AccessRight }
+				}
+			}
+		}
+
+		Invoke-Section 'FolderPermissions' {
+			foreach ($s in $userShares) {
+				$targets = @($s.Path)
+				$targets += @(Get-ChildItem -LiteralPath $s.Path -Directory -Force -ErrorAction SilentlyContinue | Select-Object -First 100 | ForEach-Object { $_.FullName })
+				foreach ($t in $targets) {
+					try {
+						(Get-Acl -LiteralPath $t).Access | Where-Object { $t -eq $s.Path -or -not $_.IsInherited } | ForEach-Object {
+							[pscustomobject]@{ Share = $s.Name; Path = $t; Identity = [string]$_.IdentityReference; Rights = [string]$_.FileSystemRights; Type = [string]$_.AccessControlType; Inherited = $_.IsInherited }
+						}
+					} catch {
+						Write-Verbose ('ACL read failed: {0}' -f $t)
+					}
+				}
+			}
+		}
+
+		if (-not $SkipFileScan) {
+			Invoke-Section 'ShareSizes' {
+				function Measure-Tree {
+					param([string]$Path, [hashtable]$Ext)
+					$count = 0
+					$bytes = [int64]0
+					$newest = $null
+					Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+						$count++
+						$bytes += $_.Length
+						if ($null -eq $newest -or $_.LastWriteTime -gt $newest) { $newest = $_.LastWriteTime }
+						$e = $_.Extension.ToLower()
+						if (-not $e) { $e = '(none)' }
+						if ($Ext.ContainsKey($e)) {
+							$Ext[$e].Count++
+							$Ext[$e].Bytes += $_.Length
+						} else {
+							$Ext[$e] = [pscustomobject]@{ Extension = $e; Count = 1; Bytes = [int64]$_.Length }
+						}
+					}
+					[pscustomobject]@{ Files = $count; Bytes = $bytes; Newest = $newest }
+				}
+				# Measure each path once. A share nested inside another share is listed but not re-counted.
+				$measured = @()
+				foreach ($s in ($userShares | Sort-Object { $_.Path.Length })) {
+					$root = $s.Path.TrimEnd('\') + '\'
+					$parent = $measured | Where-Object { $root.StartsWith($_.Root, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+					if ($parent) {
+						[pscustomobject]@{ Share = $s.Name; Folder = ('(inside share {0}, counted there)' -f $parent.Name); Files = $null; SizeGB = $null; NewestFile = $null }
+						continue
+					}
+					$measured += [pscustomobject]@{ Name = $s.Name; Root = $root }
+					$top = @(Get-ChildItem -LiteralPath $s.Path -Force -ErrorAction SilentlyContinue)
+					foreach ($d in ($top | Where-Object { $_.PSIsContainer })) {
+						$m = Measure-Tree -Path $d.FullName -Ext $extTable
+						[pscustomobject]@{ Share = $s.Name; Folder = $d.Name; Files = $m.Files; SizeGB = [math]::Round($m.Bytes / 1GB, 2); NewestFile = $m.Newest }
+					}
+					$rootFiles = @($top | Where-Object { -not $_.PSIsContainer })
+					if ($rootFiles.Count -gt 0) {
+						$sum = ($rootFiles | Measure-Object -Property Length -Sum).Sum
+						[pscustomobject]@{ Share = $s.Name; Folder = '(files in share root)'; Files = $rootFiles.Count; SizeGB = [math]::Round($sum / 1GB, 2); NewestFile = ($rootFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime }
+					}
+				}
+			}
+
+			Invoke-Section 'FileTypes' {
+				$extTable.Values | Sort-Object Bytes -Descending | Select-Object -First 40 | ForEach-Object {
+					[pscustomobject]@{ Extension = $_.Extension; Files = $_.Count; SizeMB = [math]::Round($_.Bytes / 1MB, 1) }
+				}
+			}
+
+			Invoke-Section 'NotableFiles' {
+				$skip = @('Windows', 'Program Files', 'Program Files (x86)', '$Recycle.Bin', 'System Volume Information', 'Recovery', 'PerfLogs')
+				# Databases, mail stores, and backup/image formats that usually need a migration or backup plan
+				$inc = '*.mdf', '*.ldf', '*.sdf', '*.mdb', '*.accdb', '*.qbw', '*.qbb', '*.qbm', '*.tlg', '*.pst', '*.ost', '*.bak', '*.vhd', '*.vhdx', '*.vmdk', '*.dbf', '*.adb', '*.vbk', '*.vib', '*.tib', '*.tibx', '*.spf', '*.mrimg', '*.bkf'
+				$limit = 500
+				$found = 0
+				foreach ($drv in (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3')) {
+					$root = $drv.DeviceID + '\'
+					foreach ($d in (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+						if ($found -ge $limit) { break }
+						if ($d.PSIsContainer -and ($skip -contains $d.Name)) { continue }
+						if ($d.PSIsContainer) {
+							Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Force -Include $inc -ErrorAction SilentlyContinue | Select-Object -First ($limit - $found) | ForEach-Object {
+								$found++
+								[pscustomobject]@{ Path = $_.FullName; SizeMB = [math]::Round($_.Length / 1MB, 1); Modified = $_.LastWriteTime }
+							}
+						} elseif ($inc | Where-Object { $d.Name -like $_ }) {
+							$found++
+							[pscustomobject]@{ Path = $d.FullName; SizeMB = [math]::Round($d.Length / 1MB, 1); Modified = $d.LastWriteTime }
+						}
+					}
+				}
+				if ($found -ge $limit) { Write-Host ('    stopped after {0} files' -f $limit) -ForegroundColor DarkCyan }
+			}
+		}
+
+		Invoke-Section 'SmbSessions' {
+			Get-SmbSession | ForEach-Object {
+				[pscustomobject]@{ Client = $_.ClientComputerName; User = $_.ClientUserName; Opens = $_.NumOpens; IdleSeconds = $_.SecondsIdle; Dialect = $_.Dialect }
+			}
+		}
+
+		Invoke-Section 'SmbOpenFilesSummary' {
+			Get-SmbOpenFile | Group-Object ClientComputerName, ClientUserName | ForEach-Object {
+				[pscustomobject]@{ Client = $_.Group[0].ClientComputerName; User = $_.Group[0].ClientUserName; OpenFiles = $_.Count }
+			}
+		}
+
+		Invoke-Section 'SmbServerConfig' {
+			$c = Get-SmbServerConfiguration
+			[pscustomobject]@{ SMB1Enabled = $c.EnableSMB1Protocol; SMB2Enabled = $c.EnableSMB2Protocol; RequireSigning = $c.RequireSecuritySignature; EncryptData = $c.EncryptData; RejectUnencrypted = $c.RejectUnencryptedAccess }
+		}
+
+		# ------------------------------------------------------------ local accounts
+		Invoke-Section 'LocalUsers' {
+			try {
+				Get-LocalUser -ErrorAction Stop | ForEach-Object {
+					[pscustomobject]@{ Name = $_.Name; Enabled = $_.Enabled; FullName = $_.FullName; Description = $_.Description; LastLogon = $_.LastLogon; PasswordLastSet = $_.PasswordLastSet; PasswordRequired = $_.PasswordRequired; PasswordExpires = $_.PasswordExpires }
+				}
+			} catch {
+				Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' | ForEach-Object {
+					[pscustomobject]@{ Name = $_.Name; Enabled = (-not $_.Disabled); FullName = $_.FullName; Description = $_.Description; LastLogon = $null; PasswordLastSet = $null; PasswordRequired = $_.PasswordRequired; PasswordExpires = $_.PasswordExpires }
+				}
+			}
+		}
+
+		Invoke-Section 'LocalGroupMembers' {
+			foreach ($gn in 'Administrators', 'Remote Desktop Users', 'Backup Operators', 'Power Users') {
+				try {
+					$g = [ADSI]('WinNT://{0}/{1},group' -f $env:COMPUTERNAME, $gn)
+					foreach ($m in @($g.Invoke('Members'))) {
+						$path = $m.GetType().InvokeMember('ADsPath', 'GetProperty', $null, $m, $null)
+						[pscustomobject]@{ Group = $gn; Member = ($path -replace '^WinNT://', '') }
+					}
+				} catch {
+					Write-Verbose ('Group not readable: {0}' -f $gn)
+				}
+			}
+		}
+
+		Invoke-Section 'UserProfiles' {
+			Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special } | ForEach-Object {
+				$prof = $_
+				$acct = $null
+				try { $acct = ([System.Security.Principal.SecurityIdentifier]$prof.SID).Translate([System.Security.Principal.NTAccount]).Value } catch { $acct = $prof.SID }
+				[pscustomobject]@{ Account = $acct; LocalPath = $prof.LocalPath; LastUse = $prof.LastUseTime; Loaded = $prof.Loaded }
+			}
+		}
+
+		Invoke-Section 'LoggedOnSessions' {
+			quser 2>&1 | ForEach-Object { [pscustomobject]@{ Line = ([string]$_).Trim() } }
+		}
+
+		Invoke-Section 'PasswordPolicy' {
+			net accounts 2>&1 | ForEach-Object { [pscustomobject]@{ Line = ([string]$_).Trim() } } | Where-Object { $_.Line }
+		}
+
+		# ------------------------------------------------------------ Active Directory
+		if ($computerSystem.PartOfDomain) {
+			try {
+				# GetComputerDomain uses the server's domain, not the domain of whoever is running the function
+				$dom = [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
+				$rootDse = [ADSI]('LDAP://{0}/RootDSE' -f $dom.Name)
+				$adInfo = [pscustomobject]@{
+					Domain = $dom
+					DomainDn = [string]$rootDse.Properties['defaultNamingContext'].Value
+					RootDn = [string]$rootDse.Properties['rootDomainNamingContext'].Value
+					ConfigDn = [string]$rootDse.Properties['configurationNamingContext'].Value
+				}
+				$rootDse.Dispose()
+			} catch {
+				[void]$errors.Add(('ActiveDirectory: {0}' -f $_.Exception.Message))
+				Write-Host ('    Active Directory not reachable: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+			}
+		}
+
+		if ($adInfo) {
+			Invoke-Section 'ADDomain' {
+				$dom = $adInfo.Domain
+				$forest = $dom.Forest
+				$head = @(Search-Ad -Filter '(objectClass=*)' -Props @('minpwdlength', 'pwdhistorylength', 'maxpwdage', 'lockoutthreshold', 'ms-ds-machineaccountquota') -Root $adInfo.DomainDn -Base)[0]
+				$maxAge = Get-Prop $head 'maxpwdage'
+				$maxAgeDays = $null
+				if ($null -ne $maxAge) {
+					if ([int64]$maxAge -eq [int64]::MinValue -or [int64]$maxAge -eq 0) { $maxAgeDays = 'Never' } else { $maxAgeDays = [math]::Round([math]::Abs([double]$maxAge) / 864000000000, 0) }
+				}
+				$recycleBin = $null
+				try {
+					$rb = @(Search-Ad -Filter '(objectClass=*)' -Props @('msds-enabledfeaturebl') -Root ('CN=Recycle Bin Feature,CN=Optional Features,CN=Directory Service,CN=Windows NT,CN=Services,{0}' -f $adInfo.ConfigDn) -Base)
+					$recycleBin = ($rb.Count -gt 0 -and $rb[0].Properties['msds-enabledfeaturebl'].Count -gt 0)
+				} catch {
+					Write-Verbose 'Recycle Bin state not readable'
+				}
+				$dcs = @(foreach ($dc in $dom.DomainControllers) {
+					$ip = $null
+					try { $ip = $dc.IPAddress } catch { $ip = '?' }
+					'{0} ({1}, {2})' -f $dc.Name, $ip, $dc.OSVersion
+				})
+				$sites = @()
+				try { $sites = @($forest.Sites | ForEach-Object { '{0}: {1}' -f $_.Name, (($_.Subnets | ForEach-Object { $_.Name }) -join ', ') }) } catch { Write-Verbose 'Sites not readable' }
+				[pscustomobject]@{
+					Domain = $dom.Name
+					DomainDn = $adInfo.DomainDn
+					DomainMode = [string]$dom.DomainMode
+					Forest = $forest.Name
+					ForestMode = [string]$forest.ForestMode
+					PdcRoleOwner = $dom.PdcRoleOwner.Name
+					RidRoleOwner = $dom.RidRoleOwner.Name
+					InfrastructureRoleOwner = $dom.InfrastructureRoleOwner.Name
+					SchemaRoleOwner = $forest.SchemaRoleOwner.Name
+					NamingRoleOwner = $forest.NamingRoleOwner.Name
+					DomainControllers = ($dcs -join '; ')
+					Sites = ($sites -join '; ')
+					RecycleBinEnabled = $recycleBin
+					MinPasswordLength = Get-Prop $head 'minpwdlength'
+					PasswordHistory = Get-Prop $head 'pwdhistorylength'
+					MaxPasswordAgeDays = $maxAgeDays
+					LockoutThreshold = Get-Prop $head 'lockoutthreshold'
+					MachineAccountQuota = Get-Prop $head 'ms-ds-machineaccountquota'
+				}
+			}
+
+			Invoke-Section 'ADUsers' {
+				Search-Ad '(&(objectCategory=person)(objectClass=user))' @('samaccountname', 'displayname', 'mail', 'title', 'department', 'description', 'useraccountcontrol', 'lastlogontimestamp', 'pwdlastset', 'whencreated', 'memberof') | ForEach-Object {
+					$uac = [int](Get-Prop $_ 'useraccountcontrol')
+					$last = Convert-FileTimeValue (Get-Prop $_ 'lastlogontimestamp')
+					[pscustomobject]@{
+						Account = (Get-Prop $_ 'samaccountname')
+						DisplayName = (Get-Prop $_ 'displayname')
+						Email = (Get-Prop $_ 'mail')
+						Title = (Get-Prop $_ 'title')
+						Department = (Get-Prop $_ 'department')
+						Description = (Get-Prop $_ 'description')
+						Enabled = (-not ($uac -band 2))
+						PasswordNeverExpires = [bool]($uac -band 65536)
+						PasswordNotRequired = [bool]($uac -band 32)
+						LastLogon = $last
+						DaysSinceLogon = $(if ($last) { [int]((Get-Date) - $last).TotalDays } else { $null })
+						PasswordLastSet = (Convert-FileTimeValue (Get-Prop $_ 'pwdlastset'))
+						Created = (Get-Prop $_ 'whencreated')
+						GroupCount = $_.Properties['memberof'].Count
+					}
+				}
+			}
+
+			Invoke-Section 'ADComputers' {
+				Search-Ad '(objectCategory=computer)' @('name', 'dnshostname', 'operatingsystem', 'operatingsystemversion', 'description', 'lastlogontimestamp', 'whencreated', 'useraccountcontrol') | ForEach-Object {
+					$uac = [int](Get-Prop $_ 'useraccountcontrol')
+					$last = Convert-FileTimeValue (Get-Prop $_ 'lastlogontimestamp')
+					[pscustomobject]@{
+						Name = (Get-Prop $_ 'name')
+						DnsHostName = (Get-Prop $_ 'dnshostname')
+						OS = (Get-Prop $_ 'operatingsystem')
+						OSVersion = (Get-Prop $_ 'operatingsystemversion')
+						Description = (Get-Prop $_ 'description')
+						Enabled = (-not ($uac -band 2))
+						LastLogon = $last
+						DaysSinceLogon = $(if ($last) { [int]((Get-Date) - $last).TotalDays } else { $null })
+						Created = (Get-Prop $_ 'whencreated')
+					}
+				}
+			}
+
+			Invoke-Section 'ADPrivilegedUsers' {
+				# Resolve groups by well-known SID so renamed, moved, or non-English groups are still found
+				$domSid = Get-AdObjectSid $adInfo.DomainDn
+				$rootSid = Get-AdObjectSid $adInfo.RootDn
+				$groups = [ordered]@{
+					'Domain Admins' = ('{0}-512' -f $domSid)
+					'Enterprise Admins' = ('{0}-519' -f $rootSid)
+					'Schema Admins' = ('{0}-518' -f $rootSid)
+					'Administrators (built-in)' = 'S-1-5-32-544'
+					'Account Operators' = 'S-1-5-32-548'
+					'Server Operators' = 'S-1-5-32-549'
+					'Backup Operators' = 'S-1-5-32-551'
+				}
+				foreach ($label in $groups.Keys) {
+					try {
+						$g = [ADSI]('LDAP://<SID={0}>' -f $groups[$label])
+						$gdn = [string]$g.Properties['distinguishedName'].Value
+						$g.Dispose()
+						if (-not $gdn) { continue }
+						$f = '(&(objectCategory=person)(objectClass=user)(memberOf:1.2.840.113556.1.4.1941:={0}))' -f (ConvertTo-LdapFilterValue $gdn)
+						Search-Ad $f @('samaccountname', 'useraccountcontrol', 'lastlogontimestamp') | ForEach-Object {
+							$uac = [int](Get-Prop $_ 'useraccountcontrol')
+							[pscustomobject]@{ Group = $label; Account = (Get-Prop $_ 'samaccountname'); Enabled = (-not ($uac -band 2)); PasswordNeverExpires = [bool]($uac -band 65536); LastLogon = (Convert-FileTimeValue (Get-Prop $_ 'lastlogontimestamp')) }
+						}
+					} catch {
+						Write-Verbose ('Privileged group not readable: {0}' -f $label)
+					}
+				}
+			}
+
+			Invoke-Section 'ADGroups' {
+				Search-Ad '(objectCategory=group)' @('samaccountname', 'description', 'grouptype', 'member', 'whencreated') | ForEach-Object {
+					$gt = [int](Get-Prop $_ 'grouptype')
+					$scope = 'Global'
+					if ($gt -band 4) { $scope = 'DomainLocal' } elseif ($gt -band 8) { $scope = 'Universal' } elseif ($gt -band 1) { $scope = 'BuiltinLocal' }
+					$members = @($_.Properties['member'])
+					[pscustomobject]@{
+						Group = (Get-Prop $_ 'samaccountname')
+						Type = $(if ($gt -lt 0) { 'Security' } else { 'Distribution' })
+						Scope = $scope
+						Description = (Get-Prop $_ 'description')
+						MemberCount = $members.Count
+						Members = (($members | Select-Object -First 50 | ForEach-Object { Get-DnLeaf ([string]$_) }) -join '; ')
+						Created = (Get-Prop $_ 'whencreated')
+					}
+				}
+			}
+
+			Invoke-Section 'ADOUs' {
+				Search-Ad '(objectCategory=organizationalUnit)' @('distinguishedname', 'description', 'gplink', 'gpoptions') | ForEach-Object {
+					$link = [string](Get-Prop $_ 'gplink')
+					[pscustomobject]@{ OU = (Get-Prop $_ 'distinguishedname'); Description = (Get-Prop $_ 'description'); LinkedGpos = ([regex]::Matches($link, '\[LDAP://').Count); BlocksInheritance = ([int](Get-Prop $_ 'gpoptions') -eq 1) }
+				}
+			}
+
+			Invoke-Section 'ADGroupPolicies' {
+				# Map each GPO GUID to the domain root / OUs it is linked to
+				$links = @{}
+				$containers = @(Search-Ad -Filter '(objectClass=*)' -Props @('distinguishedname', 'gplink') -Root $adInfo.DomainDn -Base)
+				$containers += @(Search-Ad '(&(objectCategory=organizationalUnit)(gplink=*))' @('distinguishedname', 'gplink'))
+				foreach ($c in $containers) {
+					$where = [string](Get-Prop $c 'distinguishedname')
+					foreach ($m in [regex]::Matches([string](Get-Prop $c 'gplink'), '(?i)\[LDAP://cn=(\{[0-9a-f-]+\}),[^;]*;(\d)\]')) {
+						$guid = $m.Groups[1].Value.ToUpper()
+						$state = if ($m.Groups[2].Value -eq '1' -or $m.Groups[2].Value -eq '3') { ' (link disabled)' } else { '' }
+						if (-not $links.ContainsKey($guid)) { $links[$guid] = @() }
+						$links[$guid] += ($where + $state)
+					}
+				}
+				$flagText = @{ 0 = 'Enabled'; 1 = 'User settings disabled'; 2 = 'Computer settings disabled'; 3 = 'All settings disabled' }
+				Search-Ad '(objectClass=groupPolicyContainer)' @('displayname', 'cn', 'flags', 'whencreated', 'whenchanged') | ForEach-Object {
+					$guid = ([string](Get-Prop $_ 'cn')).ToUpper()
+					[pscustomobject]@{
+						Name = (Get-Prop $_ 'displayname')
+						Guid = $guid
+						Status = $flagText[[int](Get-Prop $_ 'flags')]
+						LinkedTo = $(if ($links.ContainsKey($guid)) { $links[$guid] -join '; ' } else { '(not linked)' })
+						Created = (Get-Prop $_ 'whencreated')
+						Changed = (Get-Prop $_ 'whenchanged')
+					}
+				}
+			}
+		} elseif (-not $computerSystem.PartOfDomain) {
+			$result['ADDomain'] = New-NotApplicable ('Not domain joined. Workgroup: {0}' -f $computerSystem.Domain)
+		}
+
+		# ------------------------------------------------------------ roles, services, software
+		Invoke-Section 'WindowsFeatures' {
+			if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+				Get-WindowsFeature | Where-Object { $_.Installed } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName } }
+			} else {
+				Get-WindowsOptionalFeature -Online | Where-Object { $_.State -eq 'Enabled' } | ForEach-Object { [pscustomobject]@{ Name = $_.FeatureName; DisplayName = $_.FeatureName } }
+			}
+		}
+
+		Invoke-Section 'Services' {
+			Get-CimInstance Win32_Service | ForEach-Object {
+				[pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName; State = $_.State; StartMode = $_.StartMode; RunAs = $_.StartName; Path = $_.PathName }
+			} | Sort-Object Name
+		}
+
+		Invoke-Section 'ScheduledTasks' {
+			Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } | ForEach-Object {
+				$info = $null
+				try { $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath -ErrorAction Stop } catch { $info = $null }
+				$lastRun = $null
+				$lastResult = $null
+				if ($info) { $lastRun = $info.LastRunTime; $lastResult = $info.LastTaskResult }
+				[pscustomobject]@{
+					TaskName = $_.TaskName
+					TaskPath = $_.TaskPath
+					State = [string]$_.State
+					RunAs = $_.Principal.UserId
+					LogonType = [string]$_.Principal.LogonType
+					RunLevel = [string]$_.Principal.RunLevel
+					Actions = (($_.Actions | ForEach-Object { ('{0} {1}' -f $_.Execute, $_.Arguments).Trim() }) -join ' | ')
+					LastRun = $lastRun
+					LastResult = $lastResult
+				}
+			}
+		}
+
+		Invoke-Section 'StartupCommands' {
+			Get-CimInstance Win32_StartupCommand | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Command = $_.Command; Location = $_.Location; User = $_.User } }
+		}
+
+		Invoke-Section 'InstalledSoftware' {
+			$paths = @(
+				@('Machine', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'),
+				@('Machine', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+			)
+			# Per-user installs (Zoom, Teams, Dropbox, etc.) for users whose hives are currently loaded
+			Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-' -and $_.PSChildName -notmatch '_Classes$' } | ForEach-Object {
+				$paths += , @(('User:{0}' -f $_.PSChildName), ('Registry::HKEY_USERS\{0}\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -f $_.PSChildName))
+			}
+			$rows = foreach ($p in $paths) {
+				Get-ItemProperty $p[1] -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
+					[pscustomobject]@{ DisplayName = $_.DisplayName; DisplayVersion = $_.DisplayVersion; Publisher = $_.Publisher; InstallDate = $_.InstallDate; Scope = $p[0] }
+				}
+			}
+			$rows | Sort-Object DisplayName -Unique
+		}
+
+		Invoke-Section 'NotableSoftware' {
+			$cats = [ordered]@{
+				Security = 'Sophos|SentinelOne|CrowdStrike|Carbon Black|Webroot|Malwarebytes|McAfee|Trellix|Norton|Symantec|Kaspersky|\bESET\b|Trend Micro|Bitdefender|Cylance|Huntress|Defender|Avast|\bAVG\b|Vipre|Blackpoint|ThreatLocker|Arctic Wolf|Rapid7|Cisco Secure|Umbrella|DNSFilter|Todyl|Heimdal|Cortex XDR|Wazuh'
+				RemoteAccess = 'ScreenConnect|ConnectWise|TeamViewer|AnyDesk|LogMeIn|\bGoTo|Splashtop|RemotePC|\bVNC\b|Action1|Ninja|Datto|Kaseya|Atera|Zoho Assist|Chrome Remote|Pulseway|Syncro|N-able|SolarWinds|Take Control|Bomgar|BeyondTrust|Dameware|RustDesk|Radmin|SimpleHelp|Tactical RMM|Mesh ?Agent|LabTech'
+				Backup = 'Veeam|Acronis|Datto|Backblaze|Carbonite|CrashPlan|IDrive|Macrium|Cobian|SyncBack|StorageCraft|ShadowProtect|Barracuda|Unitrends|Axcient|Altaro|NovaBackup|NovaStor|Duplicati|\bCove\b|Backup Manager|Arcserve|Retrospect|BackupAssist|MSP360|CloudBerry|Druva|Commvault|Active Backup'
+				CloudSync = 'OneDrive|Google Drive|Drive for desktop|Dropbox|Box Drive|Box Sync|Egnyte|Syncthing|ShareFile|Nextcloud|ownCloud|LucidLink|Panzura|Nasuni|CTERA|Resilio'
+				Identity = 'Azure AD Connect|Entra Connect|\bDuo\b|Okta|JumpCloud|AuthLite|Imprivata|ADSelfService|Specops|Netwrix'
+				DatabaseEngines = 'SQL Server|MySQL|MariaDB|PostgreSQL|Pervasive|Actian|Btrieve|FileMaker|Firebird|SQL Anywhere|Oracle Database|MongoDB|Advantage Database'
+				PowerProtection = 'PowerChute|\bAPC\b|Schneider Electric|Eaton|Intelligent Power|CyberPower|PowerPanel|Liebert|Vertiv|Tripp ?Lite|PowerAlert'
+				BusinessApps = 'QuickBooks|Intuit|\bACT!|Swiftpage|\bSage\b|Relius|ftwilliam|Corbel|Datair|PlanConnect|Pension|ERISA|Adobe|Acrobat|Foxit|Nitro|Bluebeam|DocuSign|Microsoft 365|Microsoft Office|Outlook|Zoom|Teams|Slack|\bJava\b|CCH|Lacerte|Drake|Chrome|Firefox'
+			}
+			$sw = Get-SectionRows 'InstalledSoftware'
+			$svc = Get-SectionRows 'Services'
+			foreach ($cat in $cats.Keys) {
+				$rx = $cats[$cat]
+				foreach ($s in $sw) {
+					if ($s.DisplayName -match $rx) { [pscustomobject]@{ Category = $cat; Name = $s.DisplayName; Version = $s.DisplayVersion; Source = 'Software' } }
+				}
+				foreach ($s in $svc) {
+					if ($s.DisplayName -match $rx -or $s.Name -match $rx) { [pscustomobject]@{ Category = $cat; Name = ('{0} ({1})' -f $s.DisplayName, $s.Name); Version = $s.State; Source = 'Service' } }
+				}
+			}
+		}
+
+		Invoke-Section 'Hotfixes' {
+			Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 30 | ForEach-Object {
+				[pscustomobject]@{ HotFixID = $_.HotFixID; Description = $_.Description; InstalledOn = $_.InstalledOn; InstalledBy = $_.InstalledBy }
+			}
+		}
+
+		Invoke-Section 'WindowsUpdatePolicy' {
+			$policy = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue
+			$au = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue
+			[pscustomobject]@{
+				WSUSServer = $policy.WUServer
+				WSUSStatusServer = $policy.WUStatusServer
+				TargetGroup = $policy.TargetGroup
+				UseWUServer = $au.UseWUServer
+				NoAutoUpdate = $au.NoAutoUpdate
+				AUOptions = $au.AUOptions
+				ScheduledInstallDay = $au.ScheduledInstallDay
+				ScheduledInstallTime = $au.ScheduledInstallTime
+			}
+		}
+
+		$wuSearcher = $null
+		try {
+			$wuSearcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+		} catch {
+			[void]$errors.Add(('WindowsUpdate: {0}' -f $_.Exception.Message))
+		}
+
+		if ($wuSearcher) {
+			Invoke-Section 'WindowsUpdateHistory' {
+				$resultText = @{ 0 = 'NotStarted'; 1 = 'InProgress'; 2 = 'Succeeded'; 3 = 'SucceededWithErrors'; 4 = 'Failed'; 5 = 'Aborted' }
+				$count = $wuSearcher.GetTotalHistoryCount()
+				if ($count -gt 0) {
+					@($wuSearcher.QueryHistory(0, [math]::Min($count, 25))) | Where-Object { $_.Title } | ForEach-Object {
+						[pscustomobject]@{ Date = $_.Date; Title = $_.Title; Result = $resultText[[int]$_.ResultCode] }
+					}
+				}
+			}
+
+			if (-not $SkipUpdateSearch) {
+				Invoke-Section 'PendingUpdates' {
+					Write-Host '    searching for pending updates (this can take a few minutes)...' -ForegroundColor DarkCyan
+					$found = $wuSearcher.Search('IsInstalled=0 and IsHidden=0')
+					@($found.Updates) | ForEach-Object {
+						[pscustomobject]@{ Title = $_.Title; KB = (@($_.KBArticleIDs) -join ','); Severity = $_.MsrcSeverity; Downloaded = $_.IsDownloaded }
+					}
+				}
+			}
+		}
+
+		Invoke-Section 'PendingReboot' {
+			[pscustomobject]@{
+				ComponentBasedServicing = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+				WindowsUpdate = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+				PendingFileRename = [bool](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue).PendingFileRenameOperations
+			}
+		}
+
+		# ------------------------------------------------------------ security posture
+		Invoke-Section 'Defender' {
+			if (-not (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue)) { return (New-NotApplicable 'Microsoft Defender not installed') }
+			$s = Get-MpComputerStatus
+			$p = Get-MpPreference
+			[pscustomobject]@{
+				AntivirusEnabled = $s.AntivirusEnabled
+				RealTimeProtection = $s.RealTimeProtectionEnabled
+				AMRunningMode = $s.AMRunningMode
+				SignatureVersion = $s.AntivirusSignatureVersion
+				SignatureLastUpdated = $s.AntivirusSignatureLastUpdated
+				QuickScanEnd = $s.QuickScanEndTime
+				FullScanEnd = $s.FullScanEndTime
+				TamperProtected = $s.IsTamperProtected
+				ExclusionPaths = (@($p.ExclusionPath) -join '; ')
+				ExclusionExtensions = (@($p.ExclusionExtension) -join '; ')
+				ExclusionProcesses = (@($p.ExclusionProcess) -join '; ')
+			}
+		}
+
+		Invoke-Section 'DefenderThreats' {
+			if (-not (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue)) { return $null }
+			$names = @{}
+			try { Get-MpThreat | ForEach-Object { $names[[string]$_.ThreatID] = $_.ThreatName } } catch { Write-Verbose 'Get-MpThreat unavailable' }
+			Get-MpThreatDetection | ForEach-Object {
+				[pscustomobject]@{ Detected = $_.InitialDetectionTime; Threat = $names[[string]$_.ThreatID]; ThreatID = $_.ThreatID; Resources = (@($_.Resources) -join '; '); Process = $_.ProcessName; ActionSuccess = $_.ActionSuccess }
+			}
+		}
+
+		Invoke-Section 'SecurityCenterAV' {
+			# root/SecurityCenter2 only exists on client OS (Windows 10/11)
+			if ([int]$computerSystem.DomainRole -ge 2) { return $null }
+			Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct | ForEach-Object {
+				[pscustomobject]@{ Name = $_.displayName; State = $_.productState; Path = $_.pathToSignedProductExe }
+			}
+		}
+
+		Invoke-Section 'FirewallProfiles' {
+			Get-NetFirewallProfile | ForEach-Object {
+				[pscustomobject]@{ Profile = [string]$_.Name; Enabled = [string]$_.Enabled; DefaultInbound = [string]$_.DefaultInboundAction; DefaultOutbound = [string]$_.DefaultOutboundAction }
+			}
+		}
+
+		Invoke-Section 'SecuritySettings' {
+			$smb1 = $null
+			try { $smb1 = (Get-SmbServerConfiguration).EnableSMB1Protocol } catch { $smb1 = $null }
+			$lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
+			$pol = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
+			$wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+			$ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue
+			$rdp = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
+			$wdigest = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -ErrorAction SilentlyContinue
+			$dnsClient = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -ErrorAction SilentlyContinue
+			# Windows LAPS policy roots in precedence order, then legacy Microsoft LAPS
+			$laps = 'None found'
+			foreach ($k in @(
+					@('Windows LAPS (CSP/Intune)', 'HKLM:\SOFTWARE\Microsoft\Policies\LAPS'),
+					@('Windows LAPS (GPO)', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS'),
+					@('Legacy Microsoft LAPS (GPO)', 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd')
+				)) {
+				if ((Test-Path $k[1]) -and @((Get-Item $k[1]).Property).Count -gt 0) { $laps = $k[0]; break }
+			}
+			$secureBoot = 'n/a'
+			try { $secureBoot = [string](Confirm-SecureBootUEFI) } catch { $secureBoot = 'n/a' }
+			$tpm = 'n/a'
+			try { $t = Get-Tpm; $tpm = ('Present={0};Ready={1}' -f $t.TpmPresent, $t.TpmReady) } catch { $tpm = 'n/a' }
+			$winrm = (Get-Service WinRM -ErrorAction SilentlyContinue).Status
+			[pscustomobject]@{
+				SMB1Enabled = $smb1
+				LmCompatibilityLevel = $lsa.LmCompatibilityLevel
+				NoLMHash = $lsa.NoLMHash
+				RunAsPPL = $lsa.RunAsPPL
+				WDigestUseLogonCredential = $wdigest.UseLogonCredential
+				LlmnrDisabledByPolicy = ($dnsClient.EnableMulticast -eq 0)
+				EnableLUA = $pol.EnableLUA
+				AutoAdminLogon = $wl.AutoAdminLogon
+				DefaultPasswordStoredInRegistry = [bool]($null -ne $wl.DefaultPassword)
+				RdpEnabled = ($ts.fDenyTSConnections -eq 0)
+				RdpPort = $rdp.PortNumber
+				RdpNLA = $rdp.UserAuthentication
+				RdpSecurityLayer = $rdp.SecurityLayer
+				LapsPolicy = $laps
+				SecureBoot = $secureBoot
+				Tpm = $tpm
+				WinRMService = [string]$winrm
+			}
+		}
+
+		Invoke-Section 'Certificates' {
+			Get-ChildItem Cert:\LocalMachine\My | ForEach-Object {
+				[pscustomobject]@{ Subject = $_.Subject; Issuer = $_.Issuer; NotAfter = $_.NotAfter; DaysLeft = [int]($_.NotAfter - (Get-Date)).TotalDays; HasPrivateKey = $_.HasPrivateKey; Thumbprint = $_.Thumbprint }
+			}
+		}
+
+		Invoke-Section 'EventLogs' {
+			Get-WinEvent -ListLog Security, System, Application | ForEach-Object {
+				[pscustomobject]@{ Log = $_.LogName; MaxSizeMB = [math]::Round($_.MaximumSizeInBytes / 1MB, 0); Records = $_.RecordCount; Enabled = $_.IsEnabled }
+			}
+		}
+
+		Invoke-Section 'AuditPolicy' {
+			# category:* avoids localized category names and the comma-list quoting problem
+			auditpol /get /category:* 2>&1 | ForEach-Object { [pscustomobject]@{ Line = ([string]$_).Trim() } } | Where-Object { $_.Line }
+		}
+
+		Invoke-Section 'FailedLogons' {
+			$evts = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625; StartTime = $since } -MaxEvents 5000 -ErrorAction SilentlyContinue
+			$rows = foreach ($e in $evts) {
+				$d = ConvertFrom-EventRecord $e
+				[pscustomobject]@{ Time = $e.TimeCreated; User = $d['TargetUserName']; Ip = $d['IpAddress']; LogonType = $d['LogonType'] }
+			}
+			$rows | Group-Object User, Ip, LogonType | ForEach-Object {
+				$f = $_.Group[0]
+				[pscustomobject]@{ User = $f.User; Ip = $f.Ip; PublicIp = (Test-PublicIp $f.Ip); LogonType = $f.LogonType; Count = $_.Count; First = ($_.Group | Measure-Object Time -Minimum).Minimum; Last = ($_.Group | Measure-Object Time -Maximum).Maximum }
+			} | Sort-Object Count -Descending | Select-Object -First 100
+		}
+
+		Invoke-Section 'RecentLogons' {
+			$ms = [int64]$EventDays * 86400000
+			$xp = "*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $ms]]] and *[EventData[(Data[@Name='LogonType']='2') or (Data[@Name='LogonType']='3') or (Data[@Name='LogonType']='10')]]"
+			$evts = Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents 20000 -ErrorAction SilentlyContinue
+			$rows = foreach ($e in $evts) {
+				$d = ConvertFrom-EventRecord $e
+				$u = $d['TargetUserName']
+				if ($u -and $u -notmatch '\$$|^(SYSTEM|ANONYMOUS LOGON|LOCAL SERVICE|NETWORK SERVICE)$|^(DWM|UMFD)-') {
+					[pscustomobject]@{ Time = $e.TimeCreated; User = $u; Ip = $d['IpAddress']; LogonType = $d['LogonType']; Workstation = $d['WorkstationName'] }
+				}
+			}
+			$rows | Group-Object LogonType, User, Ip | ForEach-Object {
+				$f = $_.Group[0]
+				[pscustomobject]@{ LogonType = $f.LogonType; User = $f.User; Ip = $f.Ip; Workstation = $f.Workstation; Count = $_.Count; First = ($_.Group | Measure-Object Time -Minimum).Minimum; Last = ($_.Group | Measure-Object Time -Maximum).Maximum }
+			} | Sort-Object LogonType, User
+		}
+
+		Invoke-Section 'RdpConnections' {
+			$evts = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'; Id = 1149; StartTime = $since } -MaxEvents 2000 -ErrorAction SilentlyContinue
+			$rows = foreach ($e in $evts) {
+				[pscustomobject]@{ Time = $e.TimeCreated; User = [string]$e.Properties[0].Value; Domain = [string]$e.Properties[1].Value; Ip = [string]$e.Properties[2].Value }
+			}
+			$rows | Group-Object User, Ip | ForEach-Object {
+				$f = $_.Group[0]
+				[pscustomobject]@{ User = $f.User; Domain = $f.Domain; Ip = $f.Ip; PublicIp = (Test-PublicIp $f.Ip); Count = $_.Count; Last = ($_.Group | Measure-Object Time -Maximum).Maximum }
+			}
+		}
+
+		Invoke-Section 'ServiceInstalls' {
+			Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7045; StartTime = $since } -MaxEvents 200 -ErrorAction SilentlyContinue | ForEach-Object {
+				[pscustomobject]@{ Time = $_.TimeCreated; Service = [string]$_.Properties[0].Value; Image = [string]$_.Properties[1].Value; StartType = [string]$_.Properties[3].Value; Account = [string]$_.Properties[4].Value }
+			}
+		}
+
+		Invoke-Section 'AccountChanges' {
+			Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4720, 4722, 4724, 4725, 4726, 4728, 4729, 4732, 4733, 4740, 4756, 4757, 1102; StartTime = $since } -MaxEvents 300 -ErrorAction SilentlyContinue | ForEach-Object {
+				$msg = ([string]$_.Message -split "`n")[0].Trim()
+				[pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Summary = $msg }
+			}
+		}
+
+		Invoke-Section 'SystemHealthEvents' {
+			Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 41, 1074, 6008, 7, 11, 51, 55, 98, 129, 153, 157; StartTime = $since } -MaxEvents 2000 -ErrorAction SilentlyContinue | Group-Object Id, ProviderName | ForEach-Object {
+				$latest = $_.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1
+				[pscustomobject]@{ EventId = $latest.Id; Provider = $latest.ProviderName; Count = $_.Count; Last = $latest.TimeCreated; Sample = (([string]$latest.Message -split "`n")[0]).Trim() }
+			}
+		}
+
+		# ------------------------------------------------------------ backup and sync
+		Invoke-Section 'ShadowCopies' {
+			Get-CimInstance Win32_ShadowCopy | ForEach-Object { [pscustomobject]@{ Volume = $_.VolumeName; Created = $_.InstallDate; Persistent = $_.Persistent } }
+		}
+
+		Invoke-Section 'ShadowStorage' {
+			vssadmin list shadowstorage 2>&1 | ForEach-Object { [pscustomobject]@{ Line = ([string]$_).Trim() } } | Where-Object { $_.Line }
+		}
+
+		Invoke-Section 'VssWriters' { Get-VSSWriter }
+
+		Invoke-Section 'WindowsServerBackup' {
+			if (-not (Get-Command Get-WBSummary -ErrorAction SilentlyContinue)) { return (New-NotApplicable 'Windows Server Backup not installed') }
+			$s = Get-WBSummary
+			[pscustomobject]@{ LastSuccessfulBackup = $s.LastSuccessfulBackupTime; LastBackupResult = $s.LastBackupResultHR; NextBackup = $s.NextBackupTime; NumberOfVersions = $s.NumberOfVersions }
+		}
+
+		Invoke-Section 'OneDrive' {
+			$hives = Get-ChildItem Registry::HKEY_USERS | Where-Object { $_.PSChildName -match '^S-1-5-21-' -and $_.PSChildName -notmatch '_Classes$' }
+			foreach ($h in $hives) {
+				$k = 'Registry::HKEY_USERS\{0}\Software\Microsoft\OneDrive\Accounts' -f $h.PSChildName
+				if (Test-Path $k) {
+					Get-ChildItem $k | ForEach-Object {
+						$p = Get-ItemProperty $_.PSPath
+						[pscustomobject]@{ UserSid = $h.PSChildName; Account = $_.PSChildName; Email = $p.UserEmail; Folder = $p.UserFolder; Business = $p.Business }
+					}
+				}
+			}
+		}
+
+		# ------------------------------------------------------------ SQL and printers
+		Invoke-Section 'SqlInstances' {
+			foreach ($hive in 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server') {
+				$key = Join-Path $hive 'Instance Names\SQL'
+				if (-not (Test-Path $key)) { continue }
+				$names = Get-ItemProperty $key
+				foreach ($p in ($names.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+					$setup = Get-ItemProperty (Join-Path $hive ('{0}\Setup' -f $p.Value)) -ErrorAction SilentlyContinue
+					$svcName = if ($p.Name -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { 'MSSQL$' + $p.Name }
+					$svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+					[pscustomobject]@{ Instance = $p.Name; InstanceId = $p.Value; Edition = $setup.Edition; Version = $setup.Version; PatchLevel = $setup.PatchLevel; DataRoot = $setup.SQLDataRoot; ServiceState = $(if ($svc) { [string]$svc.Status } else { $null }); Bitness = $(if ($hive -match 'WOW6432Node') { '32-bit' } else { '64-bit' }) }
+				}
+			}
+		}
+
+		Invoke-Section 'SqlDatabases' {
+			$query = @'
+SELECT d.name, d.state_desc, d.recovery_model_desc, d.compatibility_level, d.create_date,
+ CAST(SUM(CASE WHEN mf.type = 0 THEN CAST(mf.size AS bigint) ELSE 0 END) * 8.0 / 1024 AS decimal(18,1)) AS data_mb,
+ CAST(SUM(CASE WHEN mf.type = 1 THEN CAST(mf.size AS bigint) ELSE 0 END) * 8.0 / 1024 AS decimal(18,1)) AS log_mb,
+ (SELECT MAX(b.backup_finish_date) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type = 'D') AS last_full,
+ (SELECT MAX(b.backup_finish_date) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type = 'I') AS last_diff,
+ (SELECT MAX(b.backup_finish_date) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type = 'L') AS last_log
+FROM sys.databases d LEFT JOIN sys.master_files mf ON mf.database_id = d.database_id
+GROUP BY d.name, d.state_desc, d.recovery_model_desc, d.compatibility_level, d.create_date
+'@
+			foreach ($inst in (Get-SectionRows 'SqlInstances')) {
+				$server = '.'
+				if ($inst.Instance -ne 'MSSQLSERVER') { $server = '.\' + $inst.Instance }
+				$cn = New-Object System.Data.SqlClient.SqlConnection ('Server={0};Database=master;Integrated Security=SSPI;Connect Timeout=5;TrustServerCertificate=True' -f $server)
+				try {
+					$cn.Open()
+					$cmd = $cn.CreateCommand()
+					$cmd.CommandText = $query
+					$rd = $cmd.ExecuteReader()
+					try {
+						while ($rd.Read()) {
+							[pscustomobject]@{ Instance = $inst.Instance; Edition = $inst.Edition; Database = $rd['name']; State = $rd['state_desc']; Recovery = $rd['recovery_model_desc']; CompatLevel = $rd['compatibility_level']; Created = (ConvertFrom-DbNull $rd['create_date']); DataMB = (ConvertFrom-DbNull $rd['data_mb']); LogMB = (ConvertFrom-DbNull $rd['log_mb']); LastFull = (ConvertFrom-DbNull $rd['last_full']); LastDiff = (ConvertFrom-DbNull $rd['last_diff']); LastLog = (ConvertFrom-DbNull $rd['last_log']) }
+						}
+					} finally {
+						$rd.Close()
+					}
+				} catch {
+					[pscustomobject]@{ Instance = $inst.Instance; Edition = $inst.Edition; Database = ('(could not query: {0})' -f $_.Exception.Message); State = $null; Recovery = $null; CompatLevel = $null; Created = $null; DataMB = $null; LogMB = $null; LastFull = $null; LastDiff = $null; LastLog = $null }
+				} finally {
+					$cn.Dispose()
+				}
+			}
+		}
+
+		Invoke-Section 'Printers' {
+			$ports = @{}
+			try { Get-PrinterPort | ForEach-Object { $ports[$_.Name] = $_.PrinterHostAddress } } catch { Write-Verbose 'Get-PrinterPort unavailable' }
+			Get-Printer | ForEach-Object {
+				[pscustomobject]@{ Name = $_.Name; Driver = $_.DriverName; Port = $_.PortName; PortAddress = $ports[$_.PortName]; Shared = $_.Shared; ShareName = $_.ShareName; Status = [string]$_.PrinterStatus }
+			}
+		}
+
+		# ------------------------------------------------------------ public DNS
+		if ($PublicDomain.Count -gt 0) {
+			Invoke-Section 'PublicDns' {
+				# Prefer a public resolver so an internal zone with the same name does not hide the real records
+				$dnsArgs = @{ DnsOnly = $true; ErrorAction = 'Stop' }
+				$resolver = 'system resolver'
+				try {
+					Resolve-DnsName -Name 'www.microsoft.com' -Type A -Server 1.1.1.1 -DnsOnly -QuickTimeout -ErrorAction Stop | Out-Null
+					$dnsArgs['Server'] = '1.1.1.1'
+					$resolver = '1.1.1.1'
+				} catch {
+					Write-Verbose 'Outbound DNS to 1.1.1.1 blocked, using the system resolver'
+				}
+				foreach ($d in $PublicDomain) {
+					$queries = @(
+						@($d, 'MX'), @($d, 'TXT'), @($d, 'NS'), @($d, 'A'), @($d, 'SOA'),
+						@(('www.' + $d), 'A'), @(('_dmarc.' + $d), 'TXT'), @(('google._domainkey.' + $d), 'TXT'),
+						@(('selector1._domainkey.' + $d), 'CNAME'), @(('selector2._domainkey.' + $d), 'CNAME'),
+						@(('autodiscover.' + $d), 'CNAME'), @(('enterpriseenrollment.' + $d), 'CNAME'), @(('enterpriseregistration.' + $d), 'CNAME')
+					)
+					foreach ($q in $queries) {
+						$hit = $false
+						try {
+							Resolve-DnsName -Name $q[0] -Type $q[1] @dnsArgs | Where-Object { $_.Section -eq 'Answer' } | ForEach-Object {
+								$rec = $_
+								$val = switch ([string]$rec.Type) {
+									'MX' { '{0} {1}' -f $rec.Preference, $rec.NameExchange }
+									'TXT' { $rec.Strings -join '' }
+									'NS' { $rec.NameHost }
+									'CNAME' { $rec.NameHost }
+									'A' { $rec.IPAddress }
+									'SOA' { '{0} {1}' -f $rec.PrimaryServer, $rec.NameAdministrator }
+									default { [string]$rec }
+								}
+								$hit = $true
+								[pscustomobject]@{ Domain = $d; Query = $q[0]; Type = [string]$rec.Type; Value = $val; Resolver = $resolver }
+							}
+						} catch {
+							Write-Verbose ('DNS query failed: {0} {1}' -f $q[0], $q[1])
+						}
+						if (-not $hit) { [pscustomobject]@{ Domain = $d; Query = $q[0]; Type = $q[1]; Value = '(no record)'; Resolver = $resolver } }
+					}
+				}
+			}
+		}
+
+		# ------------------------------------------------------------ LAN scan
+		if (-not $SkipSubnetScan) {
+			Invoke-Section 'LanHosts' {
+				$cfg = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -and $_.DefaultIPGateway } | Select-Object -First 1
+				if (-not $cfg) { return (New-NotApplicable 'No adapter with a default gateway') }
+				$rx = '^\d+\.\d+\.\d+\.\d+$'
+				$myIp = @($cfg.IPAddress | Where-Object { $_ -match $rx })[0]
+				$mask = @($cfg.IPSubnet | Where-Object { $_ -match $rx })[0]
+				$gw = @($cfg.DefaultIPGateway | Where-Object { $_ -match $rx })[0]
+				$dhcp = $cfg.DHCPServer
+				if (-not $myIp -or -not $mask) { return (New-NotApplicable 'No IPv4 address on the gateway adapter') }
+				$bits = 0
+				foreach ($b in [System.Net.IPAddress]::Parse($mask).GetAddressBytes()) {
+					$v = [int]$b
+					while ($v -gt 0) { $bits += ($v -band 1); $v = $v -shr 1 }
+				}
+				# Never scan more than a /24, even on a larger subnet
+				if ($bits -lt 24) { $bits = 24 }
+				$size = [math]::Pow(2, 32 - $bits)
+				$net = [math]::Floor([double](ConvertTo-UInt32Ip $myIp) / $size) * $size
+				$ips = New-Object System.Collections.ArrayList
+				for ($n = $net + 1; $n -le ($net + $size - 2); $n++) { [void]$ips.Add((ConvertFrom-UInt32Ip ([uint32]$n))) }
+				Write-Host ('    scanning {0} addresses around {1}/{2}' -f $ips.Count, $myIp, $bits) -ForegroundColor DarkCyan
+
+				$pings = foreach ($ip in $ips) {
+					$p = New-Object System.Net.NetworkInformation.Ping
+					[pscustomobject]@{ Ip = $ip; Pinger = $p; Task = $p.SendPingAsync($ip, 800) }
+				}
+				try {
+					[void][System.Threading.Tasks.Task]::WaitAll(@($pings | ForEach-Object { $_.Task }), 20000)
+				} catch {
+					Write-Verbose 'ping wait finished with errors'
+				}
+				$live = @{}
+				foreach ($p in $pings) {
+					try {
+						if ($p.Task.Status -eq 'RanToCompletion' -and $p.Task.Result.Status -eq 'Success') { $live[$p.Ip] = $true }
+					} catch {
+						Write-Verbose 'ping result read failed'
+					}
+					$p.Pinger.Dispose()
+				}
+				# Hosts that block ping usually still show up in the ARP cache after the sweep
+				$mac = @{}
+				try {
+					Get-NetNeighbor -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.LinkLayerAddress -and $_.LinkLayerAddress -notmatch '^(00-00-00-00-00-00|FF-FF-FF-FF-FF-FF|01-00-5E)' -and [string]$_.State -notin 'Unreachable', 'Incomplete' } | ForEach-Object {
+						if ($ips -contains $_.IPAddress) { $mac[$_.IPAddress] = $_.LinkLayerAddress; $live[$_.IPAddress] = $true }
+					}
+				} catch {
+					Write-Verbose 'Get-NetNeighbor unavailable'
+				}
+				if ($gw) { $live[$gw] = $true }
+				$live[$myIp] = $true
+
+				$prevPolicy = $null
+				$prevProto = [System.Net.ServicePointManager]::SecurityProtocol
+				$isDesktop = ($PSVersionTable.PSEdition -ne 'Core')
+				if ($isDesktop) {
+					# Windows PowerShell only: accept self-signed device certificates for the banner grab, restored in finally
+					$prevPolicy = [System.Net.ServicePointManager]::CertificatePolicy
+					if (-not ('MTTrustAll' -as [type])) {
+						Add-Type -TypeDefinition 'using System.Net; using System.Security.Cryptography.X509Certificates; public class MTTrustAll : ICertificatePolicy { public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; } }'
+					}
+					[System.Net.ServicePointManager]::CertificatePolicy = New-Object MTTrustAll
+					[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]'Tls12,Tls11,Tls'
+				}
+				$ports = 21, 22, 23, 25, 53, 80, 135, 139, 443, 445, 515, 554, 631, 902, 3389, 5000, 5001, 5900, 8000, 8006, 8080, 8443, 9100, 37777
+				$hostList = @($live.Keys | Sort-Object { ConvertTo-UInt32Ip $_ })
+				$idx = 0
+				try {
+					foreach ($ip in $hostList) {
+						$idx++
+						Write-Progress -Activity 'LAN scan' -Status ('{0} ({1} of {2})' -f $ip, $idx, $hostList.Count) -PercentComplete (100 * $idx / [math]::Max(1, $hostList.Count))
+						$open = @(Get-OpenPorts -Ip $ip -Ports $ports)
+						$dnsName = $null
+						try { $dnsName = [System.Net.Dns]::GetHostEntry($ip).HostName } catch { $dnsName = $null }
+						$nb = $null
+						if ($open -contains 445 -or $open -contains 139) {
+							try {
+								$m = nbtstat -A $ip 2>&1 | Select-String -Pattern '^\s+(\S+)\s+<00>\s+UNIQUE' | Select-Object -First 1
+								if ($m) { $nb = $m.Matches[0].Groups[1].Value }
+							} catch {
+								$nb = $null
+							}
+						}
+						$banner = $null
+						foreach ($wp in 443, 80, 8443, 8080, 5001, 5000, 8006) {
+							if (-not $banner -and $open -contains $wp) { $banner = Get-WebBanner -Ip $ip -Port $wp }
+						}
+						$macAddr = $mac[$ip]
+						if (-not $macAddr -and $ip -eq $myIp) { $macAddr = $cfg.MACAddress }
+						$isGw = [bool]($ip -eq $gw)
+						$oui = $null
+						if ($macAddr) { $oui = (($macAddr -replace '[:\-]', '').Substring(0, 6)).ToUpper() }
+						[pscustomobject]@{
+							IP = $ip
+							MAC = $macAddr
+							OUI = $oui
+							Hostname = $dnsName
+							NetBIOS = $nb
+							IsThisServer = [bool]($ip -eq $myIp)
+							IsGateway = $isGw
+							IsDhcpServer = [bool]($ip -eq $dhcp)
+							OpenPorts = ($open -join ',')
+							WebUrl = $(if ($banner) { $banner.Url } else { $null })
+							WebStatus = $(if ($banner) { $banner.Status } else { $null })
+							WebServer = $(if ($banner) { $banner.Server } else { $null })
+							WebAuthRealm = $(if ($banner) { $banner.AuthRealm } else { $null })
+							WebTitle = $(if ($banner) { $banner.Title } else { $null })
+							LikelyType = (Get-LikelyType -Open $open -IsGateway $isGw)
+						}
+					}
+				} finally {
+					Write-Progress -Activity 'LAN scan' -Completed
+					if ($isDesktop) {
+						[System.Net.ServicePointManager]::CertificatePolicy = $prevPolicy
+						[System.Net.ServicePointManager]::SecurityProtocol = $prevProto
+					}
+				}
+			}
+		}
+
+		# ------------------------------------------------------------ findings
+		Invoke-Section 'Findings' {
+			$list = New-Object System.Collections.ArrayList
+			$add = {
+				param([string]$Severity, [string]$Area, [string]$Finding, [string]$Detail)
+				[void]$list.Add([pscustomobject]@{ Severity = $Severity; Area = $Area; Finding = $Finding; Detail = $Detail })
+			}
+			$now = Get-Date
+
+			$sys = Get-SectionRows 'System' | Select-Object -First 1
+			if ($sys) {
+				$build = [int]$sys.BuildNumber
+				if ([int]$sys.ProductType -ne 1) {
+					if ($build -lt 14393) { & $add 'High' 'OS' 'Server OS is past end of support' $sys.OSCaption }
+					elseif ($build -eq 14393) {
+						$sev = if ($now -ge [datetime]'2027-01-12') { 'High' } else { 'Medium' }
+						& $add $sev 'OS' 'Windows Server 2016 extended support ends 2027-01-12' $sys.OSCaption
+					}
+				} elseif ($build -lt 22000 -and $sys.OSCaption -match 'LTS') {
+					& $add 'Low' 'OS' 'Windows 10 LTSC/LTSB edition (confirm its lifecycle date)' $sys.OSCaption
+				} elseif ($build -lt 22000) {
+					& $add 'High' 'OS' 'Windows 10 or older client OS (Windows 10 support ended 2025-10-14)' $sys.OSCaption
+				}
+				if ($sys.UptimeDays -gt 60) { & $add 'Medium' 'Patching' ('No reboot in {0} days' -f [int]$sys.UptimeDays) 'Monthly updates usually require a reboot' }
+			}
+
+			foreach ($l in (Get-SectionRows 'WindowsLicense')) { if ($l.LicenseStatus -ne 1) { & $add 'Medium' 'OS' 'Windows is not activated' ('{0}: {1}' -f $l.Name, $l.LicenseStatusText) } }
+			$ts = Get-SectionRows 'TimeSync' | Select-Object -First 1
+			if ($ts -and $ts.TimeSource -match 'Local CMOS Clock|Free-running') { & $add 'Medium' 'Time' 'Time source is the local clock' $ts.TimeSource }
+
+			$pr = Get-SectionRows 'PendingReboot' | Select-Object -First 1
+			if ($pr -and ($pr.ComponentBasedServicing -or $pr.WindowsUpdate -or $pr.PendingFileRename)) { & $add 'Low' 'Patching' 'Reboot pending' '' }
+
+			foreach ($v in (Get-SectionRows 'Volumes')) {
+				if ($null -ne $v.PctFree -and $v.PctFree -lt 5) { & $add 'High' 'Storage' ('{0} has {1}% free' -f $v.Drive, $v.PctFree) ('{0} GB free of {1} GB' -f $v.FreeGB, $v.SizeGB) }
+				elseif ($null -ne $v.PctFree -and $v.PctFree -lt 15) { & $add 'Medium' 'Storage' ('{0} has {1}% free' -f $v.Drive, $v.PctFree) ('{0} GB free of {1} GB' -f $v.FreeGB, $v.SizeGB) }
+			}
+			foreach ($p in (Get-SectionRows 'PhysicalDiskHealth')) { if ($p.Health -and $p.Health -ne 'Healthy') { & $add 'High' 'Storage' ('Physical disk {0} is {1}' -f $p.Name, $p.Health) $p.Operational } }
+			foreach ($e in (Get-SectionRows 'SystemHealthEvents')) {
+				if (@(7, 11, 51, 129, 153, 157) -contains [int]$e.EventId) { & $add 'Medium' 'Storage' ('Disk/controller event {0} ({1}) x{2}' -f $e.EventId, $e.Provider, $e.Count) $e.Sample }
+				if (@(41, 6008) -contains [int]$e.EventId) { & $add 'Medium' 'Stability' ('Unexpected shutdowns (event {0}) x{1}' -f $e.EventId, $e.Count) ('Last: {0}' -f $e.Last) }
+			}
+
+			$notable = Get-SectionRows 'NotableSoftware'
+			# Only real AV/EDR engines count here, not DNS filters or other security add-ons
+			$avRx = 'Sophos|SentinelOne|CrowdStrike|Carbon Black|Webroot|Malwarebytes|McAfee|Trellix|Norton|Symantec|Kaspersky|\bESET\b|Trend Micro|Bitdefender|Cylance|Avast|\bAVG\b|Vipre|Cortex XDR|Blackpoint'
+			$thirdPartyAv = @($notable | Where-Object { $_.Category -eq 'Security' -and $_.Name -match $avRx })
+			$def = Get-SectionRows 'Defender' | Select-Object -First 1
+			$defOn = ($def -and $def.RealTimeProtection -eq $true)
+			if ($thirdPartyAv.Count -eq 0 -and -not $defOn) { & $add 'High' 'Security' 'No active antivirus detected' 'No third-party security product found and Defender real-time protection is off or missing' }
+			if ($defOn -and $def.SignatureLastUpdated -and ($now - [datetime]$def.SignatureLastUpdated).TotalDays -gt 7) { & $add 'Medium' 'Security' 'Defender signatures older than 7 days' ('Last updated {0}' -f $def.SignatureLastUpdated) }
+			if ($def -and ($def.ExclusionPaths -or $def.ExclusionProcesses -or $def.ExclusionExtensions)) { & $add 'Low' 'Security' 'Defender exclusions configured (review)' ('Paths: {0} | Processes: {1} | Extensions: {2}' -f $def.ExclusionPaths, $def.ExclusionProcesses, $def.ExclusionExtensions) }
+			$threats = @(Get-SectionRows 'DefenderThreats')
+			if ($threats.Count -gt 0) { & $add 'Medium' 'Security' ('{0} Defender threat detections on record' -f $threats.Count) (($threats | Select-Object -First 5 | ForEach-Object { $_.Threat }) -join '; ') }
+
+			foreach ($f in (Get-SectionRows 'FirewallProfiles')) { if ($f.Enabled -eq 'False') { & $add 'Medium' 'Security' ('Windows Firewall {0} profile is disabled' -f $f.Profile) '' } }
+			$smb = Get-SectionRows 'SmbServerConfig' | Select-Object -First 1
+			if ($smb -and $smb.SMB1Enabled) { & $add 'High' 'Security' 'SMBv1 server protocol is enabled' 'Disable after confirming no legacy devices (old copiers/NAS) depend on it' }
+			$sec = Get-SectionRows 'SecuritySettings' | Select-Object -First 1
+			if ($sec) {
+				if ([string]$sec.AutoAdminLogon -eq '1') { & $add 'High' 'Security' 'Automatic logon (AutoAdminLogon) is enabled' '' }
+				if ($sec.DefaultPasswordStoredInRegistry) { & $add 'High' 'Security' 'A plain-text DefaultPassword is stored in the Winlogon registry key' 'Value not collected' }
+				if ([string]$sec.WDigestUseLogonCredential -eq '1') { & $add 'High' 'Security' 'WDigest stores logon credentials in memory' 'UseLogonCredential=1' }
+				if ($sec.RdpEnabled -and [string]$sec.RdpNLA -ne '1') { & $add 'Medium' 'Security' 'RDP is enabled without Network Level Authentication' '' }
+				if ($null -ne $sec.LmCompatibilityLevel -and [int]$sec.LmCompatibilityLevel -lt 3) { & $add 'Medium' 'Security' ('LmCompatibilityLevel is {0} (LM/NTLMv1 allowed)' -f $sec.LmCompatibilityLevel) '' }
+				if ([string]$sec.EnableLUA -eq '0') { & $add 'Medium' 'Security' 'UAC is disabled (EnableLUA=0)' '' }
+				if (-not $sec.LlmnrDisabledByPolicy) { & $add 'Low' 'Security' 'LLMNR is not disabled by policy' '' }
+				if ($computerSystem.PartOfDomain -and $sec.LapsPolicy -eq 'None found') { & $add 'Low' 'Security' 'No LAPS policy applied to this server' '' }
+			}
+			$publicRdp = @(Get-SectionRows 'RdpConnections' | Where-Object { $_.PublicIp })
+			if ($publicRdp.Count -gt 0) { & $add 'High' 'Security' 'RDP logons from public IP addresses (RDP may be exposed to the internet)' (($publicRdp | Select-Object -First 10 | ForEach-Object { '{0} from {1}' -f $_.User, $_.Ip }) -join '; ') }
+			$publicFail = @(Get-SectionRows 'FailedLogons' | Where-Object { $_.PublicIp })
+			if ($publicFail.Count -gt 0) { & $add 'High' 'Security' 'Failed logons from public IP addresses' ('{0} user/IP combinations, {1} attempts' -f $publicFail.Count, ($publicFail | Measure-Object Count -Sum).Sum) }
+			if (@(Get-SectionRows 'AccountChanges' | Where-Object { $_.EventId -eq 1102 }).Count -gt 0) { & $add 'Medium' 'Security' 'Security event log was cleared (event 1102)' '' }
+			foreach ($c in (Get-SectionRows 'Certificates')) {
+				if ($c.HasPrivateKey -and $c.DaysLeft -lt 30 -and $c.Issuer -ne $c.Subject) { & $add $(if ($c.DaysLeft -lt 0) { 'Medium' } else { 'Low' }) 'Certificates' ('Certificate expires in {0} days' -f $c.DaysLeft) $c.Subject }
+			}
+			$svcAccts = @(Get-SectionRows 'Services' | Where-Object { $_.RunAs -and $_.RunAs -notmatch '^(LocalSystem|NT AUTHORITY\\|NT SERVICE\\|\.\\LocalSystem)' -and $_.RunAs -notmatch '^(LocalService|NetworkService)$|\$$' })
+			if ($svcAccts.Count -gt 0) { & $add 'Low' 'Accounts' 'Services run under named accounts (password changes will break them)' (($svcAccts | ForEach-Object { '{0} as {1}' -f $_.Name, $_.RunAs }) -join '; ') }
+			$taskAccts = @(Get-SectionRows 'ScheduledTasks' | Where-Object { $_.LogonType -eq 'Password' })
+			if ($taskAccts.Count -gt 0) { & $add 'Low' 'Accounts' 'Scheduled tasks store account passwords' (($taskAccts | ForEach-Object { '{0} as {1}' -f $_.TaskName, $_.RunAs }) -join '; ') }
+
+			$remote = @($notable | Where-Object { $_.Category -eq 'RemoteAccess' -and $_.Source -eq 'Software' } | ForEach-Object { $_.Name } | Sort-Object -Unique)
+			if ($remote.Count -gt 0) { & $add 'Info' 'Onboarding' 'Remote access / RMM tools present (remove the previous provider''s tools)' ($remote -join '; ') }
+
+			$backupSw = @($notable | Where-Object { $_.Category -eq 'Backup' })
+			$wsb = Get-SectionRows 'WindowsServerBackup' | Select-Object -First 1
+			$wsbOk = ($wsb -and $wsb.LastSuccessfulBackup -and ($now - [datetime]$wsb.LastSuccessfulBackup).TotalDays -le 2)
+			if ($backupSw.Count -eq 0 -and -not $wsbOk) { & $add 'High' 'Backup' 'No backup software or recent Windows Server Backup detected' 'Cloud sync tools (OneDrive, Dropbox) are not backups' }
+			if ($wsb -and $wsb.LastSuccessfulBackup -and -not $wsbOk) { & $add 'Medium' 'Backup' 'Windows Server Backup last succeeded more than 2 days ago' ([string]$wsb.LastSuccessfulBackup) }
+			if (@(Get-SectionRows 'ShadowCopies').Count -eq 0) { & $add 'Low' 'Backup' 'No shadow copies (Previous Versions) on any volume' '' }
+			foreach ($w in (Get-SectionRows 'VssWriters')) { if ($w.State -notmatch 'Stable' -or $w.LastError -notmatch 'No error') { & $add 'Medium' 'Backup' ('VSS writer {0} is {1}' -f $w.Name, $w.State) $w.LastError } }
+			foreach ($db in (Get-SectionRows 'SqlDatabases')) {
+				if (-not $db.State -or $db.Database -eq 'tempdb') { continue }
+				if (-not $db.LastFull -or ($now - [datetime]$db.LastFull).TotalDays -gt 7) { & $add 'High' 'SQL' ('{0}\{1} has no full backup in 7 days' -f $db.Instance, $db.Database) ('Last full: {0}' -f $db.LastFull) }
+				if ($db.Recovery -eq 'FULL' -and (-not $db.LastLog -or ($now - [datetime]$db.LastLog).TotalDays -gt 2)) { & $add 'Medium' 'SQL' ('{0}\{1} is in FULL recovery without recent log backups (log growth)' -f $db.Instance, $db.Database) ('Log size {0} MB' -f $db.LogMB) }
+				if ($db.Edition -match 'Express' -and $db.DataMB -gt 8192) { & $add 'Medium' 'SQL' ('{0}\{1} is near the SQL Express 10 GB data limit' -f $db.Instance, $db.Database) ('{0} MB' -f $db.DataMB) }
+			}
+			foreach ($q in (Get-SectionRows 'SqlDatabases' | Where-Object { -not $_.State })) { & $add 'Info' 'SQL' ('Could not query SQL instance {0}' -f $q.Instance) $q.Database }
+
+			$pending = @(Get-SectionRows 'PendingUpdates')
+			if ($pending.Count -gt 0) { & $add 'Medium' 'Patching' ('{0} updates pending' -f $pending.Count) (($pending | Select-Object -First 5 | ForEach-Object { $_.Title }) -join '; ') }
+			$hf = Get-SectionRows 'Hotfixes' | Where-Object { $_.InstalledOn } | Sort-Object { [datetime]$_.InstalledOn } -Descending | Select-Object -First 1
+			if ($hf -and ($now - [datetime]$hf.InstalledOn).TotalDays -gt 60) { & $add 'Medium' 'Patching' ('Last update installed {0} days ago' -f [int]($now - [datetime]$hf.InstalledOn).TotalDays) $hf.HotFixID }
+			$wup = Get-SectionRows 'WindowsUpdatePolicy' | Select-Object -First 1
+			if ($wup -and $wup.WSUSServer) { & $add 'Info' 'Patching' 'Updates are pointed at a WSUS server' $wup.WSUSServer }
+			if ($wup -and [string]$wup.NoAutoUpdate -eq '1') { & $add 'Medium' 'Patching' 'Automatic updates are disabled by policy' '' }
+
+			foreach ($s in (Get-SectionRows 'DhcpScopes')) { if ($s.PercentInUse -gt 90) { & $add 'Medium' 'Network' ('DHCP scope {0} is {1}% used' -f $s.ScopeId, [int]$s.PercentInUse) ('{0} free' -f $s.Free) } }
+			foreach ($vm in (Get-SectionRows 'HyperVVMs')) { if ($vm.Checkpoints -gt 0) { & $add 'Medium' 'Hyper-V' ('VM {0} has {1} checkpoint(s)' -f $vm.Name, $vm.Checkpoints) 'Old checkpoints grow differencing disks and hurt performance' } }
+			$legacy = @(Get-SectionRows 'LanHosts' | Where-Object { $_.OpenPorts -match '(^|,)(21|23)(,|$)' })
+			if ($legacy.Count -gt 0) { & $add 'Low' 'Network' 'LAN devices with Telnet or FTP open' (($legacy | ForEach-Object { '{0} ({1})' -f $_.IP, $_.LikelyType }) -join '; ') }
+
+			if ($adInfo) {
+				$users = Get-SectionRows 'ADUsers' | Where-Object { $_.Enabled }
+				$da = @(Get-SectionRows 'ADPrivilegedUsers' | Where-Object { $_.Group -eq 'Domain Admins' -and $_.Enabled })
+				if ($da.Count -gt 5) { & $add 'Medium' 'AD' ('{0} enabled Domain Admins' -f $da.Count) (($da | ForEach-Object { $_.Account }) -join ', ') }
+				$pne = @($users | Where-Object { $_.PasswordNeverExpires })
+				if ($pne.Count -gt 0) { & $add 'Low' 'AD' ('{0} enabled users with password never expires' -f $pne.Count) (($pne | Select-Object -First 25 | ForEach-Object { $_.Account }) -join ', ') }
+				$pnr = @($users | Where-Object { $_.PasswordNotRequired })
+				if ($pnr.Count -gt 0) { & $add 'Medium' 'AD' ('{0} enabled users flagged password-not-required' -f $pnr.Count) (($pnr | ForEach-Object { $_.Account }) -join ', ') }
+				$staleU = @($users | Where-Object { $null -eq $_.DaysSinceLogon -or $_.DaysSinceLogon -gt 90 })
+				if ($staleU.Count -gt 0) { & $add 'Low' 'AD' ('{0} enabled users with no logon in 90 days' -f $staleU.Count) (($staleU | Select-Object -First 25 | ForEach-Object { $_.Account }) -join ', ') }
+				$staleC = @(Get-SectionRows 'ADComputers' | Where-Object { $_.Enabled -and ($null -eq $_.DaysSinceLogon -or $_.DaysSinceLogon -gt 90) })
+				if ($staleC.Count -gt 0) { & $add 'Low' 'AD' ('{0} enabled computers with no logon in 90 days' -f $staleC.Count) (($staleC | Select-Object -First 25 | ForEach-Object { $_.Name }) -join ', ') }
+				$oldOs = @(Get-SectionRows 'ADComputers' | Where-Object { $_.Enabled -and $null -ne $_.DaysSinceLogon -and $_.DaysSinceLogon -le 90 -and $_.OS -match 'Windows (XP|Vista|7|8|2000|Server 2003|Server 2008|Server 2012)' })
+				if ($oldOs.Count -gt 0) { & $add 'High' 'AD' ('{0} active computers on unsupported Windows versions' -f $oldOs.Count) (($oldOs | ForEach-Object { '{0} ({1})' -f $_.Name, $_.OS }) -join '; ') }
+				$addom = Get-SectionRows 'ADDomain' | Select-Object -First 1
+				if ($addom) {
+					if ($addom.RecycleBinEnabled -eq $false) { & $add 'Low' 'AD' 'AD Recycle Bin is not enabled' '' }
+					if ($null -ne $addom.MachineAccountQuota -and [int]$addom.MachineAccountQuota -gt 0) { & $add 'Low' 'AD' ('ms-DS-MachineAccountQuota is {0} (any user can join computers)' -f $addom.MachineAccountQuota) '' }
+					if ($null -ne $addom.MinPasswordLength -and [int]$addom.MinPasswordLength -lt 12) { & $add 'Medium' 'AD' ('Domain minimum password length is {0}' -f $addom.MinPasswordLength) '' }
+					if ([string]$addom.LockoutThreshold -eq '0') { & $add 'Medium' 'AD' 'No account lockout threshold' '' }
+				}
+			}
+
+			foreach ($d in $PublicDomain) {
+				$recs = @(Get-SectionRows 'PublicDns' | Where-Object { $_.Domain -eq $d })
+				if (-not ($recs | Where-Object { $_.Query -eq $d -and $_.Type -eq 'TXT' -and $_.Value -match '^v=spf1' })) { & $add 'Medium' 'Email' ('{0} has no SPF record' -f $d) '' }
+				$dmarc = $recs | Where-Object { $_.Query -like '_dmarc.*' -and $_.Value -match '^v=DMARC1' } | Select-Object -First 1
+				if (-not $dmarc) { & $add 'Medium' 'Email' ('{0} has no DMARC record' -f $d) '' }
+				elseif ($dmarc.Value -match 'p=none') { & $add 'Low' 'Email' ('{0} DMARC policy is p=none (monitor only)' -f $d) $dmarc.Value }
+			}
+
+			$order = @{ High = 0; Medium = 1; Low = 2; Info = 3 }
+			$list | Sort-Object { $order[$_.Severity] }, Area
+		}
+
+		# ------------------------------------------------------------ write results
+		Write-Host 'Writing summary and JSON...' -ForegroundColor Cyan
+		$sys = Get-SectionRows 'System' | Select-Object -First 1
+		$findings = Get-SectionRows 'Findings'
+		$lines = New-Object System.Collections.ArrayList
+		[void]$lines.Add('CLIENT DISCOVERY SUMMARY')
+		[void]$lines.Add(('Run: {0} by {1}\{2}' -f $started.ToString('yyyy-MM-dd HH:mm'), $env:USERDOMAIN, $env:USERNAME))
+		if ($sys) {
+			[void]$lines.Add(('Host: {0}  Domain/Workgroup: {1}  Joined: {2}' -f $sys.ComputerName, $sys.DomainOrWorkgroup, $sys.PartOfDomain))
+			[void]$lines.Add(('OS: {0} ({1}) build {2}.{3}  Uptime: {4} days' -f $sys.OSCaption, $sys.OSVersion, $sys.BuildNumber, $sys.UBR, $sys.UptimeDays))
+			[void]$lines.Add(('Hardware: {0} {1}  Serial: {2}  Virtual: {3}' -f $sys.Manufacturer, $sys.Model, $sys.SerialNumber, $sys.LooksVirtual))
+			[void]$lines.Add(('CPU: {0}  Cores: {1}  RAM: {2} GB' -f $sys.CpuName, $sys.CpuCores, $sys.RamGB))
+		}
+		foreach ($n in (Get-SectionRows 'NetConfig')) { [void]$lines.Add(('NIC: {0}  IP {1}  Mask {2}  GW {3}  DNS {4}  DHCP {5}' -f $n.Adapter, $n.IPAddress, $n.SubnetMask, $n.DefaultGateway, $n.DnsServers, $n.DhcpServer)) }
+		$pub = Get-SectionRows 'PublicIP' | Select-Object -First 1
+		if ($pub) { [void]$lines.Add(('Public IP: {0}  Org: {1}  Reverse DNS: {2}' -f $pub.Ip, $pub.Org, $pub.ReverseDns)) }
+		foreach ($v in (Get-SectionRows 'Volumes')) { [void]$lines.Add(('Volume {0} {1}: {2} GB, {3} GB free' -f $v.Drive, $v.Label, $v.SizeGB, $v.FreeGB)) }
+		foreach ($s in $userShares) { [void]$lines.Add(('Share: {0} -> {1}' -f $s.Name, $s.Path)) }
+		$addom = Get-SectionRows 'ADDomain' | Select-Object -First 1
+		if ($addom -and $addom.Domain) { [void]$lines.Add(('AD: {0} ({1})  Users: {2}  Computers: {3}  DCs: {4}' -f $addom.Domain, $addom.DomainMode, @(Get-SectionRows 'ADUsers').Count, @(Get-SectionRows 'ADComputers').Count, $addom.DomainControllers)) }
+		foreach ($vm in (Get-SectionRows 'HyperVVMs')) { [void]$lines.Add(('VM: {0}  {1}  {2} vCPU  {3} GB' -f $vm.Name, $vm.State, $vm.vCPU, $vm.MemoryStartupGB)) }
+		[void]$lines.Add(('Installed software entries: {0}' -f @(Get-SectionRows 'InstalledSoftware').Count))
+		foreach ($x in (Get-SectionRows 'NotableSoftware')) { if ($x.Source -eq 'Software') { [void]$lines.Add(('  [{0}] {1} {2}' -f $x.Category, $x.Name, $x.Version)) } }
+		foreach ($i in (Get-SectionRows 'SqlInstances')) { [void]$lines.Add(('SQL instance: {0}  {1}  {2}' -f $i.Instance, $i.Edition, $i.Version)) }
+		[void]$lines.Add(('LAN hosts found: {0}' -f @(Get-SectionRows 'LanHosts' | Where-Object { $_.IP }).Count))
+		[void]$lines.Add('')
+		[void]$lines.Add(('FINDINGS: {0} High, {1} Medium, {2} Low, {3} Info' -f @($findings | Where-Object { $_.Severity -eq 'High' }).Count, @($findings | Where-Object { $_.Severity -eq 'Medium' }).Count, @($findings | Where-Object { $_.Severity -eq 'Low' }).Count, @($findings | Where-Object { $_.Severity -eq 'Info' }).Count))
+		foreach ($f in $findings) {
+			$line = '  [{0}] {1}: {2}' -f $f.Severity, $f.Area, $f.Finding
+			if ($f.Detail) { $line += (' -- {0}' -f $f.Detail) }
+			[void]$lines.Add($line)
+		}
+		[void]$lines.Add('')
+		[void]$lines.Add(('Sections with errors: {0}' -f $errors.Count))
+		foreach ($e in $errors) { [void]$lines.Add(('  {0}' -f $e)) }
+		$lines | Set-Content -Path (Join-Path $outDir 'summary.txt') -Encoding UTF8
+		if ($errors.Count -gt 0) { $errors | Set-Content -Path (Join-Path $outDir 'errors.txt') -Encoding UTF8 }
+
+		try {
+			$json = $result | ConvertTo-Json -Depth 6
+			$json = [regex]::Replace($json, '\\/Date\((-?\d+)([+-]\d{4})?\)\\/', [System.Text.RegularExpressions.MatchEvaluator] {
+					param($m)
+					([datetime]::SpecifyKind([datetime]'1970-01-01', [DateTimeKind]::Utc)).AddMilliseconds([double]$m.Groups[1].Value).ToString('s') + 'Z'
+				})
+			Set-Content -Path (Join-Path $outDir 'discovery.json') -Value $json -Encoding UTF8
+		} catch {
+			Write-Host ('JSON export failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+		}
+
+		foreach ($f in ($findings | Where-Object { $_.Severity -eq 'High' })) { Write-Host ('  [High] {0}: {1}' -f $f.Area, $f.Finding) -ForegroundColor Red }
+	} finally {
+		if ($transcriptOn) {
+			try { Stop-Transcript | Out-Null } catch { Write-Verbose 'Transcript stop failed' }
+		}
+	}
+
+	$zip = Join-Path $OutputRoot ('{0}.zip' -f (Split-Path $outDir -Leaf))
+	try {
+		Compress-Archive -Path (Join-Path $outDir '*') -DestinationPath $zip -Force -ErrorAction Stop
+		Protect-DiscoveryPath -Path $zip
+		Write-Host ('DONE. Send this file: {0}' -f $zip) -ForegroundColor Green
+	} catch {
+		Write-Host ('Zip failed ({0}). Send the folder: {1}' -f $_.Exception.Message, $outDir) -ForegroundColor Yellow
+		$zip = $null
+	}
+	Write-Host 'The output contains account names, group memberships, share names, computer names, and IP/MAC addresses.' -ForegroundColor Yellow
+	Write-Host ('Delete both {0} and the zip from the server after delivery.' -f $outDir) -ForegroundColor Yellow
+
+	Write-Output ([pscustomobject]@{
+			OutputFolder = $outDir
+			ZipFile = $zip
+			Findings = @(Get-SectionRows 'Findings')
+			Errors = @($errors)
+		})
+}
+
 function Get-ComputerEntraStatus {
 	# Capture the command output as an array of strings
 	# The @() ensures we always get an array, even if there's only one line

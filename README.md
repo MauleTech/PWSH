@@ -105,6 +105,7 @@ Enable-SSL #Enables SSL Permanently
   Get-ADStaleUsers
   Get-ADUserPassExpirations
   Get-BitLockerKey
+  Get-ClientDiscovery
   Get-ComputerEntraStatus
   Get-DellWarranty
   Get-DiskUsage

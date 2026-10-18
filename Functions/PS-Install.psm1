@@ -1450,129 +1450,249 @@ Function Install-UmbrellaDnsCert {
 
 Function Install-WinGet {
 	<#
-		.SYNOPSIS
-			Installs winget, Microsoft's answer to apt-get and choco.
-		.LINK
-			https://github.com/microsoft/winget-cli
-		.LINK
-			https://docs.microsoft.com/en-us/windows/package-manager/winget/
+	.SYNOPSIS
+		Installs or updates winget (App Installer) and the framework packages it depends on.
+	.DESCRIPTION
+		Looks up the latest winget-cli release on GitHub and reads its
+		DesktopAppInstaller_Dependencies.json to learn which framework packages that
+		release requires (as of v1.29: Microsoft.VCLibs.140.00,
+		Microsoft.VCLibs.140.00.UWPDesktop and Microsoft.WindowsAppRuntime.1.8).
+		Any dependency that is missing or older than required is installed from the
+		release's DesktopAppInstaller_Dependencies.zip for the native OS architecture,
+		then the App Installer msixbundle is installed.
+		When run elevated, App Installer is also provisioned for all users with the
+		release's license file. This is required on Windows Server and LTSC, where
+		there is no Store license and winget otherwise fails with
+		"No applicable app licenses found".
+		App Installer is a per-user AppX package, so this must run as the logged-on
+		desktop user. It cannot run as SYSTEM.
+	.PARAMETER Force
+		Reinstall the latest winget even if the installed version is already current.
+	.EXAMPLE
+		Install-WinGet
+		Installs winget if missing, or updates it if older than the latest GitHub release.
+	.EXAMPLE
+		Install-WinGet -Force -Verbose
+		Reinstalls the latest winget and any missing dependencies with detailed logging.
+	.LINK
+		https://github.com/microsoft/winget-cli
+	.LINK
+		https://learn.microsoft.com/en-us/windows/package-manager/winget/
 	#>
-	
-		$GetWinGet = {
-			$url = 'https://github.com/microsoft/winget-cli/releases/latest'
-			$request = [System.Net.WebRequest]::Create($url)
-			$response = $request.GetResponse()
-			$realTagUrl = $response.ResponseUri.OriginalString
-			$version = $realTagUrl.split('/')[-1].Trim('v')
-			#$version
-			$fileName = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
-			$realDownloadUrl = $realTagUrl.Replace('tag', 'download') + '/' + $fileName
-			Write-Host "Installing the latest version of winget from:`n $realDownloadUrl"
-			$DownloadLocation = $($env:temp)
-			Write-Host "Downloading Desktop App Installer"
-			If (-not (Get-Command -Name "Get-FileDownload" -ErrorAction SilentlyContinue)) {irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex}
-			$DownloadFileInfo = Get-FileDownload -URL $realDownloadUrl -SaveToFolder $($env:temp)
-			$DownloadFilePath = $DownloadFileInfo[-1]
-			Add-AppxPackage -Path $DownloadFilePath -ForceApplicationShutdown -InstallAllResources -Verbose
-			#& $($Env:LOCALAPPDATA + "\Microsoft\WindowsApps\winget.exe") source reset w
-			#& $($Env:LOCALAPPDATA + "\Microsoft\WindowsApps\winget.exe") source add --name winget --arg https://winget.azureedge.net/cache --type Microsoft.PreIndexed.Package
-			Remove-Item -Path $DownloadFilePath -Force -ErrorAction SilentlyContinue
-		}
-	
-		$GetWinGetDependancies = {
-			Write-Host "Checking Dependancies"
-			## C++ Runtime framework packages for Desktop Bridge - https://docs.microsoft.com/en-us/troubleshoot/cpp/c-runtime-packages-desktop-bridge#how-to-install-and-update-desktop-framework-packages
-			## x86 version
-			$Installed_X86_VCLibs = Get-AppxPackage | Where-Object {$_.Name -Match "Microsoft.VCLibs.140.00.UWPDesktop" -and $_.Architecture -Match "X86"}
-			If (-not ($Installed_X86_VCLibs)) {
-				$DownloadURL = 'https://aka.ms/Microsoft.VCLibs.x86.14.00.Desktop.appx'
-				$DownloadLocation = "$env:TEMP\"
-				$LocalFilePath = Join-Path -Path $DownloadLocation -ChildPath "Microsoft.VCLibs.x86.14.00.Desktop.appx"
-				If (Test-Path $LocalFilePath) {Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue}
-				Write-Host "Downloading $DownloadURL"
-				$progressPreference = 'silentlyContinue'
-				Invoke-WebRequest -Uri $DownloadURL -OutFile $LocalFilePath
-				If ($PSVersionTable.PSEdition -eq "Core") {Import-module "Appx" -UseWindowsPowerShell}
-				Write-Host "Installing $LocalFilePath"
-				Add-AppxPackage -Path $LocalFilePath -ForceApplicationShutdown -InstallAllResources -Verbose
-				Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue
-			}
-			## x64 version
-			If ([Environment]::Is64BitOperatingSystem){
-				$Installed_X64_VCLibs = Get-AppxPackage | Where-Object {$_.Name -Match "Microsoft.VCLibs.140.00.UWPDesktop" -and $_.Architecture -Match "X64"}
-				If (-not ($Installed_X64_VCLibs)) {
-					$DownloadURL = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
-					$DownloadLocation = "$env:TEMP\"
-					$LocalFilePath = Join-Path -Path $DownloadLocation -ChildPath "Microsoft.VCLibs.x64.14.00.Desktop.appx"
-					If (Test-Path $LocalFilePath) {Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue}
-					Write-Host "Downloading $DownloadURL"
-					$progressPreference = 'silentlyContinue'
-					Invoke-WebRequest -Uri $DownloadURL -OutFile $LocalFilePath
-					If ($PSVersionTable.PSEdition -eq "Core") {Import-module "Appx" -UseWindowsPowerShell}
-					Write-Host "Installing $LocalFilePath"
-					Add-AppxPackage -Path $LocalFilePath -ForceApplicationShutdown -InstallAllResources -Verbose
-					Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue
-				}
-			}
-			#Microsoft.UI.Xaml
-			$Providers = (Get-PackageProvider).Name
-			If ($Providers -NotContains "Nuget") {
-				Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force -ErrorAction SilentlyContinue
-			}
-						# Check if running in the desktop version of PowerShell
-			if ($PSVersionTable.PSEdition -eq "Desktop" -and (Get-Command -Name "Register-PackageSource" -ErrorAction SilentlyContinue)) {
-				Register-PackageSource -Name nuget.org -Location https://www.nuget.org/api/v2 -ProviderName NuGet -Trusted -Force
-				Write-Host "Registered nuget.org package source for desktop PowerShell."
-			} elseif ($PSVersionTable.PSEdition -eq "Core" -and (Get-Command -Name "Register-PackageSource" -ErrorAction SilentlyContinue)) {
-				Register-PackageSource -Name nuget.org -Location https://api.nuget.org/v3/index.json -ProviderName NuGet -Trusted -Force
-				Write-Host "Registered nuget.org package source for PowerShell Core."
-			} else {
-				Write-Host "Register-PackageSource cmdlet not found. Ensure you are running this script in a compatible PowerShell environment."
-			}
+	[CmdletBinding()]
+	Param(
+		[switch]$Force
+	)
 
-			Install-Package -Name 'Microsoft.UI.Xaml' -ProviderName Nuget -Force
+	Function Resolve-WinGetExe {
+		Param([string]$WindowsApps)
+		$Path = Join-Path -Path $WindowsApps -ChildPath 'winget.exe'
+		If (Test-Path -Path $Path) { Return $Path }
+		(Get-Command -Name winget -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+	}
+
+	Function Get-InstalledWinGetVersion {
+		Param([string]$WinGetExe)
+		If (-not $WinGetExe) { Return }
+		Try {
+			$Output = & $WinGetExe --version 2>$null
+			If ("$Output" -match '(\d+\.\d+\.\d+)') { [version]$Matches[1] }
+		} Catch {
+			Write-Verbose "Unable to run winget: $($_.Exception.Message)"
 		}
-	
-		If ($(whoami) -eq "nt authority\system") {
-			Write-Error "Due to the AppX nature of Winget, you cannot run this as the system user"
-		} ElseIf (!(Get-process -Name Explorer -IncludeUserName | Where-Object -Property UserName -EQ $(whoami))){
-			Write-Error "Due to the AppX nature of Winget, you cannot install WinGet when running the command as a user that is not logged in"
+	}
+
+	Function Save-WinGetAsset {
+		Param([string]$Url, [string]$Folder)
+		$FileName = $Url.Split('/')[-1]
+		$Path = Join-Path -Path $Folder -ChildPath $FileName
+		Write-Host "Downloading $Url"
+		If (Get-Command -Name Get-FileDownload -ErrorAction SilentlyContinue) {
+			$null = Get-FileDownload -URL $Url -SaveToFolder $Folder -FileName $FileName
 		} Else {
-	# Install WinGet
-		If (Get-Command winget -ErrorAction SilentlyContinue) {
-			Write-Host "WinGet is already installed."
-			$WGVersion = winget -v
-			
-			$url = 'https://github.com/microsoft/winget-cli/releases/latest'
-			$request = [System.Net.WebRequest]::Create($url)
-			$response = $request.GetResponse()
-			$realTagUrl = $response.ResponseUri.OriginalString
-			$WGLatestLink = $realTagUrl.split('/')[-1].Trim('v')
-			
-			If ($WGVersion -match $WGLatestLink) {
-				Write-Host "The installed version $WGVersion is up to date."
-				winget source update
+			Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -ErrorAction Stop
+		}
+		If (-not (Test-Path -Path $Path)) { Throw "Download failed: $Url" }
+		$Path
+	}
+
+	Function Get-WinGetLicenseUrl {
+		Param([string]$ReleaseUrl, [string]$Tag)
+		# The license file name contains a GUID that changes every release, so look it up
+		Try {
+			$Release = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/winget-cli/releases/tags/$Tag" -UseBasicParsing -ErrorAction Stop
+			$Name = ($Release.assets | Where-Object { $_.name -match '^[0-9a-fA-F]{32}_License1\.xml$' } | Select-Object -First 1).name
+		} Catch {
+			Write-Verbose "GitHub API lookup of the license file failed: $($_.Exception.Message)"
+		}
+		If (-not $Name) {
+			Try {
+				$Html = (Invoke-WebRequest -Uri "https://github.com/microsoft/winget-cli/releases/expanded_assets/$Tag" -UseBasicParsing -ErrorAction Stop).Content
+				If ($Html -match '([0-9a-fA-F]{32}_License1\.xml)') { $Name = $Matches[1] }
+			} Catch {
+				Write-Verbose "GitHub release page lookup of the license file failed: $($_.Exception.Message)"
+			}
+		}
+		If ($Name) { "$ReleaseUrl/$Name" }
+	}
+
+	# App Installer is a per-user AppX package, so it must be registered by the logged-on desktop user
+	$Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+	If ($Identity.User.Value -eq 'S-1-5-18') {
+		Write-Error "Due to the AppX nature of WinGet, you cannot install it as the SYSTEM user. Run this as the logged-on user."
+		Return
+	}
+	# GetOwnerSid does not need elevation for the caller's own processes (Get-Process -IncludeUserName does)
+	$ExplorerOwnerSids = ForEach ($Explorer in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue)) {
+		$Owner = Invoke-CimMethod -InputObject $Explorer -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+		If ($Owner.ReturnValue -eq 0) { $Owner.Sid }
+	}
+	If (@($ExplorerOwnerSids) -notcontains $Identity.User.Value) {
+		Write-Error "Due to the AppX nature of WinGet, you cannot install it as a user ($($Identity.Name)) that is not logged in to the desktop."
+		Return
+	}
+
+	If ([Environment]::OSVersion.Version.Build -lt 17763) {
+		Write-Error "WinGet requires Windows 10 1809 (build 17763) or later."
+		Return
+	}
+
+	# Use the native OS architecture; $env:PROCESSOR_ARCHITECTURE reports AMD64 inside x64 emulation on ARM64
+	$NativeArch = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
+	$Arch = Switch ($NativeArch) { 'AMD64' {'x64'} 'ARM64' {'arm64'} 'x86' {'x86'} Default {$null} }
+	If (-not $Arch) {
+		Write-Error "Unsupported processor architecture: $NativeArch"
+		Return
+	}
+
+	$IsAdmin = ([System.Security.Principal.WindowsPrincipal]$Identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+
+	If ($PSVersionTable.PSEdition -eq 'Core') {
+		# The Appx module fails to load natively in some PowerShell 7 releases; use the Windows PowerShell compatibility session
+		Import-Module -Name Appx -UseWindowsPowerShell -WarningAction SilentlyContinue
+		If ($IsAdmin) { Import-Module -Name Dism -UseWindowsPowerShell -WarningAction SilentlyContinue }
+	}
+
+	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+
+	Write-Host -ForegroundColor Cyan "Checking the latest WinGet release on GitHub"
+	Try {
+		$Request = [System.Net.WebRequest]::Create('https://github.com/microsoft/winget-cli/releases/latest')
+		$Response = $Request.GetResponse()
+		Try { $Tag = $Response.ResponseUri.Segments[-1] } Finally { $Response.Dispose() }
+	} Catch {
+		Write-Error "Unable to determine the latest WinGet release: $($_.Exception.Message)"
+		Return
+	}
+	If ($Tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+		Write-Error "Unexpected WinGet release tag: $Tag"
+		Return
+	}
+	$LatestVersion = [version]$Matches[1]
+	$ReleaseUrl = "https://github.com/microsoft/winget-cli/releases/download/$Tag"
+
+	$WindowsApps = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Microsoft\WindowsApps'
+	$WinGetExe = Resolve-WinGetExe -WindowsApps $WindowsApps
+	$InstalledVersion = Get-InstalledWinGetVersion -WinGetExe $WinGetExe
+
+	If ($InstalledVersion -and $InstalledVersion -ge $LatestVersion -and -not $Force) {
+		Write-Host -ForegroundColor Green "WinGet $InstalledVersion is installed and up to date."
+		& $WinGetExe source update | Out-Host
+		Return
+	} ElseIf ($InstalledVersion) {
+		Write-Host -ForegroundColor Yellow "WinGet $InstalledVersion is installed. Installing $LatestVersion."
+	} Else {
+		Write-Host -ForegroundColor Yellow "WinGet is not installed. Installing $LatestVersion."
+	}
+
+	$TempFolder = Join-Path -Path $env:TEMP -ChildPath ('WinGetInstall_' + [guid]::NewGuid().ToString('N'))
+	$null = New-Item -Path $TempFolder -ItemType Directory -Force
+	$OldProgressPreference = $ProgressPreference
+	$ProgressPreference = 'SilentlyContinue'
+	Try {
+		# The release publishes the exact framework packages it needs, so read them instead of hardcoding
+		$DepJson = Save-WinGetAsset -Url "$ReleaseUrl/DesktopAppInstaller_Dependencies.json" -Folder $TempFolder
+		$Dependencies = @((Get-Content -Path $DepJson -Raw | ConvertFrom-Json).Dependencies)
+		If ($Dependencies.Count -eq 0) { Throw "DesktopAppInstaller_Dependencies.json did not list any dependencies." }
+
+		Write-Host -ForegroundColor Cyan "Checking dependencies for $Arch"
+		$Missing = @(ForEach ($Dep in $Dependencies) {
+			$Present = Get-AppxPackage -Name $Dep.Name | Where-Object { "$($_.Architecture)" -eq $Arch -and [version]"$($_.Version)" -ge [version]$Dep.Version }
+			If ($Present) {
+				Write-Verbose "$($Dep.Name) $($Dep.Version) ($Arch) is already installed."
 			} Else {
-				Write-Host "The installed version $WGVersion is out of date."
-				If ($PSVersionTable.PSEdition -eq "Core") {Powershell.exe -NonInteractive -Command '$GetWinGetDependancies;$GetWinGet'} Else {$GetWinGetDependancies | IEX ; $GetWinGet | IEX}
-				$WGVersion2 = winget -v
-				If ($WGVersion -notmatch $WGVersion2) {
-					Write-Host "Winget $WGVersion2 installed successfully"
-				} Else {
-					Write-Error "Winget did not install successfully"
+				Write-Host -ForegroundColor Yellow "Missing dependency: $($Dep.Name) $($Dep.Version) ($Arch)"
+				$Dep
+			}
+		})
+
+		$DepPaths = @()
+		If ($Missing.Count -gt 0) {
+			$DepZip = Save-WinGetAsset -Url "$ReleaseUrl/DesktopAppInstaller_Dependencies.zip" -Folder $TempFolder
+			Add-Type -AssemblyName System.IO.Compression.FileSystem
+			$Zip = [System.IO.Compression.ZipFile]::OpenRead($DepZip)
+			Try {
+				ForEach ($Dep in $Missing) {
+					$Entry = $Zip.Entries | Where-Object { $_.FullName -like "$Arch/$($Dep.Name)_*.appx" } | Select-Object -First 1
+					If (-not $Entry) { Throw "$($Dep.Name) for $Arch was not found in DesktopAppInstaller_Dependencies.zip" }
+					$AppxPath = Join-Path -Path $TempFolder -ChildPath $Entry.Name
+					[System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, $AppxPath, $true)
+					Write-Host "Installing $($Entry.Name)"
+					Add-AppxPackage -Path $AppxPath -ErrorAction Stop
+					$DepPaths += $AppxPath
 				}
-			}
-		} Else {
-			Write-Host "WinGet is not installed."
-			If ($PSVersionTable.PSEdition -eq "Core") {Powershell.exe -NonInteractive -Command $GetWinGetDependancies} Else {$GetWinGetDependancies | IEX}
-			If ($PSVersionTable.PSEdition -eq "Core") {Powershell.exe -NonInteractive -Command $GetWinGet} Else {$GetWinGet | IEX}
-			If (Get-Command winget -ErrorAction SilentlyContinue) {
-				$WGVersion = winget -v
-				Write-Host "Winget $WGVersion installed successfully"
-			} Else {
-				Write-Error "Winget did not install successfully"
+			} Finally {
+				$Zip.Dispose()
 			}
 		}
+
+		$Bundle = Save-WinGetAsset -Url "$ReleaseUrl/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -Folder $TempFolder
+
+		# Without a Store license (Windows Server, LTSC) winget fails with "No applicable app licenses found".
+		# Provisioning with the release's license file fixes that and makes winget available to all users.
+		If ($IsAdmin) {
+			$LicenseUrl = Get-WinGetLicenseUrl -ReleaseUrl $ReleaseUrl -Tag $Tag
+			If ($LicenseUrl) {
+				$License = Save-WinGetAsset -Url $LicenseUrl -Folder $TempFolder
+				Write-Host "Provisioning App Installer (WinGet $Tag) with its license for all users"
+				$ProvisionParams = @{ Online = $true; PackagePath = $Bundle; LicensePath = $License; ErrorAction = 'Stop' }
+				If ($DepPaths.Count -gt 0) { $ProvisionParams.DependencyPackagePath = $DepPaths }
+				Try {
+					$null = Add-AppxProvisionedPackage @ProvisionParams
+				} Catch {
+					Write-Host -ForegroundColor Yellow "Provisioning failed, continuing with a per-user install: $($_.Exception.Message)"
+				}
+			} Else {
+				Write-Host -ForegroundColor Yellow "Could not find the license file for $Tag. Continuing with a per-user install."
+			}
+		} Else {
+			Write-Verbose "Not elevated, so App Installer will not be provisioned with its license file."
+		}
+
+		Write-Host "Installing App Installer (WinGet $Tag) for $($Identity.Name)"
+		Add-AppxPackage -Path $Bundle -ForceApplicationShutdown -ErrorAction Stop
+	} Catch {
+		Write-Host -ForegroundColor Red "WinGet installation failed: $($_.Exception.Message)"
+		Write-Error $_
+		Return
+	} Finally {
+		$ProgressPreference = $OldProgressPreference
+		Remove-Item -Path $TempFolder -Recurse -Force -ErrorAction SilentlyContinue
+	}
+
+	# A first-time install may not have WindowsApps on this session's PATH yet
+	If (($env:Path -split ';') -notcontains $WindowsApps) { $env:Path = "$env:Path;$WindowsApps" }
+
+	$WinGetExe = Resolve-WinGetExe -WindowsApps $WindowsApps
+	$NewVersion = Get-InstalledWinGetVersion -WinGetExe $WinGetExe
+	If ($NewVersion -and $NewVersion -ge $LatestVersion) {
+		Write-Host -ForegroundColor Green "WinGet $NewVersion installed successfully."
+		& $WinGetExe source update | Out-Host
+	} Else {
+		If (-not $IsAdmin) {
+			Write-Host -ForegroundColor Yellow "If winget reports 'No applicable app licenses found' (common on Windows Server and LTSC), run Install-WinGet from an elevated PowerShell so it can provision the license."
+		}
+		Write-Error "WinGet did not install successfully. Detected version: $(If ($NewVersion) {$NewVersion} Else {'none'})"
 	}
 }
 

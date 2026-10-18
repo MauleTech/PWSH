@@ -1460,8 +1460,12 @@ Function Install-WinGet {
 		Any dependency that is missing or older than required is installed from the
 		release's DesktopAppInstaller_Dependencies.zip for the native OS architecture,
 		then the App Installer msixbundle is installed.
+		When run elevated, App Installer is also provisioned for all users with the
+		release's license file. This is required on Windows Server and LTSC, where
+		there is no Store license and winget otherwise fails with
+		"No applicable app licenses found".
 		App Installer is a per-user AppX package, so this must run as the logged-on
-		desktop user. It cannot run as SYSTEM. Administrator rights are not required.
+		desktop user. It cannot run as SYSTEM.
 	.PARAMETER Force
 		Reinstall the latest winget even if the installed version is already current.
 	.EXAMPLE
@@ -1512,6 +1516,26 @@ Function Install-WinGet {
 		$Path
 	}
 
+	Function Get-WinGetLicenseUrl {
+		Param([string]$ReleaseUrl, [string]$Tag)
+		# The license file name contains a GUID that changes every release, so look it up
+		Try {
+			$Release = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/winget-cli/releases/tags/$Tag" -UseBasicParsing -ErrorAction Stop
+			$Name = ($Release.assets | Where-Object { $_.name -match '^[0-9a-fA-F]{32}_License1\.xml$' } | Select-Object -First 1).name
+		} Catch {
+			Write-Verbose "GitHub API lookup of the license file failed: $($_.Exception.Message)"
+		}
+		If (-not $Name) {
+			Try {
+				$Html = (Invoke-WebRequest -Uri "https://github.com/microsoft/winget-cli/releases/expanded_assets/$Tag" -UseBasicParsing -ErrorAction Stop).Content
+				If ($Html -match '([0-9a-fA-F]{32}_License1\.xml)') { $Name = $Matches[1] }
+			} Catch {
+				Write-Verbose "GitHub release page lookup of the license file failed: $($_.Exception.Message)"
+			}
+		}
+		If ($Name) { "$ReleaseUrl/$Name" }
+	}
+
 	# App Installer is a per-user AppX package, so it must be registered by the logged-on desktop user
 	$Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 	If ($Identity.User.Value -eq 'S-1-5-18') {
@@ -1541,9 +1565,12 @@ Function Install-WinGet {
 		Return
 	}
 
+	$IsAdmin = ([System.Security.Principal.WindowsPrincipal]$Identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+
 	If ($PSVersionTable.PSEdition -eq 'Core') {
 		# The Appx module fails to load natively in some PowerShell 7 releases; use the Windows PowerShell compatibility session
 		Import-Module -Name Appx -UseWindowsPowerShell -WarningAction SilentlyContinue
+		If ($IsAdmin) { Import-Module -Name Dism -UseWindowsPowerShell -WarningAction SilentlyContinue }
 	}
 
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
@@ -1599,6 +1626,7 @@ Function Install-WinGet {
 			}
 		})
 
+		$DepPaths = @()
 		If ($Missing.Count -gt 0) {
 			$DepZip = Save-WinGetAsset -Url "$ReleaseUrl/DesktopAppInstaller_Dependencies.zip" -Folder $TempFolder
 			Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1611,6 +1639,7 @@ Function Install-WinGet {
 					[System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, $AppxPath, $true)
 					Write-Host "Installing $($Entry.Name)"
 					Add-AppxPackage -Path $AppxPath -ErrorAction Stop
+					$DepPaths += $AppxPath
 				}
 			} Finally {
 				$Zip.Dispose()
@@ -1618,7 +1647,29 @@ Function Install-WinGet {
 		}
 
 		$Bundle = Save-WinGetAsset -Url "$ReleaseUrl/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -Folder $TempFolder
-		Write-Host "Installing App Installer (WinGet $Tag)"
+
+		# Without a Store license (Windows Server, LTSC) winget fails with "No applicable app licenses found".
+		# Provisioning with the release's license file fixes that and makes winget available to all users.
+		If ($IsAdmin) {
+			$LicenseUrl = Get-WinGetLicenseUrl -ReleaseUrl $ReleaseUrl -Tag $Tag
+			If ($LicenseUrl) {
+				$License = Save-WinGetAsset -Url $LicenseUrl -Folder $TempFolder
+				Write-Host "Provisioning App Installer (WinGet $Tag) with its license for all users"
+				$ProvisionParams = @{ Online = $true; PackagePath = $Bundle; LicensePath = $License; ErrorAction = 'Stop' }
+				If ($DepPaths.Count -gt 0) { $ProvisionParams.DependencyPackagePath = $DepPaths }
+				Try {
+					$null = Add-AppxProvisionedPackage @ProvisionParams
+				} Catch {
+					Write-Host -ForegroundColor Yellow "Provisioning failed, continuing with a per-user install: $($_.Exception.Message)"
+				}
+			} Else {
+				Write-Host -ForegroundColor Yellow "Could not find the license file for $Tag. Continuing with a per-user install."
+			}
+		} Else {
+			Write-Verbose "Not elevated, so App Installer will not be provisioned with its license file."
+		}
+
+		Write-Host "Installing App Installer (WinGet $Tag) for $($Identity.Name)"
 		Add-AppxPackage -Path $Bundle -ForceApplicationShutdown -ErrorAction Stop
 	} Catch {
 		Write-Host -ForegroundColor Red "WinGet installation failed: $($_.Exception.Message)"
@@ -1638,6 +1689,9 @@ Function Install-WinGet {
 		Write-Host -ForegroundColor Green "WinGet $NewVersion installed successfully."
 		& $WinGetExe source update | Out-Host
 	} Else {
+		If (-not $IsAdmin) {
+			Write-Host -ForegroundColor Yellow "If winget reports 'No applicable app licenses found' (common on Windows Server and LTSC), run Install-WinGet from an elevated PowerShell so it can provision the license."
+		}
 		Write-Error "WinGet did not install successfully. Detected version: $(If ($NewVersion) {$NewVersion} Else {'none'})"
 	}
 }

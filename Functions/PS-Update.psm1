@@ -1713,6 +1713,250 @@ Function Update-PowershellModules {
 	Get-Module | Select-Object Name, Version, Description
 }
 
+Function Update-ProtectedConfigFile {
+	<#
+	.SYNOPSIS
+	Decrypts a protected config file, opens it for editing, then re-encrypts it.
+	.DESCRIPTION
+	Streamlines editing a file encrypted with Protect-ConfigFile. The encrypted
+	content is read from a local .enc file or downloaded from a URL, decrypted with
+	Unprotect-ConfigFile, and written to a temporary .txt file that is opened in the
+	default .txt editor (or the editor given by -Editor).
+
+	The function waits until the temp file is saved. If the saved content differs
+	from the original, it is re-encrypted with Protect-ConfigFile and the result is
+	verified by decrypting it again:
+	  * Local file source: the original .enc file is overwritten in place.
+	  * URL source: the encrypted string is written to the pipeline and can be
+	    copied to the clipboard. For raw.githubusercontent.com URLs, the GitHub
+	    edit page is shown so the new content can be pasted in.
+
+	Whatever happens (success, no changes, wrong password, timeout or Ctrl+C), any
+	editor window showing the temp file is closed (forcefully if it does not close
+	on its own) and the temp file is overwritten and deleted.
+
+	Note: tabbed editors (Windows 11 Notepad, Notepad++, VS Code) close the whole
+	window, not just the tab. Save any other work open in that editor first.
+	.PARAMETER Source
+	Path to a local encrypted file, or an http(s) URL of an encrypted file.
+	.PARAMETER Password
+	Password used to encrypt the file. If omitted, you are prompted for it securely.
+	The same password is used to re-encrypt.
+	.PARAMETER CopyToClipboard
+	URL source only. Copies the new encrypted string to the clipboard without
+	prompting. If omitted, you are asked whether to copy it.
+	.PARAMETER Editor
+	Optional path or name of the editor executable to use instead of the default
+	.txt file association (e.g. notepad++.exe).
+	.PARAMETER TimeoutMinutes
+	How long to wait for the temp file to be saved before giving up and cleaning up.
+	Defaults to 60. Use 0 to wait indefinitely.
+	.EXAMPLE
+	Update-ProtectedConfigFile -Source https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.enc
+	Downloads Sophos.enc, prompts for the password, opens it for editing, and outputs the re-encrypted string.
+	.EXAMPLE
+	Update-ProtectedConfigFile -Source .\Sophos.enc -Password "MySecurePassword"
+	Edits the local Sophos.enc and overwrites it with the re-encrypted content.
+	.EXAMPLE
+	Update-ProtectedConfigFile https://example.com/Action1.enc -CopyToClipboard -Editor notepad++.exe
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true, Position = 0)]
+		[Alias('Path', 'Url', 'Uri')]
+		[string]$Source,
+		[string]$Password,
+		[switch]$CopyToClipboard,
+		[string]$Editor,
+		[ValidateRange(0, 1440)]
+		[int]$TimeoutMinutes = 60
+	)
+
+	$isUrl = $Source -match '^https?://'
+
+	# Read the encrypted content
+	if ($isUrl) {
+		if ($Source -notmatch '^https://') {
+			Write-Host "Warning: $Source is not HTTPS. The content is still integrity-checked by the password." -ForegroundColor Yellow
+		}
+		try {
+			$encryptedContent = [string](Invoke-RestMethod -Uri $Source -UseBasicParsing -ErrorAction Stop)
+		} catch {
+			throw "Failed to download $Source : $($_.Exception.Message)"
+		}
+		$baseName = [System.IO.Path]::GetFileNameWithoutExtension(([System.Uri]$Source).AbsolutePath)
+	} else {
+		if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+			throw "File not found: $Source"
+		}
+		$sourceFullPath = (Resolve-Path -LiteralPath $Source).ProviderPath
+		$encryptedContent = [System.IO.File]::ReadAllText($sourceFullPath)
+		$baseName = [System.IO.Path]::GetFileNameWithoutExtension($sourceFullPath)
+	}
+	$encryptedContent = $encryptedContent.Trim()
+
+	# Prompt for the password securely if not supplied
+	if (-not $Password) {
+		$securePassword = Read-Host -Prompt "Password for $baseName" -AsSecureString
+		$bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
+		try {
+			$Password = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+		} finally {
+			[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+		}
+		if (-not $Password) { throw "A password is required." }
+	}
+
+	# Decrypt first so a wrong password fails before anything is written to disk
+	$plainText = Unprotect-ConfigFile -EncryptedContent $encryptedContent -Password $Password
+
+	# Temp file in the per-user temp folder with a unique, recognizable name
+	$baseName = ($baseName -replace '[^A-Za-z0-9_.-]', '_')
+	if (-not $baseName) { $baseName = 'ConfigFile' }
+	$uniqueId = [System.IO.Path]::GetFileNameWithoutExtension([System.IO.Path]::GetRandomFileName())
+	$tempName = "$baseName-$uniqueId"
+	$tempTxt = Join-Path ([System.IO.Path]::GetTempPath()) "$tempName.txt"
+	$tempEnc = Join-Path ([System.IO.Path]::GetTempPath()) "$tempName.enc"
+	$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+	try {
+		[System.IO.File]::WriteAllText($tempTxt, $plainText, $utf8NoBom)
+		$originalWriteTime = (Get-Item -LiteralPath $tempTxt).LastWriteTimeUtc
+
+		# Open in the requested editor, the default .txt editor, or Notepad as a fallback
+		try {
+			if ($Editor) {
+				Start-Process -FilePath $Editor -ArgumentList "`"$tempTxt`"" -ErrorAction Stop
+			} else {
+				Start-Process -FilePath $tempTxt -ErrorAction Stop
+			}
+		} catch {
+			Write-Host "Could not open the editor ($($_.Exception.Message)). Falling back to Notepad." -ForegroundColor Yellow
+			Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$tempTxt`""
+		}
+
+		Write-Host "Opened decrypted content: $tempTxt" -ForegroundColor Cyan
+		Write-Host "Edit and save the file to continue. Press Ctrl+C to cancel." -ForegroundColor Cyan
+
+		# Wait for the file to be saved
+		$deadline = if ($TimeoutMinutes -gt 0) { (Get-Date).AddMinutes($TimeoutMinutes) } else { [datetime]::MaxValue }
+		$saved = $false
+		while (-not $saved) {
+			if ((Get-Date) -gt $deadline) {
+				Write-Host "Timed out after $TimeoutMinutes minute(s) waiting for a save. No changes made." -ForegroundColor Yellow
+				return
+			}
+			Start-Sleep -Milliseconds 500
+			# Some editors save by delete-and-rename, so the file can briefly be missing
+			$item = Get-Item -LiteralPath $tempTxt -ErrorAction SilentlyContinue
+			if ($item -and $item.LastWriteTimeUtc -ne $originalWriteTime) { $saved = $true }
+		}
+
+		# Let the save settle: wait until the timestamp is stable and the file is readable
+		$newText = $null
+		for ($i = 0; $i -lt 20 -and $null -eq $newText; $i++) {
+			$before = (Get-Item -LiteralPath $tempTxt -ErrorAction SilentlyContinue).LastWriteTimeUtc
+			Start-Sleep -Milliseconds 750
+			$after = (Get-Item -LiteralPath $tempTxt -ErrorAction SilentlyContinue).LastWriteTimeUtc
+			if ($before -and $before -eq $after) {
+				try {
+					# ReadAllText honors any BOM the editor added and defaults to UTF-8
+					$newText = [System.IO.File]::ReadAllText($tempTxt)
+				} catch {
+					Write-Verbose "Temp file not readable yet: $($_.Exception.Message)"
+				}
+			}
+		}
+		if ($null -eq $newText) {
+			throw "Could not read the saved temp file. No changes made."
+		}
+		Write-Host "Save detected." -ForegroundColor Green
+
+		if ($newText -ceq $plainText) {
+			Write-Host "Content is unchanged. Nothing was re-encrypted." -ForegroundColor Yellow
+			return
+		}
+
+		# Normalize to UTF-8 without BOM so a BOM is not baked into the decrypted output
+		$newBytes = $utf8NoBom.GetBytes($newText)
+		$fileBytes = [System.IO.File]::ReadAllBytes($tempTxt)
+		if ([System.Convert]::ToBase64String($fileBytes) -ne [System.Convert]::ToBase64String($newBytes)) {
+			Write-Verbose "Rewriting temp file as UTF-8 without BOM before encrypting"
+			[System.IO.File]::WriteAllBytes($tempTxt, $newBytes)
+		}
+
+		# Encrypt to a temp .enc, then verify the round trip before replacing anything
+		Protect-ConfigFile -Path $tempTxt -Password $Password -OutputPath $tempEnc 6>$null
+		$newEncrypted = [System.IO.File]::ReadAllText($tempEnc)
+		$verifyText = Unprotect-ConfigFile -EncryptedContent $newEncrypted -Password $Password
+		if ($verifyText -cne $newText) {
+			throw "Verification failed: the re-encrypted content does not decrypt to the edited text. No changes made."
+		}
+		$verifyText = $null
+
+		if ($isUrl) {
+			Write-Host "Re-encrypted content verified." -ForegroundColor Green
+			if (-not $CopyToClipboard) {
+				$answer = Read-Host -Prompt "Copy the encrypted string to the clipboard? (Y/N)"
+				$CopyToClipboard = $answer -match '^\s*y'
+			}
+			if ($CopyToClipboard) {
+				Set-Clipboard -Value $newEncrypted
+				Write-Host "Encrypted string copied to the clipboard." -ForegroundColor Green
+			}
+			# Point at the GitHub web editor for raw.githubusercontent.com sources
+			if ($Source -match '^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)$') {
+				Write-Host "Paste it into: https://github.com/$($Matches[1])/$($Matches[2])/edit/$($Matches[3])/$($Matches[4])" -ForegroundColor Cyan
+				Write-Host "raw.githubusercontent.com may serve the old content for a few minutes after the commit." -ForegroundColor Cyan
+			}
+			Write-Output $newEncrypted
+		} else {
+			# Write in place so the original file keeps its permissions
+			[System.IO.File]::WriteAllText($sourceFullPath, $newEncrypted)
+			Write-Host "Updated encrypted file: $sourceFullPath" -ForegroundColor Green
+		}
+	} finally {
+		$plainText = $null
+		$newText = $null
+		$Password = $null
+
+		# Close any editor window showing the temp file, forcefully if it does not close in time
+		$editorProcs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like "*$tempName*" })
+		foreach ($proc in $editorProcs) {
+			Write-Verbose "Closing $($proc.ProcessName) (PID $($proc.Id)): $($proc.MainWindowTitle)"
+			try {
+				[void]$proc.CloseMainWindow()
+				if (-not $proc.WaitForExit(5000)) {
+					Write-Host "Forcefully closing $($proc.ProcessName) (PID $($proc.Id))." -ForegroundColor Yellow
+					Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+				}
+			} catch {
+				Write-Host "Could not close $($proc.ProcessName) (PID $($proc.Id)): $($_.Exception.Message)" -ForegroundColor Yellow
+			}
+		}
+
+		# Overwrite then delete the plaintext temp file, retrying while an editor lets go of it
+		$deleted = -not (Test-Path -LiteralPath $tempTxt)
+		for ($i = 0; $i -lt 10 -and -not $deleted; $i++) {
+			try {
+				$length = (Get-Item -LiteralPath $tempTxt -ErrorAction Stop).Length
+				[System.IO.File]::WriteAllBytes($tempTxt, (New-Object byte[] $length))
+				Remove-Item -LiteralPath $tempTxt -Force -ErrorAction Stop
+				$deleted = $true
+			} catch {
+				Write-Verbose "Temp file delete attempt $($i + 1) failed: $($_.Exception.Message)"
+				Start-Sleep -Milliseconds 500
+			}
+		}
+		if ($deleted) {
+			Write-Verbose "Deleted temp file $tempTxt"
+		} else {
+			Write-Host "Could not delete the plaintext temp file. Delete it manually: $tempTxt" -ForegroundColor Red
+		}
+		Remove-Item -LiteralPath $tempEnc -Force -ErrorAction SilentlyContinue
+	}
+}
+
 Function Update-PSWinGetPackages {
 	If (Get-Command -Name "winget.exe" -ErrorAction SilentlyContinue) {
 		& winget.exe update --all --silent --accept-package-agreements --accept-source-agreements --source winget --include-unknown --force --disable-interactivity

@@ -951,6 +951,115 @@ Function Add-RDPCertificate {
 	}
 }
 
+Function Add-WiFiProfile {
+	<#
+	.SYNOPSIS
+		Adds a Windows WiFi (WLAN) profile from profile XML.
+	.DESCRIPTION
+		Adds a wireless profile with "netsh wlan add profile". The profile can be passed as an XML
+		string or as a path to an XML file, such as one created by "netsh wlan export profile".
+		The XML is checked to be a WLANProfile document (DTDs are refused) before it is given to netsh.
+		When an XML string is passed, it is written to a uniquely named temporary file that is deleted
+		as soon as netsh finishes, because the XML may contain a plaintext network key.
+		Throws a terminating error if the profile could not be added, so callers can use try/catch.
+	.PARAMETER ProfileXml
+		The WLAN profile XML as a string.
+	.PARAMETER Path
+		Path to a WLAN profile XML file.
+	.PARAMETER User
+		All (default) makes the profile available to every user on this computer.
+		Current makes it available to the current user only.
+	.EXAMPLE
+		Add-WiFiProfile -Path "C:\IT\Wi-Fi-OfficeWifi.xml"
+		Adds the exported OfficeWifi profile for all users.
+	.EXAMPLE
+		Add-WiFiProfile -ProfileXml $Xml -User Current
+		Adds the profile in $Xml for the current user only.
+	.NOTES
+		Used by Connect-Wifi and Import-WiFiProfiles.
+		Adding all-user profiles normally requires administrative privileges.
+	#>
+	[CmdletBinding(DefaultParameterSetName = 'Xml')]
+	param(
+		[Parameter(Mandatory = $true, ParameterSetName = 'Xml')]
+		[ValidateNotNullOrEmpty()]
+		[string]$ProfileXml,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'Path')]
+		[ValidateNotNullOrEmpty()]
+		[string]$Path,
+
+		[ValidateSet('All', 'Current')]
+		[string]$User = 'All'
+	)
+
+	if ($PSCmdlet.ParameterSetName -eq 'Path') {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+			throw "File not found: $Path"
+		}
+		$profileFile = (Resolve-Path -LiteralPath $Path).ProviderPath
+		$ProfileXml = [System.IO.File]::ReadAllText($profileFile)
+	}
+
+	# Parse with DTD processing off so a crafted file cannot expand entities or reach external resources
+	$readerSettings = New-Object System.Xml.XmlReaderSettings
+	$readerSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+	$readerSettings.XmlResolver = $null
+	$xmlDoc = New-Object System.Xml.XmlDocument
+	$xmlDoc.XmlResolver = $null
+	$reader = [System.Xml.XmlReader]::Create((New-Object System.IO.StringReader($ProfileXml)), $readerSettings)
+	try {
+		$xmlDoc.Load($reader)
+	} catch {
+		throw "The WiFi profile is not valid XML: $($_.Exception.Message)"
+	} finally {
+		$reader.Dispose()
+	}
+
+	if ($xmlDoc.DocumentElement.LocalName -ne 'WLANProfile') {
+		throw "The XML is not a WLAN profile (root element is '$($xmlDoc.DocumentElement.LocalName)', expected 'WLANProfile')."
+	}
+	$nameNode = $xmlDoc.DocumentElement.SelectSingleNode("*[local-name()='name']")
+	if (-not $nameNode -or [string]::IsNullOrWhiteSpace($nameNode.InnerText)) {
+		throw "The WLAN profile has no <name> element."
+	}
+	$profileName = $nameNode.InnerText
+
+	$tempProfileXML = $null
+	try {
+		if ($PSCmdlet.ParameterSetName -eq 'Xml') {
+			# Drop any XML declaration (it may claim UTF-16) and write UTF-8 without BOM for netsh
+			if ($xmlDoc.FirstChild -is [System.Xml.XmlDeclaration]) {
+				[void]$xmlDoc.RemoveChild($xmlDoc.FirstChild)
+			}
+			$tempProfileXML = Join-Path -Path $env:TEMP -ChildPath ("WiFiProfile-" + [guid]::NewGuid().ToString('N') + ".xml")
+			$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+			[System.IO.File]::WriteAllText($tempProfileXML, $xmlDoc.OuterXml, $Utf8NoBom)
+			$profileFile = $tempProfileXML
+		}
+
+		Write-Verbose "Running: netsh wlan add profile filename=`"$profileFile`" user=$($User.ToLower())"
+		$addResult = & netsh wlan add profile filename="$profileFile" user=$($User.ToLower()) 2>&1
+		$addExitCode = $LASTEXITCODE
+		$addResultString = ($addResult | Out-String).Trim()
+	} finally {
+		if ($tempProfileXML -and (Test-Path -LiteralPath $tempProfileXML)) {
+			Remove-Item -LiteralPath $tempProfileXML -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	# netsh exit codes are unreliable, so also check the text. The profile name is removed first
+	# so a network called e.g. "ErrorFree" is not mistaken for a failure.
+	$outputWithoutName = $addResultString -replace [regex]::Escape($profileName), ''
+	if ($addExitCode -ne 0 -or $outputWithoutName -match 'is not valid|error|fail|denied') {
+		$isElevated = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+		$hint = if ($User -eq 'All' -and -not $isElevated) { " Try again from an elevated session, or use -User Current." } else { "" }
+		throw "Failed to add WiFi profile '$profileName': $addResultString$hint"
+	}
+
+	Write-Host "WiFi profile '$profileName' added." -ForegroundColor Green
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

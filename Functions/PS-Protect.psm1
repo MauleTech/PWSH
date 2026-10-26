@@ -1,12 +1,13 @@
 Function Protect-ConfigFile {
 	<#
 	.Synopsis
-	Encrypts a configuration file for secure storage
+	Encrypts a configuration file or string for secure storage
 	.Description
-	Takes a plaintext configuration file and encrypts it using AES-256-CBC with
-	HMAC-SHA256 integrity verification (Encrypt-then-MAC). The key is derived via
-	PBKDF2-SHA256 with 600000 iterations. The encrypted file can be safely
-	committed to a public or private repository.
+	Takes a plaintext configuration file (or a string passed with -Content) and
+	encrypts it using AES-256-CBC with HMAC-SHA256 integrity verification
+	(Encrypt-then-MAC). The key is derived via PBKDF2-SHA256 with 600000
+	iterations. The encrypted file can be safely committed to a public or
+	private repository.
 
 	File format: Base64( salt[16] + iv[16] + hmac[32] + ciphertext )
 	.Parameter Path
@@ -14,30 +15,58 @@ Function Protect-ConfigFile {
 	.Parameter Password
 	Password used for encryption. Must match the password used for decryption.
 	.Parameter OutputPath
-	Path for the encrypted output file. Defaults to the same directory with .enc extension
+	Path for the encrypted output file. Defaults to the same directory with .enc extension.
+	Required when using -Content.
+	.Parameter Content
+	Plaintext string to encrypt instead of reading a file. The string is encoded
+	as UTF-8 and is never written to disk unencrypted. Use this for secrets
+	generated in memory (e.g. Export-WiFiProfiles).
 	.Example
 	Protect-ConfigFile -Path .\Sophos.csv -Password "MySecurePassword"
 	.Example
 	Protect-ConfigFile -Path .\Action1.csv -Password "MySecurePassword" -OutputPath .\Action1.enc
+	.Example
+	Protect-ConfigFile -Content $Json -Password "MySecurePassword" -OutputPath .\Settings.enc
 	#>
-	[CmdletBinding()]
+	[CmdletBinding(DefaultParameterSetName = 'Path')]
 	param(
-		[Parameter(Mandatory = $true)]
+		# Explicit positions keep the original "Protect-ConfigFile <Path> <Password> [<OutputPath>]" form working
+		[Parameter(Mandatory = $true, ParameterSetName = 'Path', Position = 0)]
 		[string]$Path,
-		[Parameter(Mandatory = $true)]
+		[Parameter(Mandatory = $true, Position = 1)]
+		[ValidateNotNullOrEmpty()]
 		[string]$Password,
-		[string]$OutputPath
+		[Parameter(ParameterSetName = 'Path', Position = 2)]
+		[Parameter(Mandatory = $true, ParameterSetName = 'Content')]
+		[ValidateNotNullOrEmpty()]
+		[string]$OutputPath,
+		[Parameter(Mandatory = $true, ParameterSetName = 'Content')]
+		[ValidateNotNullOrEmpty()]
+		[string]$Content
 	)
 
-	if (-not (Test-Path $Path)) {
-		throw "File not found: $Path"
+	$inputFullPath = $null
+	if ($PSCmdlet.ParameterSetName -eq 'Path') {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+			throw "File not found: $Path"
+		}
+		$inputFullPath = (Resolve-Path -LiteralPath $Path).ProviderPath
+		if (-not $OutputPath) {
+			$OutputPath = [System.IO.Path]::ChangeExtension($inputFullPath, '.enc')
+		}
 	}
 
-	if (-not $OutputPath) {
-		$OutputPath = [System.IO.Path]::ChangeExtension($Path, '.enc')
+	# Resolves relative paths against the PowerShell location, not the .NET working directory
+	$outputFullPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputPath)
+	if ($inputFullPath -and ($outputFullPath -eq $inputFullPath)) {
+		throw "OutputPath is the same as the input file. Specify a different -OutputPath to avoid overwriting the plaintext source."
 	}
 
-	$plainBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $Path).ProviderPath)
+	if ($PSCmdlet.ParameterSetName -eq 'Path') {
+		$plainBytes = [System.IO.File]::ReadAllBytes($inputFullPath)
+	} else {
+		$plainBytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($Content)
+	}
 
 	# Generate random salt and IV
 	$salt = New-Object byte[] 16
@@ -89,15 +118,11 @@ Function Protect-ConfigFile {
 		[System.Buffer]::BlockCopy($ciphertext, 0, $combined, 64, $ciphertext.Length)
 
 		# Write as Base64
-		$outputFullPath = if ([System.IO.Path]::IsPathRooted($OutputPath)) {
-			$OutputPath
-		} else {
-			Join-Path (Get-Location) $OutputPath
-		}
 		[System.IO.File]::WriteAllText($outputFullPath, [System.Convert]::ToBase64String($combined))
 
 		Write-Host "Encrypted file saved to: $outputFullPath" -ForegroundColor Green
 	} finally {
+		if ($plainBytes) { [System.Array]::Clear($plainBytes, 0, $plainBytes.Length) }
 		if ($encKey) { [System.Array]::Clear($encKey, 0, $encKey.Length) }
 		if ($hmacKey) { [System.Array]::Clear($hmacKey, 0, $hmacKey.Length) }
 		if ($hmac) { $hmac.Dispose() }

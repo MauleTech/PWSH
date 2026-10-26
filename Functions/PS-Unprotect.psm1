@@ -6,21 +6,40 @@ Function Unprotect-ConfigFile {
 	Decrypts Base64-encoded AES-256-CBC encrypted content with HMAC-SHA256
 	integrity verification (Encrypt-then-MAC). The key is derived via
 	PBKDF2-SHA256 with 600000 iterations. Returns the plaintext content as a string.
-	Note: assumes the original file was UTF-8 encoded.
+	Note: assumes the original file was UTF-8 encoded. A leading UTF-8 byte order
+	mark is removed so CSV headers and JSON parse cleanly.
 
 	Expected format: Base64( salt[16] + iv[16] + hmac[32] + ciphertext )
 	.Parameter EncryptedContent
 	The Base64-encoded encrypted content (as downloaded from BinCache)
 	.Parameter Password
 	The password that was used to encrypt the file via Protect-ConfigFile
+	.Parameter Path
+	Path to a local encrypted file (as written by Protect-ConfigFile). Use instead of -EncryptedContent.
+	.Example
+	Unprotect-ConfigFile -EncryptedContent $EncryptedText -Password "MySecurePassword"
+	.Example
+	Unprotect-ConfigFile -Path .\Action1.enc -Password "MySecurePassword" | ConvertFrom-Csv
 	#>
-	[CmdletBinding()]
+	[CmdletBinding(DefaultParameterSetName = 'Content')]
 	param(
-		[Parameter(Mandatory = $true)]
+		# Explicit positions keep the original "Unprotect-ConfigFile <EncryptedContent> <Password>" form working
+		[Parameter(Mandatory = $true, ParameterSetName = 'Content', Position = 0)]
 		[string]$EncryptedContent,
-		[Parameter(Mandatory = $true)]
-		[string]$Password
+		[Parameter(Mandatory = $true, Position = 1)]
+		[ValidateNotNullOrEmpty()]
+		[string]$Password,
+		[Parameter(Mandatory = $true, ParameterSetName = 'Path')]
+		[ValidateNotNullOrEmpty()]
+		[string]$Path
 	)
+
+	if ($PSCmdlet.ParameterSetName -eq 'Path') {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+			throw "File not found: $Path"
+		}
+		$EncryptedContent = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).ProviderPath)
+	}
 
 	try {
 		$combined = [System.Convert]::FromBase64String($EncryptedContent)
@@ -98,7 +117,12 @@ Function Unprotect-ConfigFile {
 	}
 
 	# Assumes original file was UTF-8 encoded
-	return [System.Text.Encoding]::UTF8.GetString($plainBytes)
+	$plainText = [System.Text.Encoding]::UTF8.GetString($plainBytes)
+	[System.Array]::Clear($plainBytes, 0, $plainBytes.Length)
+	if ($plainText.Length -gt 0 -and $plainText[0] -eq [char]0xFEFF) {
+		$plainText = $plainText.Substring(1)
+	}
+	return $plainText
 }
 
 # SIG # Begin signature block

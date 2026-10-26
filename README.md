@@ -36,6 +36,7 @@ Enable-SSL #Enables SSL Permanently
   Add-FileFolderShortcut
   Add-IEShortcut
   Add-WebShortcut
+  Add-WiFiProfile
 
 [Backup]
 --------
@@ -96,6 +97,7 @@ Enable-SSL #Enables SSL Permanently
   Export-365DistributionGroup
   Export-LDAPSCertificate
   Export-UsersOneDrive
+  Export-WiFiProfiles
 
 [Get]
 -----
@@ -132,6 +134,7 @@ Enable-SSL #Enables SSL Permanently
   Import-PPESenderLists
   Import-PPESingleUserSenderLists
   Import-WindowsInstallerDrivers
+  Import-WiFiProfiles
 
 [Install]
 ---------

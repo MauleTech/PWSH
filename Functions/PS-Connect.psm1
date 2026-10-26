@@ -566,7 +566,10 @@ Function Connect-Wifi {
 	.NOTES
 		Requires administrative privileges to add WiFi profiles.
 		The profile is configured for automatic connection when the network is in range.
+		A 64-character hexadecimal NetworkPassword is treated as a raw PSK; anything else must be an 8-63 character passphrase.
+		Uses Add-WiFiProfile to add the profile. To move every saved network to another computer, see Export-WiFiProfiles.
 	#>
+	[CmdletBinding()]
 	param
 	(
 		[Parameter(Mandatory = $true)]
@@ -612,6 +615,17 @@ Function Connect-Wifi {
 		}
 	}
 
+	# A 64-digit hex string is a raw pre-shared key (networkKey); otherwise it is an 8-63 character passphrase
+	$KeyType = 'passPhrase'
+	If ($Authentication -ne 'Open') {
+		If ($NetworkPassword -match '^[0-9a-fA-F]{64}$') {
+			$KeyType = 'networkKey'
+		} ElseIf ($NetworkPassword.Length -lt 8 -or $NetworkPassword.Length -gt 63) {
+			Write-Error "NetworkPassword must be 8-63 characters (or a 64-character hexadecimal key) for $Authentication authentication."
+			return
+		}
+	}
+
 	# Escape XML special characters in SSID and password to prevent malformed XML
 	$XmlEscapedSSID = [System.Security.SecurityElement]::Escape($NetworkSSID)
 	$XmlEscapedPassword = if ($NetworkPassword) { [System.Security.SecurityElement]::Escape($NetworkPassword) } else { "" }
@@ -636,7 +650,7 @@ Function Connect-Wifi {
 				<useOneX>false</useOneX>
 			</authEncryption>
 			<sharedKey>
-				<keyType>passPhrase</keyType>
+				<keyType>$KeyType</keyType>
 				<protected>false</protected>
 				<keyMaterial>$XmlEscapedPassword</keyMaterial>
 			</sharedKey>
@@ -662,39 +676,28 @@ $SecurityXml
 </WLANProfile>
 "@
 
-	# Create a temporary XML file for the profile
-	$random = Get-Random -Minimum 1111 -Maximum 99999999
-	$tempProfileXML = Join-Path -Path $env:TEMP -ChildPath "tempProfile$random.xml"
+	# Add the WiFi profile for all users on this computer (temp file handling is in Add-WiFiProfile)
+	Write-Host "Adding WiFi profile for SSID: $NetworkSSID"
+	Try {
+		Add-WiFiProfile -ProfileXml $WirelessProfile -User All -ErrorAction Stop
+	}
+	Catch {
+		Write-Error $_.Exception.Message
+		return
+	}
 
 	Try {
-		# Write the profile XML to the temp file using UTF-8 without BOM for netsh compatibility
-		# PowerShell 5.1's -Encoding UTF8 includes BOM which can cause issues
-		$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
-		[System.IO.File]::WriteAllText($tempProfileXML, $WirelessProfile, $Utf8NoBom)
-
-		# Add the WiFi profile using netsh (run synchronously to ensure completion)
-		# Use user=all to make profile available to all users on this computer
-		Write-Host "Adding WiFi profile for SSID: $NetworkSSID"
-		$addResult = & netsh wlan add profile filename="$tempProfileXML" user=all 2>&1
-		$addResultString = $addResult | Out-String
-
-		# Check both exit code and output for errors (netsh exit codes can be unreliable)
-		If ($LASTEXITCODE -ne 0 -or $addResultString -match "is not valid|error|failed") {
-			Write-Error "Failed to add WiFi profile: $addResultString"
-			return
-		}
-		Write-Host "WiFi profile added successfully." -ForegroundColor Green
-
-		# Check if the network is currently visible
+		# Check if the network is currently visible. Match the whole SSID line so "Office" does not match "Office-Guest".
+		$escapedSSID = [regex]::Escape($NetworkSSID)
 		$WifiNetworks = & netsh wlan show networks 2>&1
-		If ($WifiNetworks -match [regex]::Escape($NetworkSSID)) {
+		If ($WifiNetworks -match "^\s*SSID\s+\d+\s*:\s*$escapedSSID\s*$") {
 			Write-Host "Found SSID: $NetworkSSID - Attempting to connect..."
 
 			$connectResult = & netsh wlan connect name="$NetworkSSID" 2>&1
 			$connectResultString = $connectResult | Out-String
 
-			# Check both exit code and output for errors
-			If ($LASTEXITCODE -ne 0 -or $connectResultString -match "error|failed") {
+			# Check both exit code and output for errors (SSID removed so its name cannot trigger a false match)
+			If ($LASTEXITCODE -ne 0 -or ($connectResultString -replace $escapedSSID, '') -match "error|failed") {
 				Write-Error "Failed to connect to WiFi network: $connectResultString"
 				return
 			}
@@ -705,8 +708,7 @@ $SecurityXml
 
 			# Verify connection status
 			$interfaceStatus = & netsh wlan show interfaces 2>&1
-			$escapedSSID = [regex]::Escape($NetworkSSID)
-			If ($interfaceStatus -match "State\s*:\s*connected" -and $interfaceStatus -match $escapedSSID) {
+			If ($interfaceStatus -match "State\s*:\s*connected" -and $interfaceStatus -match "^\s*SSID\s*:\s*$escapedSSID\s*$") {
 				Write-Host "Successfully connected to $NetworkSSID" -ForegroundColor Green
 			} Else {
 				Write-Warning "Connection command sent, but connection state is uncertain. Check your network status."
@@ -721,12 +723,6 @@ $SecurityXml
 	}
 	Catch {
 		Write-Error "An error occurred: $_"
-	}
-	Finally {
-		# Clean up the temporary XML file
-		If (Test-Path -Path $tempProfileXML) {
-			Remove-Item -Path $tempProfileXML -Force -ErrorAction SilentlyContinue
-		}
 	}
 }
 

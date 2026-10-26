@@ -765,6 +765,141 @@ Function Import-WindowsInstallerDrivers {
 	Copy-Item -Path $WIMBootWorkingFile -Destination $BootWimPath -Force
 }
 
+Function Import-WiFiProfiles {
+	<#
+	.SYNOPSIS
+		Imports WiFi networks from a config file created by Export-WiFiProfiles.
+	.DESCRIPTION
+		Reads a WiFi profile config file written by Export-WiFiProfiles and adds each profile to this
+		computer with Add-WiFiProfile. Encrypted (.enc) files are detected automatically and decrypted
+		with Unprotect-ConfigFile; if -Password is not given for an encrypted file, it is prompted for
+		without echoing.
+
+		Windows connects to imported networks automatically when they are in range (for profiles
+		saved with automatic connection). A profile with the same name as an existing one replaces it.
+	.PARAMETER Path
+		Path to the .json or .enc file created by Export-WiFiProfiles.
+	.PARAMETER Password
+		Password used when the file was exported with -Password. Prompted for if needed and not given.
+	.PARAMETER Name
+		Only import profiles whose name matches one of these wildcard patterns. Defaults to all profiles.
+	.PARAMETER User
+		All (default) makes the profiles available to every user on this computer (normally needs elevation).
+		Current makes them available to the current user only.
+	.EXAMPLE
+		Import-WiFiProfiles -Path "C:\IT\WiFiProfiles-OLDPC-20261026-091500.json"
+		Imports every profile from an unencrypted export.
+	.EXAMPLE
+		Import-WiFiProfiles -Path "E:\Migration\WiFi.enc"
+		Prompts for the password, decrypts the file, and imports every profile.
+	.EXAMPLE
+		Import-WiFiProfiles -Path "E:\Migration\WiFi.enc" -Password "MySecurePassword" -Name "Office*"
+		Imports only the profiles whose names start with Office.
+	.NOTES
+		Returns one object per profile with Name, Authentication, Status (Added or Failed) and Message.
+		Delete the config file once the migration is finished.
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		[string]$Path,
+
+		[ValidateNotNullOrEmpty()]
+		[string]$Password,
+
+		[ValidateNotNullOrEmpty()]
+		[string[]]$Name = '*',
+
+		[ValidateSet('All', 'Current')]
+		[string]$User = 'All'
+	)
+
+	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+		Write-Error "File not found: $Path"
+		return
+	}
+	$fileContent = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).ProviderPath).Trim()
+
+	# Plain exports are JSON objects; anything else is treated as Protect-ConfigFile output
+	if ($fileContent.StartsWith('{')) {
+		$json = $fileContent
+	} else {
+		if (-not $PSBoundParameters.ContainsKey('Password')) {
+			$securePassword = Read-Host -Prompt "Enter the password used to export $Path" -AsSecureString
+			$Password = (New-Object System.Net.NetworkCredential('', $securePassword)).Password
+			if ([string]::IsNullOrEmpty($Password)) {
+				Write-Error "A password is required to decrypt $Path."
+				return
+			}
+		}
+		Write-Host "Decrypting $Path..." -ForegroundColor Cyan
+		try {
+			$json = Unprotect-ConfigFile -EncryptedContent $fileContent -Password $Password
+		} catch {
+			Write-Error "Failed to decrypt ${Path}: $($_.Exception.Message)"
+			return
+		}
+	}
+
+	try {
+		$config = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+	} catch {
+		Write-Error "$Path is not a valid WiFi profile config file: $($_.Exception.Message)"
+		return
+	}
+	if ($config.Format -ne 'MauleTech.WiFiProfiles' -or -not $config.Profiles) {
+		Write-Error "$Path was not created by Export-WiFiProfiles."
+		return
+	}
+	if ([int]$config.Version -gt 1) {
+		Write-Error "$Path uses config version $($config.Version), which this version of Import-WiFiProfiles does not support. Run Update-ITFunctions and try again."
+		return
+	}
+
+	Write-Host "Found $(@($config.Profiles).Count) WiFi profile(s) exported from $($config.ComputerName) on $($config.ExportedAt)." -ForegroundColor Cyan
+
+	$results = foreach ($wifiProfile in $config.Profiles) {
+		$matchesFilter = $false
+		foreach ($pattern in $Name) {
+			if ($wifiProfile.Name -like $pattern) { $matchesFilter = $true; break }
+		}
+		if (-not $matchesFilter) { continue }
+
+		try {
+			Add-WiFiProfile -ProfileXml $wifiProfile.Xml -User $User -ErrorAction Stop
+			$status = 'Added'
+			$message = ''
+		} catch {
+			Write-Host "Failed to import '$($wifiProfile.Name)': $($_.Exception.Message)" -ForegroundColor Red
+			$status = 'Failed'
+			$message = $_.Exception.Message
+		}
+		[PSCustomObject]@{
+			Name           = $wifiProfile.Name
+			Authentication = $wifiProfile.Authentication
+			Status         = $status
+			Message        = $message
+		}
+	}
+	$results = @($results)
+
+	if ($results.Count -eq 0) {
+		Write-Warning "No WiFi profiles matched -Name. Nothing was imported."
+		return
+	}
+
+	$added = @($results | Where-Object Status -eq 'Added').Count
+	$failed = $results.Count - $added
+	if ($failed -eq 0) {
+		Write-Host "$added WiFi profile(s) imported." -ForegroundColor Green
+	} else {
+		Write-Host "$added WiFi profile(s) imported, $failed failed." -ForegroundColor Yellow
+	}
+
+	Write-Output $results
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

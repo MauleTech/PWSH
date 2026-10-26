@@ -399,6 +399,178 @@ Function Export-UsersOneDrive {
 	Write-Host "`nComplete!" -ForegroundColor Green
 }
 
+Function Export-WiFiProfiles {
+	<#
+	.SYNOPSIS
+		Exports all saved WiFi networks, including their passwords, to a single config file.
+	.DESCRIPTION
+		Uses "netsh wlan export profile key=clear" to export every saved WiFi profile on this computer,
+		then bundles the profile XML (including the network key) into one JSON config file that
+		Import-WiFiProfiles can load on another computer. Intended for computer migrations.
+
+		By default the file is plain JSON and the WiFi passwords in it are readable by anyone who
+		opens it. When -Password is specified, the file is encrypted with Protect-ConfigFile
+		(AES-256-CBC, HMAC-SHA256, PBKDF2-SHA256) and nothing unencrypted is written to the output.
+
+		Windows only exports keys in plain text to a local administrator, so this must run elevated.
+		netsh writes the individual profiles to a private temporary folder, which is deleted when done.
+	.PARAMETER Path
+		Output file path. Defaults to $ITFolder (or the current folder) with the name
+		WiFiProfiles-<COMPUTERNAME>-<yyyyMMdd-HHmmss>.json, or .enc when -Password is used.
+	.PARAMETER Password
+		Encrypts the output file with this password. Only enabled when specified.
+		The same password is needed by Import-WiFiProfiles.
+	.PARAMETER Name
+		Only export profiles whose name matches one of these wildcard patterns. Defaults to all profiles.
+	.EXAMPLE
+		Export-WiFiProfiles
+		Exports all WiFi profiles to an unencrypted JSON file in $ITFolder.
+	.EXAMPLE
+		Export-WiFiProfiles -Password "MySecurePassword"
+		Exports all WiFi profiles to an encrypted .enc file in $ITFolder.
+	.EXAMPLE
+		Export-WiFiProfiles -Path "E:\Migration\WiFi.enc" -Password "MySecurePassword" -Name "Office*", "Home"
+		Exports only the matching profiles to an encrypted file on a USB drive.
+	.NOTES
+		Enterprise (802.1X) profiles are exported without user credentials; users sign in again after import.
+		Delete the export file once the migration is finished, especially if it is not encrypted.
+		Returns the exported file as a FileInfo object.
+	#>
+	[CmdletBinding()]
+	param(
+		[string]$Path,
+
+		[ValidateNotNullOrEmpty()]
+		[string]$Password,
+
+		[ValidateNotNullOrEmpty()]
+		[string[]]$Name = '*'
+	)
+
+	$Encrypt = $PSBoundParameters.ContainsKey('Password')
+
+	$isElevated = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+	if (-not $isElevated) {
+		Write-Error "Export-WiFiProfiles must run from an elevated session. Windows only exports WiFi passwords in plain text to administrators."
+		return
+	}
+
+	$wlanService = Get-Service -Name WlanSvc -ErrorAction SilentlyContinue
+	if (-not $wlanService -or $wlanService.Status -ne 'Running') {
+		Write-Error "The WLAN AutoConfig service (WlanSvc) is not running, so there are no WiFi profiles to export."
+		return
+	}
+
+	if (-not $Path) {
+		$outFolder = if ((Test-Path Variable:ITFolder) -and $ITFolder) { $ITFolder } else { (Get-Location).ProviderPath }
+		$extension = if ($Encrypt) { 'enc' } else { 'json' }
+		$Path = Join-Path $outFolder ("WiFiProfiles-{0}-{1}.{2}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss'), $extension)
+	}
+	$outputFullPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
+	$outputFolder = Split-Path -Path $outputFullPath -Parent
+	if (-not (Test-Path -LiteralPath $outputFolder)) {
+		New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
+	}
+
+	# netsh writes one XML file per profile per interface, with keys in plain text
+	$tempFolder = Join-Path -Path $env:TEMP -ChildPath ("WiFiExport-" + [guid]::NewGuid().ToString('N'))
+	$profiles = New-Object System.Collections.Generic.List[object]
+	try {
+		New-Item -ItemType Directory -Path $tempFolder -Force | Out-Null
+
+		Write-Host "Exporting WiFi profiles..." -ForegroundColor Cyan
+		$exportResult = & netsh wlan export profile folder="$tempFolder" key=clear 2>&1
+		$exportExitCode = $LASTEXITCODE
+		$profileFiles = @(Get-ChildItem -LiteralPath $tempFolder -Filter '*.xml' -File)
+		if ($exportExitCode -ne 0 -and $profileFiles.Count -eq 0) {
+			Write-Error "netsh failed to export WiFi profiles: $(($exportResult | Out-String).Trim())"
+			return
+		}
+
+		$seenNames = @{}
+		foreach ($file in $profileFiles) {
+			$profileXml = [System.IO.File]::ReadAllText($file.FullName)
+			$xmlDoc = New-Object System.Xml.XmlDocument
+			$xmlDoc.XmlResolver = $null
+			try {
+				$xmlDoc.LoadXml($profileXml)
+			} catch {
+				Write-Warning "Skipping unreadable profile file '$($file.Name)': $($_.Exception.Message)"
+				continue
+			}
+			$root = $xmlDoc.DocumentElement
+			$profileName = $root.SelectSingleNode("*[local-name()='name']").InnerText
+
+			# The same profile is exported once per wireless adapter; keep the first copy
+			if ($seenNames.ContainsKey($profileName)) { continue }
+			$matchesFilter = $false
+			foreach ($pattern in $Name) {
+				if ($profileName -like $pattern) { $matchesFilter = $true; break }
+			}
+			if (-not $matchesFilter) { continue }
+			$seenNames[$profileName] = $true
+
+			$ssidNode = $root.SelectSingleNode("*[local-name()='SSIDConfig']/*[local-name()='SSID']/*[local-name()='name']")
+			$authNode = $root.SelectSingleNode("//*[local-name()='authEncryption']/*[local-name()='authentication']")
+			$encNode = $root.SelectSingleNode("//*[local-name()='authEncryption']/*[local-name()='encryption']")
+			$modeNode = $root.SelectSingleNode("*[local-name()='connectionMode']")
+			$keyNode = $root.SelectSingleNode("//*[local-name()='sharedKey']/*[local-name()='keyMaterial']")
+			$protectedNode = $root.SelectSingleNode("//*[local-name()='sharedKey']/*[local-name()='protected']")
+
+			$hasSharedKey = [bool]$keyNode
+			$keyIsProtected = $protectedNode -and $protectedNode.InnerText -eq 'true'
+			if ($hasSharedKey -and $keyIsProtected) {
+				Write-Warning "The key for '$profileName' could not be exported in plain text. It will not work on another computer."
+			}
+
+			$profiles.Add([ordered]@{
+				Name           = $profileName
+				SSID           = if ($ssidNode) { $ssidNode.InnerText } else { $profileName }
+				Authentication = if ($authNode) { $authNode.InnerText } else { '' }
+				Encryption     = if ($encNode) { $encNode.InnerText } else { '' }
+				ConnectionMode = if ($modeNode) { $modeNode.InnerText } else { '' }
+				Key            = if (-not $hasSharedKey) { 'None' } elseif ($keyIsProtected) { 'NotExportable' } else { 'Included' }
+				Xml            = $profileXml
+			})
+		}
+	} finally {
+		if (Test-Path -LiteralPath $tempFolder) {
+			Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	if ($profiles.Count -eq 0) {
+		Write-Warning "No WiFi profiles matched. Nothing was exported."
+		return
+	}
+
+	$export = [ordered]@{
+		Format       = 'MauleTech.WiFiProfiles'
+		Version      = 1
+		ComputerName = $env:COMPUTERNAME
+		ExportedBy   = "$env:USERDOMAIN\$env:USERNAME"
+		ExportedAt   = (Get-Date).ToString('o')
+		Profiles     = $profiles.ToArray()
+	}
+	$json = ConvertTo-Json -InputObject $export -Depth 5
+
+	if ($Encrypt) {
+		Protect-ConfigFile -Content $json -Password $Password -OutputPath $outputFullPath
+	} else {
+		$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+		[System.IO.File]::WriteAllText($outputFullPath, $json, $Utf8NoBom)
+		Write-Host "WiFi profiles saved to: $outputFullPath" -ForegroundColor Green
+		Write-Warning "This file contains WiFi passwords in plain text. Use -Password to encrypt it, and delete it after the migration."
+	}
+
+	$profiles | ForEach-Object { [PSCustomObject]$_ } |
+		Select-Object Name, Authentication, Encryption, Key |
+		Format-Table -AutoSize | Out-String | Write-Host
+	Write-Host "$($profiles.Count) WiFi profile(s) exported. Import them on the new computer with Import-WiFiProfiles." -ForegroundColor Cyan
+
+	Get-Item -LiteralPath $outputFullPath
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG

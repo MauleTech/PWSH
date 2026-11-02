@@ -629,6 +629,21 @@ Function Install-SophosConnect {
 }
 
 Function Install-SophosDnsCert {
+    <#
+    .SYNOPSIS
+    Installs the Sophos root and SSL inspection CA certificates.
+    .DESCRIPTION
+    Installs the Sophos Internet Protection Root CA and the Sophos firewall SSL inspection
+    CA certificates (PHX and ABQ data centers) from OneOffs\Sophos_certificate.pem into the
+    LocalMachine Root store. Only missing certificates are installed unless -Force is used.
+    Also enables the Windows trust store in Firefox when Firefox is installed.
+    .PARAMETER Force
+    Reinstall all certificates in the PEM bundle even if they are already present.
+    .EXAMPLE
+    Install-SophosDnsCert
+    .EXAMPLE
+    Install-SophosDnsCert -Force
+    #>
     [CmdletBinding()]
     param(
         [switch]$Force
@@ -636,8 +651,9 @@ Function Install-SophosDnsCert {
 
     Write-Host "Checking Root Certificates"
     $expectedThumbprints = @(
-        "F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD"  # Sophos cert expiring 2036
-        "BCDD30059715B32E64B79DBC37688C60CEF4F965" #PHX DataCenter early 2026
+        "F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD" # Sophos Internet Protection Root CA, expires 2044
+        "BCDD30059715B32E64B79DBC37688C60CEF4F965" # PHX DataCenter SSL CA (CA_yxwlRPvOh3TSWki), expires 2036
+        "80521857332C512366DBD96B910ADA93E9A42DC6" # ABQ DataCenter SSL CA (CA_pQmJJzMk8nRoDQm), expires 2036
 		# Add more thumbprints here as needed
     )
 

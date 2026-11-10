@@ -1559,7 +1559,7 @@ Function Install-WindowsMcpPrereqs {
 			Return $false
 		}
 		If (-not $PSCmdlet.ShouldProcess($Dir, 'Add to Machine PATH')) { Return $false }
-		Set-ItemProperty -Path $Key -Name Path -Value (($Parts + $Dir) -join ';') -Type ExpandString -ErrorAction Stop
+		Set-ItemProperty -Path $Key -Name Path -Value (($Parts + $Dir) -join ';') -Type ExpandString -Confirm:$false -ErrorAction Stop
 		If (($env:Path -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $Target) { $env:Path = "$env:Path;$Dir" }
 		Write-Host "Added to Machine PATH: $Dir" -ForegroundColor Green
 		Return $true
@@ -1567,6 +1567,8 @@ Function Install-WindowsMcpPrereqs {
 
 	Function Install-UvRelease {
 		Param([Parameter(Mandatory = $true)][string]$Destination)
+		# .NET method failures (network, locked files) are only statement-terminating by default; make them stop the install
+		$ErrorActionPreference = 'Stop'
 		# Use the native OS architecture; $env:PROCESSOR_ARCHITECTURE reports AMD64 inside x64 emulation on ARM64
 		$NativeArch = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
 		$Triple = Switch ($NativeArch) { 'AMD64' {'x86_64'} 'ARM64' {'aarch64'} 'x86' {'i686'} Default {$null} }
@@ -1581,7 +1583,7 @@ Function Install-WindowsMcpPrereqs {
 		$BaseUrl = "https://github.com/astral-sh/uv/releases/download/$Tag"
 
 		$TempFolder = Join-Path -Path $env:TEMP -ChildPath ('UvInstall_' + [guid]::NewGuid().ToString('N'))
-		$null = New-Item -Path $TempFolder -ItemType Directory -Force
+		$null = New-Item -Path $TempFolder -ItemType Directory -Force -Confirm:$false
 		$OldProgressPreference = $ProgressPreference
 		$ProgressPreference = 'SilentlyContinue'
 		Try {
@@ -1600,7 +1602,7 @@ Function Install-WindowsMcpPrereqs {
 			Add-Type -AssemblyName System.IO.Compression.FileSystem
 			$Zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
 			Try {
-				$null = New-Item -Path $Destination -ItemType Directory -Force
+				$null = New-Item -Path $Destination -ItemType Directory -Force -Confirm:$false
 				ForEach ($Bin in 'uv.exe', 'uvx.exe', 'uvw.exe') {
 					# Match on the file name only and write to a fixed path, so zip entry paths cannot escape $Destination
 					$Entry = $Zip.Entries | Where-Object { $_.Name -ieq $Bin } | Select-Object -First 1
@@ -1609,7 +1611,11 @@ Function Install-WindowsMcpPrereqs {
 						Write-Verbose "$Bin was not found in $Asset, skipping it."
 						Continue
 					}
-					[System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, (Join-Path -Path $Destination -ChildPath $Bin), $true)
+					Try {
+						[System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, (Join-Path -Path $Destination -ChildPath $Bin), $true)
+					} Catch {
+						Throw "Could not write $Bin to $Destination. Close anything running uv or uvx (such as Claude Desktop) and try again. $($_.Exception.Message)"
+					}
 					Write-Verbose "Extracted $Bin to $Destination"
 				}
 			} Finally {
@@ -1617,7 +1623,7 @@ Function Install-WindowsMcpPrereqs {
 			}
 		} Finally {
 			$ProgressPreference = $OldProgressPreference
-			Remove-Item -Path $TempFolder -Recurse -Force -ErrorAction SilentlyContinue
+			Remove-Item -Path $TempFolder -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
 		}
 	}
 

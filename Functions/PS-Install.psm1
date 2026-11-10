@@ -1464,6 +1464,239 @@ Function Install-UmbrellaDnsCert {
 	}
 }
 
+Function Install-WindowsMcpPrereqs {
+	<#
+	.SYNOPSIS
+		Installs the Windows-MCP prerequisites (Python 3.13+ and uv) for all users on this machine.
+	.DESCRIPTION
+		Python is installed machine-wide (C:\Program Files\Python313) with winget using --scope machine.
+		The Python folder and its Scripts folder are added to the Machine PATH if they are missing.
+
+		uv is installed to C:\Program Files\uv from the latest astral-sh/uv GitHub release for the
+		native OS architecture. The release zip is checked against the SHA256 file published with the
+		same release before uv.exe, uvx.exe and uvw.exe are extracted, and the folder is then added to
+		the Machine PATH. (The default uv installer is per-user only, and it does not verify its download.)
+		Because this is an unmanaged install, "uv self update" is disabled. Re-run with -Force to update uv.
+
+		Safe to re-run. Supports -WhatIf. Must run from an elevated 64-bit PowerShell session, either as an
+		administrator or as SYSTEM from an RMM. If winget is missing, Install-WinGet is tried first, but that
+		only works for a logged-on administrator, not for SYSTEM.
+	.PARAMETER PythonId
+		The winget package ID used to install Python. Default: Python.Python.3.13
+	.PARAMETER MinPython
+		The lowest machine-wide Python version that counts as already installed. Default: 3.13
+	.PARAMETER UvDir
+		The folder uv is installed to and added to the Machine PATH. Default: C:\Program Files\uv
+		Use an admin-only folder, because any folder on the Machine PATH is trusted by every user.
+	.PARAMETER Force
+		Reinstall uv from the latest release even if uv.exe is already in UvDir.
+	.EXAMPLE
+		Install-WindowsMcpPrereqs
+		Installs Python 3.13 and uv for all users, skipping anything already installed.
+	.EXAMPLE
+		Install-WindowsMcpPrereqs -WhatIf
+		Shows what would be installed and which PATH entries would be added without changing anything.
+	.EXAMPLE
+		Install-WindowsMcpPrereqs -Force -Verbose
+		Updates uv to the latest release with detailed logging.
+	.OUTPUTS
+		PSCustomObject with Python, PythonPath, Uv, UvPath and PathChanged properties.
+	.LINK
+		https://docs.astral.sh/uv/getting-started/installation/
+	.LINK
+		https://learn.microsoft.com/en-us/windows/package-manager/winget/returnCodes
+	#>
+	[CmdletBinding(SupportsShouldProcess)]
+	Param(
+		[ValidateNotNullOrEmpty()][string]$PythonId = 'Python.Python.3.13',
+		[version]$MinPython = '3.13',
+		[ValidateNotNullOrEmpty()][string]$UvDir = (Join-Path -Path $env:ProgramFiles -ChildPath 'uv'),
+		[switch]$Force
+	)
+
+	Function Get-WinGetPath {
+		$Cmd = Get-Command -Name winget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+		If ($Cmd) { Return $Cmd.Source }
+		# winget is not on PATH for SYSTEM / RMM sessions, so look in the App Installer package folder.
+		# Folder names look like Microsoft.DesktopAppInstaller_1.29.70.0_x64__8wekyb3d8bbwe, so sort by the parsed version.
+		$Hit = Get-ChildItem -Path "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+			Sort-Object -Descending -Property @{ Expression = {
+				$V = $null
+				If ([version]::TryParse(($_.Directory.Name -split '_')[1], [ref]$V)) { $V } Else { [version]'0.0' }
+			} } | Select-Object -First 1
+		If ($Hit) { Return $Hit.FullName }
+	}
+
+	Function Get-MachinePython {
+		Param([version]$Minimum)
+		$Root = 'HKLM:\SOFTWARE\Python\PythonCore'
+		If (-not (Test-Path -Path $Root)) { Return }
+		Get-ChildItem -Path $Root -ErrorAction SilentlyContinue | ForEach-Object {
+			# PEP 514 tags look like 3.13 or 3.13-arm64. Free-threaded tags (3.13t) do not parse and are skipped.
+			$Ver = $null
+			If ([version]::TryParse(($_.PSChildName -replace '-.*$', ''), [ref]$Ver) -and $Ver -ge $Minimum) {
+				$Ip = Get-ItemProperty -Path "$($_.PSPath)\InstallPath" -ErrorAction SilentlyContinue
+				# ExecutablePath is optional in PEP 514, so fall back to python.exe in the default value
+				$Exe = If ($Ip.ExecutablePath) { $Ip.ExecutablePath } ElseIf ($Ip.'(default)') { Join-Path -Path $Ip.'(default)' -ChildPath 'python.exe' }
+				If ($Exe -and (Test-Path -Path $Exe -PathType Leaf)) {
+					[pscustomobject]@{ Version = $Ver; Exe = $Exe; Dir = (Split-Path -Path $Exe -Parent) }
+				}
+			}
+		} | Sort-Object -Property Version -Descending | Select-Object -First 1
+	}
+
+	Function Add-MachinePath {
+		[CmdletBinding(SupportsShouldProcess)]
+		Param([Parameter(Mandatory = $true)][string]$Dir)
+		$Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+		# Read the raw value so %SystemRoot% style entries are preserved when writing it back
+		$Raw = (Get-Item -Path $Key).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+		$Parts = @($Raw -split ';' | Where-Object { $_ })
+		# Compare expanded values so an existing %ProgramFiles%\uv entry is not duplicated as C:\Program Files\uv
+		$Target = [Environment]::ExpandEnvironmentVariables($Dir).TrimEnd('\')
+		If ($Parts | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') -ieq $Target }) {
+			Write-Verbose "Already in Machine PATH: $Dir"
+			Return $false
+		}
+		If (-not $PSCmdlet.ShouldProcess($Dir, 'Add to Machine PATH')) { Return $false }
+		Set-ItemProperty -Path $Key -Name Path -Value (($Parts + $Dir) -join ';') -Type ExpandString -Confirm:$false -ErrorAction Stop
+		If (($env:Path -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $Target) { $env:Path = "$env:Path;$Dir" }
+		Write-Host "Added to Machine PATH: $Dir" -ForegroundColor Green
+		Return $true
+	}
+
+	Function Install-UvRelease {
+		Param([Parameter(Mandatory = $true)][string]$Destination)
+		# .NET method failures (network, locked files) are only statement-terminating by default; make them stop the install
+		$ErrorActionPreference = 'Stop'
+		# Use the native OS architecture; $env:PROCESSOR_ARCHITECTURE reports AMD64 inside x64 emulation on ARM64
+		$NativeArch = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
+		$Triple = Switch ($NativeArch) { 'AMD64' {'x86_64'} 'ARM64' {'aarch64'} 'x86' {'i686'} Default {$null} }
+		If (-not $Triple) { Throw "Unsupported processor architecture for uv: $NativeArch" }
+		$Asset = "uv-$Triple-pc-windows-msvc.zip"
+
+		# Resolve the latest tag first so the zip and its checksum come from the same release
+		$Request = [System.Net.WebRequest]::Create('https://github.com/astral-sh/uv/releases/latest')
+		$Response = $Request.GetResponse()
+		Try { $Tag = $Response.ResponseUri.Segments[-1] } Finally { $Response.Dispose() }
+		If ($Tag -notmatch '^\d+\.\d+\.\d+$') { Throw "Unexpected uv release tag: $Tag" }
+		$BaseUrl = "https://github.com/astral-sh/uv/releases/download/$Tag"
+
+		$TempFolder = Join-Path -Path $env:TEMP -ChildPath ('UvInstall_' + [guid]::NewGuid().ToString('N'))
+		$null = New-Item -Path $TempFolder -ItemType Directory -Force -Confirm:$false
+		$OldProgressPreference = $ProgressPreference
+		$ProgressPreference = 'SilentlyContinue'
+		Try {
+			$ZipPath = Join-Path -Path $TempFolder -ChildPath $Asset
+			$ShaPath = "$ZipPath.sha256"
+			Write-Host "Downloading uv $Tag ($Asset)" -ForegroundColor Cyan
+			Invoke-WebRequest -Uri "$BaseUrl/$Asset" -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
+			Invoke-WebRequest -Uri "$BaseUrl/$Asset.sha256" -OutFile $ShaPath -UseBasicParsing -ErrorAction Stop
+
+			If ((Get-Content -Path $ShaPath -Raw) -notmatch '^\s*([0-9a-fA-F]{64})\b') { Throw "Could not read the SHA256 checksum for $Asset" }
+			$Expected = $Matches[1]
+			$Actual = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash
+			If ($Actual -ne $Expected) { Throw "SHA256 mismatch for $Asset. Expected $Expected, got $Actual" }
+			Write-Verbose "SHA256 verified for ${Asset}: $Actual"
+
+			Add-Type -AssemblyName System.IO.Compression.FileSystem
+			$Zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+			Try {
+				$null = New-Item -Path $Destination -ItemType Directory -Force -Confirm:$false
+				ForEach ($Bin in 'uv.exe', 'uvx.exe', 'uvw.exe') {
+					# Match on the file name only and write to a fixed path, so zip entry paths cannot escape $Destination
+					$Entry = $Zip.Entries | Where-Object { $_.Name -ieq $Bin } | Select-Object -First 1
+					If (-not $Entry) {
+						If ($Bin -eq 'uv.exe') { Throw "uv.exe was not found in $Asset" }
+						Write-Verbose "$Bin was not found in $Asset, skipping it."
+						Continue
+					}
+					Try {
+						[System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, (Join-Path -Path $Destination -ChildPath $Bin), $true)
+					} Catch {
+						Throw "Could not write $Bin to $Destination. Close anything running uv or uvx (such as Claude Desktop) and try again. $($_.Exception.Message)"
+					}
+					Write-Verbose "Extracted $Bin to $Destination"
+				}
+			} Finally {
+				$Zip.Dispose()
+			}
+		} Finally {
+			$ProgressPreference = $OldProgressPreference
+			Remove-Item -Path $TempFolder -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+		}
+	}
+
+	$Principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+	If (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Throw 'Run this from an elevated PowerShell session.'
+	}
+	# Some RMM agents launch 32-bit PowerShell, which sees the 32-bit registry and Program Files (x86)
+	If ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+		Throw "Run this from 64-bit PowerShell. From a 32-bit host, use $env:SystemRoot\sysnative\WindowsPowerShell\v1.0\powershell.exe"
+	}
+	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+	$PathChanged = $false
+
+	# ---- Python (machine-wide) ----
+	$Py = Get-MachinePython -Minimum $MinPython
+	If ($Py) {
+		Write-Host "Python $($Py.Version) already installed machine-wide: $($Py.Dir)" -ForegroundColor Green
+	} ElseIf ($PSCmdlet.ShouldProcess($PythonId, 'winget install (scope machine)')) {
+		$WinGet = Get-WinGetPath
+		$IsSystem = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
+		If (-not $WinGet -and -not $IsSystem -and (Get-Command -Name Install-WinGet -ErrorAction SilentlyContinue)) {
+			Write-Host 'winget not found, trying Install-WinGet...' -ForegroundColor Yellow
+			Install-WinGet
+			$WinGet = Get-WinGetPath
+		}
+		If (-not $WinGet) { Throw 'winget is not available. Run Install-WinGet as a logged-on administrator first.' }
+
+		Write-Host "Installing $PythonId for all users..." -ForegroundColor Cyan
+		& $WinGet install --id $PythonId --exact --source winget --scope machine --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Host
+		# -1978335189 (0x8A15002B) = no applicable update, -1978335135 (0x8A150061) = package already installed
+		If ($LASTEXITCODE -notin 0, -1978335189, -1978335135) { Throw "winget exited with code $LASTEXITCODE" }
+
+		$Py = Get-MachinePython -Minimum $MinPython
+		If (-not $Py) {
+			Throw "Python $MinPython or newer was not found in HKLM after the install. If winget reported it as already installed, it may be a per-user install."
+		}
+		Write-Host "Python $($Py.Version) installed: $($Py.Dir)" -ForegroundColor Green
+	}
+	If ($Py) {
+		# The winget manifest passes PrependPath=1, but verify rather than assume
+		If (Add-MachinePath -Dir $Py.Dir) { $PathChanged = $true }
+		If (Add-MachinePath -Dir (Join-Path -Path $Py.Dir -ChildPath 'Scripts')) { $PathChanged = $true }
+	}
+
+	# ---- uv (machine-wide) ----
+	$UvExe = Join-Path -Path $UvDir -ChildPath 'uv.exe'
+	If ((Test-Path -Path $UvExe) -and -not $Force) {
+		Write-Host "uv already installed: $UvExe (use -Force to update)" -ForegroundColor Green
+	} ElseIf ($PSCmdlet.ShouldProcess($UvDir, 'Install uv from the latest GitHub release')) {
+		Install-UvRelease -Destination $UvDir
+		If (-not (Test-Path -Path $UvExe)) { Throw "uv.exe was not found in $UvDir after the install." }
+		Write-Host "uv installed: $UvExe" -ForegroundColor Green
+	}
+	If (Test-Path -Path $UvExe) {
+		If (Add-MachinePath -Dir $UvDir) { $PathChanged = $true }
+	}
+
+	# ---- Verify ----
+	$PyVer = If ($Py) { & $Py.Exe --version } Else { $null }
+	$UvVer = If (Test-Path -Path $UvExe) { & $UvExe --version } Else { $null }
+	If ($PathChanged) {
+		Write-Host 'Machine PATH changed. Users must sign out and back in (or restart Claude Desktop from a fresh session) to pick it up.' -ForegroundColor Yellow
+	}
+	[pscustomobject]@{
+		Python      = "$PyVer"
+		PythonPath  = If ($Py) { $Py.Exe } Else { $null }
+		Uv          = "$UvVer"
+		UvPath      = If (Test-Path -Path $UvExe) { $UvExe } Else { $null }
+		PathChanged = $PathChanged
+	}
+}
+
 Function Install-WinGet {
 	<#
 	.SYNOPSIS

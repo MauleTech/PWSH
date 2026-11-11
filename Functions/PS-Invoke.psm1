@@ -1792,8 +1792,402 @@ Function Invoke-Win10Decrap {
 	$progressPreference = 'silentlyContinue'
 	Set-ExecutionPolicy Bypass -Scope Process -Force
 	Enable-SSL
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Win-10-DeCrapifier/Windows10Decrapifier.txt -UseBasicParsing | Invoke-Expression
+	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Win-10-DeCrapifier/Windows10Decrapifier.txt -UseBasicParsing | Invoke-Expression
 }
+
+Function Invoke-Win11Decrap {
+<#
+	.SYNOPSIS
+		Runs the Maule Techs Windows 11 Decrapifier against the local machine.
+
+	.DESCRIPTION
+		Windows 11 rework of the Spiceworks Windows 10 Decrapifier, scoped for devices that are
+		going to be managed workforce endpoints (Microsoft 365, Intune and/or Action1, Defender).
+
+		This is a SEPARATE command from Invoke-Win10Decrap, which still runs the original
+		unmodified Windows 10 script. Use this one on Windows 11 builds.
+
+		Key differences from Invoke-Win10Decrap, all documented in
+		Scripts\Win-10-DeCrapifier\WINDOWS11-REVIEW.md:
+
+		  * DiagTrack (Connected User Experiences and Telemetry) is left running and
+		    AllowTelemetry is set to 1 (Required) rather than 0. Intune Endpoint Analytics
+		    requires DiagTrack running, Windows Update for Business reports require diagnostic
+		    data at Required minimum, and Defender for Endpoint logs Event 62 when the service
+		    cannot start.
+		  * The Start menu section is gone. Import-StartLayout is deprecated on Windows 11 and
+		    threw a terminating error on every run of the old script.
+		  * The keep-list covers Teams, new Outlook, Office Hub, Company Portal, Get Help,
+		    PowerShell 7, the Remote Desktop family and current OEM driver companions.
+		  * App removal skips inbox system packages by SignatureKind rather than relying on a
+		    hand-maintained keep-list, so new Windows components are not swept in.
+		  * Adds Windows 11 era controls: Recall, Click to Do, Paint generative AI, Copilot,
+		    Widgets, show file extensions, and the post-sign-in setup nag.
+
+		The script is taken from the local clone of this repository when one is present, and
+		downloaded from GitHub otherwise. A transcript is written to
+		SYSTEMDRIVE\Windows11DCtranscript.txt unless -NoLog is used.
+
+		Output is verbose by default so a run can be checked rather than assumed: an environment
+		banner, a package triage showing what was skipped and why, every registry value written,
+		and a closing pass that reads the important settings back and reports PASS/FAIL. Pass
+		-Quiet for the summary only.
+
+		Requires an elevated session. Reboot the machine when it finishes.
+
+	.PARAMETER AllApps
+		Remove ALL removable app packages including the Microsoft Store. Rarely what you want.
+
+	.PARAMETER LeaveTasks
+		Leave scheduled tasks alone.
+
+	.PARAMETER LeaveServices
+		Leave services alone.
+
+	.PARAMETER RestrictAppAccess
+		Deny camera, microphone, contacts, calendar and library access to Store apps. Off by
+		default. Turning this on will break camera and microphone for Store-app callers, which
+		on most workforce builds means Teams.
+
+	.PARAMETER RestrictLocation
+		Deny location and sensor access. Off by default.
+
+	.PARAMETER DisableOneDrive
+		Disable OneDrive by policy and remove it from File Explorer. Off by default, because
+		OneDrive is normally wanted on a Microsoft 365 workstation.
+
+	.PARAMETER Xbox
+		Leave Xbox apps, Xbox services and Game DVR alone.
+
+	.PARAMETER Cortana
+		Leave the legacy Cortana and Bing search keys alone.
+
+	.PARAMETER LeaveAI
+		Leave Recall, Click to Do, Copilot and the Paint generative AI features alone.
+
+	.PARAMETER DisableTelemetryService
+		Stop and disable DiagTrack and set AllowTelemetry to 0. DO NOT USE on anything managed
+		by Intune, Action1 reporting or Defender for Endpoint. Present only for genuinely
+		unmanaged standalone machines.
+
+	.PARAMETER NoLog
+		Do not write a transcript.
+
+	.PARAMETER AppsOnly
+		Only remove app packages.
+
+	.PARAMETER SettingsOnly
+		Only apply settings, services and scheduled task changes.
+
+	.PARAMETER Force
+		Run even if the machine does not report a Windows 11 build.
+
+	.PARAMETER Quiet
+		Suppress the detailed per-item output. Verbose is the DEFAULT: the script prints an
+		environment banner, the full package triage (what was skipped and why), every registry
+		value it writes, and a post-run pass that reads the important settings back and reports
+		PASS/FAIL. Use -Quiet only once a build process is trusted and you want the summary alone.
+
+	.EXAMPLE
+		Invoke-Win11Decrap
+
+		Standard workforce build. Removes consumer apps, disables CEIP tasks, applies privacy,
+		advertising and AI settings to the current user, the default profile and the machine.
+
+	.EXAMPLE
+		Invoke-Win11Decrap -SettingsOnly
+
+		Apply the settings to a machine whose apps have already been handled, for example one
+		that was run through Invoke-Win11Debloat first.
+
+	.EXAMPLE
+		Invoke-Win11Decrap -Quiet
+
+		Same work, summary output only. For trusted build automation, not for a first run.
+
+	.EXAMPLE
+		Invoke-Win11Decrap -RestrictAppAccess -RestrictLocation -DisableOneDrive
+
+		Locked-down kiosk or shared device. Note this breaks Teams camera and microphone.
+#>
+	[CmdletBinding(DefaultParameterSetName = "Decrapifier")]
+	param(
+		[switch]$AllApps,
+		[switch]$LeaveTasks,
+		[switch]$LeaveServices,
+		[switch]$RestrictAppAccess,
+		[switch]$RestrictLocation,
+		[switch]$DisableOneDrive,
+		[switch]$Xbox,
+		[switch]$Cortana,
+		[switch]$LeaveAI,
+		[switch]$DisableTelemetryService,
+		[switch]$NoLog,
+		[switch]$Force,
+		[switch]$Quiet,
+		[Parameter(ParameterSetName = "AppsOnly")]
+		[switch]$AppsOnly,
+		[Parameter(ParameterSetName = "SettingsOnly")]
+		[switch]$SettingsOnly
+	)
+
+	$RelativePath = "Scripts\Win-11-DeCrapifier\Windows11Decrapifier.txt"
+	$ScriptUrl    = "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Win-11-DeCrapifier/Windows11Decrapifier.txt"
+
+	Write-Host "Windows 11 Decrapifier (Maule Techs)" -ForegroundColor Cyan
+
+	# Prefer the local clone so a machine that has already run LoadFunctions does not re-download.
+	$ScriptBody = $null
+	if ($Global:PWSHFolder) {
+		$LocalPath = Join-Path $Global:PWSHFolder $RelativePath
+		if (Test-Path $LocalPath) {
+			Write-Host "  Using local copy: $LocalPath" -ForegroundColor DarkGray
+			$ScriptBody = Get-Content -Path $LocalPath -Raw
+		}
+	}
+
+	if (-not $ScriptBody) {
+		Write-Host "  Downloading from GitHub..." -ForegroundColor DarkGray
+		try {
+			if (Get-Command Enable-SSL -ErrorAction SilentlyContinue) { Enable-SSL }
+			$ProgressPreference = 'SilentlyContinue'
+			$ScriptBody = (Invoke-WebRequest -Uri $ScriptUrl -UseBasicParsing -ErrorAction Stop).Content
+		} catch {
+			Write-Host "  Failed to retrieve the Decrapifier script: $_" -ForegroundColor Red
+			return
+		}
+	}
+
+	if ([string]::IsNullOrWhiteSpace($ScriptBody)) {
+		Write-Host "  Retrieved an empty script. Aborting." -ForegroundColor Red
+		return
+	}
+
+	# A scriptblock is used rather than Invoke-Expression so the script's own param() block
+	# actually binds. Invoke-Expression cannot take arguments, which is why Invoke-Win10Decrap
+	# has never been able to pass switches through.
+	try {
+		$DecrapBlock = [scriptblock]::Create($ScriptBody)
+	} catch {
+		Write-Host "  Could not parse the Decrapifier script: $_" -ForegroundColor Red
+		return
+	}
+
+	& $DecrapBlock @PSBoundParameters
+}
+
+
+Function Invoke-Win11Debloat {
+<#
+	.SYNOPSIS
+		Runs Andrew Taylor's RemoveBloat.ps1 with a Maule Techs keep-list, after verifying the
+		script's Authenticode signature.
+
+	.DESCRIPTION
+		Wrapper around the community RemoveBloat.ps1 maintained by Andrew Taylor
+		(https://github.com/andrew-s-taylor/public/tree/main/De-Bloat). It is the closest
+		maintained equivalent to our Decrapifier and is built for MSP deployment.
+
+		Why this exists alongside Invoke-Win11Decrap:
+
+		  * Taylor's script removes apps from an explicit removal list, so it can never sweep in
+		    a Windows component nobody has whitelisted. Our Decrapifier keeps a deny-by-default
+		    model with a SignatureKind guard.
+		  * It handles OEM Win32 crapware (HP, Dell, Lenovo, McAfee) which our script does not
+		    touch at all.
+		  * It already leaves DiagTrack and telemetry alone for Endpoint Analytics, matching our
+		    F1 finding.
+
+		This wrapper adds three things:
+
+		  1. Authenticode verification. The upstream script is signed by "Open Source Developer
+		     Andrew Taylor" through the Certum CA. Because the script is fetched over the
+		     internet and run with full privilege, the signature is checked before execution and
+		     the run aborts if it does not validate. A pinned SHA256 is deliberately not used;
+		     upstream ships changes frequently and a pinned hash would fail constantly.
+		  2. A keep-list. Taylor's default bloat list removes several packages we want on a
+		     workforce build, notably Get Help, Quick Assist, Remote Desktop, Alarms, Intel
+		     Graphics, Media Player and the cross-device stack.
+		  3. AllowStartMenuReset defaults to false. When enabled on Windows 11, upstream
+		     downloads a start2.bin binary from its own GitHub repository into the default user
+		     profile. That is an unsigned third-party binary in a user's shell state, so it is
+		     opt-in here.
+
+		CAUTION: the OEM Win32 removal is aggressive. Validate on a test build for each vendor
+		you deploy, especially Dell, where management tooling shares naming with the crapware.
+
+		Logs to C:\ProgramData\Debloat\Debloat.log (upstream behaviour).
+
+	.PARAMETER AdditionalKeep
+		Extra EXACT package or program names to protect, added to the built-in keep-list.
+		Upstream matches these exactly, not as substrings, so use full names such as
+		"Microsoft.WindowsCamera", not "camera".
+
+	.PARAMETER AdditionalRemove
+		Extra app names to remove, passed through to upstream's custombloatlist.
+
+	.PARAMETER TasksToRemove
+		Scheduled tasks to DELETE. Left empty by default; deleting tasks is harder to reverse
+		than disabling them, and Invoke-Win11Decrap disables the CEIP tasks instead.
+
+	.PARAMETER AllowStartMenuReset
+		Let upstream reset the Start menu. On Windows 11 this downloads a start2.bin from
+		upstream's GitHub repository into the default profile. Off by default.
+
+	.PARAMETER ExpectedSigner
+		Substring required in the signing certificate subject. Defaults to
+		"Open Source Developer Andrew Taylor". Change this only if upstream re-keys.
+
+	.PARAMETER SkipSignatureCheck
+		Run even if the Authenticode signature is missing or does not validate. Intended for
+		break-glass use on a machine with no path to the revocation lists; it removes the only
+		integrity control on a script that runs with full privilege.
+
+	.PARAMETER ScriptUrl
+		Override the upstream URL, for example to run a vendored copy.
+
+	.EXAMPLE
+		Invoke-Win11Debloat
+
+		Standard run: upstream bloat removal plus OEM crapware, with the Maule Techs keep-list
+		applied and the Start menu left alone.
+
+	.EXAMPLE
+		Invoke-Win11Debloat -AdditionalKeep 'Microsoft.WindowsMaps','Notepad++'
+
+		Protect two more items on top of the built-in keep-list.
+
+	.EXAMPLE
+		Invoke-Win11Debloat; Invoke-Win11Decrap -SettingsOnly
+
+		Recommended combination while both are being evaluated: Taylor's script does app and OEM
+		removal, ours applies the privacy, telemetry and Windows 11 AI settings.
+#>
+	[CmdletBinding()]
+	param(
+		[string[]]$AdditionalKeep,
+		[string[]]$AdditionalRemove,
+		[string[]]$TasksToRemove,
+		[switch]$AllowStartMenuReset,
+		[string]$ExpectedSigner = "Open Source Developer Andrew Taylor",
+		[switch]$SkipSignatureCheck,
+		[string]$ScriptUrl = "https://raw.githubusercontent.com/andrew-s-taylor/public/main/De-Bloat/RemoveBloat.ps1"
+	)
+
+	# Packages upstream would remove that a Maule Techs workforce build should keep.
+	# These must be EXACT names: upstream matches with -in / -notin, not wildcards.
+	$MauleKeepList = @(
+		# Microsoft 365 and management
+		'MSTeams',
+		'Microsoft.OutlookForWindows',
+		'Microsoft.MicrosoftOfficeHub',
+		'Microsoft.CompanyPortal',
+		'Microsoft.Todos',
+		# Support and admin tooling
+		'Microsoft.GetHelp',
+		'MicrosoftCorporationII.QuickAssist',
+		'Microsoft.PowerShell',
+		'Microsoft.WindowsTerminal',
+		'Microsoft.SysinternalsSuite',
+		'Microsoft.RemoteDesktop',
+		'MicrosoftCorporationII.MicrosoftRemoteDesktop',
+		'MicrosoftCorporationII.Windows365',
+		# Inbox apps users expect
+		'Microsoft.WindowsAlarms',
+		'Microsoft.WindowsSoundRecorder',
+		'Microsoft.WindowsCamera',
+		'Microsoft.ZuneMusic',
+		'Microsoft.YourPhone',
+		'MicrosoftWindows.CrossDevice',
+		# Vendor tooling we actually drive. Taylor's script removes Dell Command | Update by
+		# default; Update-DellPackages in PS-Update.psm1 installs it and shells out to dcu-cli,
+		# so debloating a Dell would break driver updates until the next Update-DellPackages run
+		# reinstalled it.
+		'Dell Command | Update',
+		'Dell Command | Update for Windows Universal',
+		'Dell Command | Update for Windows 10',
+		'DellInc.DellCommandUpdate',
+		# Vendor companion apps and drivers
+		'AppUp.IntelGraphicsExperience',
+		'AppUp.IntelArcSoftware',
+		'AppUp.IntelManagementandSecurityStatus',
+		'AppUp.IntelOptaneMemoryandStorageManagement',
+		'NotepadPlusPlus'
+	)
+
+	$KeepList = $MauleKeepList
+	if ($AdditionalKeep) { $KeepList += $AdditionalKeep }
+
+	Write-Host "Windows 11 Debloat (Andrew Taylor RemoveBloat.ps1)" -ForegroundColor Cyan
+
+	$WorkFolder = if ($Global:ITFolder) { Join-Path $Global:ITFolder "Debloat" } else { Join-Path $env:ProgramData "Debloat" }
+	if (-not (Test-Path $WorkFolder)) {
+		New-Item -ItemType Directory -Path $WorkFolder -Force | Out-Null
+	}
+	$ScriptPath = Join-Path $WorkFolder "RemoveBloat.ps1"
+
+	Write-Host "  Downloading $ScriptUrl" -ForegroundColor DarkGray
+	try {
+		if (Get-Command Enable-SSL -ErrorAction SilentlyContinue) { Enable-SSL }
+		$ProgressPreference = 'SilentlyContinue'
+		Invoke-WebRequest -Uri $ScriptUrl -OutFile $ScriptPath -UseBasicParsing -ErrorAction Stop
+	} catch {
+		Write-Host "  Download failed: $_" -ForegroundColor Red
+		return
+	}
+
+	# Integrity gate. This script runs with full privilege, so verify who signed it before
+	# handing it the machine. Any failure here fails closed.
+	$Signature = $null
+	try {
+		$Signature = Get-AuthenticodeSignature -FilePath $ScriptPath -ErrorAction Stop
+	} catch {
+		Write-Host "  [WARN] Could not evaluate the Authenticode signature: $_" -ForegroundColor Yellow
+	}
+
+	$Status  = if ($Signature) { $Signature.Status } else { "<not evaluated>" }
+	$Subject = if ($Signature -and $Signature.SignerCertificate) { $Signature.SignerCertificate.Subject } else { "<unsigned>" }
+
+	Write-Host "  Signature status : $Status" -ForegroundColor DarkGray
+	Write-Host "  Signed by        : $Subject" -ForegroundColor DarkGray
+
+	$SignatureOk = ($Status -eq 'Valid') -and ($Subject -like "*$ExpectedSigner*")
+
+	if (-not $SignatureOk) {
+		if ($SkipSignatureCheck) {
+			Write-Host "  [WARN] Signature check failed but -SkipSignatureCheck was supplied. Continuing." -ForegroundColor Red
+		} else {
+			Write-Host "  [ABORT] Signature did not validate as '$ExpectedSigner'." -ForegroundColor Red
+			Write-Host "          Expected status 'Valid' from that publisher. Investigate before running." -ForegroundColor Red
+			Write-Host "          Use -SkipSignatureCheck only if you have verified the file another way." -ForegroundColor Red
+			return
+		}
+	} else {
+		Write-Host "  [OK] Publisher verified." -ForegroundColor Green
+	}
+
+	$Arguments = @{
+		customwhitelist     = ($KeepList -join ',')
+		AllowStartMenuReset = if ($AllowStartMenuReset) { "true" } else { "false" }
+	}
+	if ($AdditionalRemove) { $Arguments['custombloatlist'] = ($AdditionalRemove -join ',') }
+	if ($TasksToRemove)    { $Arguments['TasksToRemove']   = ($TasksToRemove -join ',') }
+
+	Write-Host "  Protecting $($KeepList.Count) packages/programs from removal." -ForegroundColor DarkGray
+	if (-not $AllowStartMenuReset) {
+		Write-Host "  Start menu reset disabled (upstream would fetch a start2.bin from GitHub)." -ForegroundColor DarkGray
+	}
+	Write-Host "  Upstream log: C:\ProgramData\Debloat\Debloat.log" -ForegroundColor DarkGray
+	Write-Host ""
+
+	& $ScriptPath @Arguments
+
+	Write-Host ""
+	Write-Host "Debloat finished. Reboot this computer." -ForegroundColor Yellow
+	Write-Host "Follow with 'Invoke-Win11Decrap -SettingsOnly' to apply the privacy," -ForegroundColor DarkGray
+	Write-Host "telemetry and Windows 11 AI settings." -ForegroundColor DarkGray
+}
+
 
 Function Invoke-OneDriveFreeUpSpace {
 <#
@@ -1818,6 +2212,18 @@ Function Invoke-OneDriveFreeUpSpace {
 		Use -UserName to target specific profiles, or -Path to point at one specific
 		folder.
 
+		After the attrib flags are set, the function looks up each affected user's
+		per-user "OneDrive Startup Task-<SID>" scheduled task (the logon-triggered task
+		Windows creates to launch onedrive.exe for that user) and, if that user is
+		currently logged on interactively, runs Start-ScheduledTask against it. This is
+		the same task Windows already fires at logon; nudging it here just prompts the
+		already-running (or about-to-start) OneDrive sync agent to notice the flag
+		change sooner instead of waiting for the next natural trigger (logon, or
+		OneDrive's own periodic rescan). The task will not run for a user who is not
+		logged on, because it is configured to run only in that user's interactive
+		session; the function detects this and skips those users rather than erroring.
+		Use -SkipOneDriveRestart to disable this behavior entirely.
+
 	.PARAMETER Mode
 		FreeSpace (default): unpin files so OneDrive dehydrates them to cloud-only.
 		KeepLocal: pin files so OneDrive downloads and keeps them locally.
@@ -1835,6 +2241,13 @@ Function Invoke-OneDriveFreeUpSpace {
 		Contoso") roots. Pass additional patterns for SharePoint or tenant sync folders,
 		e.g. @("OneDrive*", "SharePoint - *") or @("OneDrive*", "*Contoso*").
 
+	.PARAMETER SkipOneDriveRestart
+		Skip triggering each affected user's "OneDrive Startup Task-<SID>" scheduled
+		task after processing. By default the function attempts this for every user
+		whose folders were processed, but only actually starts the task for a user who
+		is currently logged on interactively (required by the task's own logon-trigger
+		configuration).
+
 	.EXAMPLE
 		Invoke-OneDriveFreeUpSpace
 		Free local space across every user's OneDrive folders on this machine.
@@ -1851,9 +2264,16 @@ Function Invoke-OneDriveFreeUpSpace {
 		Invoke-OneDriveFreeUpSpace -FolderFilter @('OneDrive*', 'SharePoint - *')
 		Include SharePoint sync folders in addition to OneDrive.
 
+	.EXAMPLE
+		Invoke-OneDriveFreeUpSpace -Mode FreeSpace -UserName 'jdoe' -SkipOneDriveRestart
+		Free jdoe's local space without attempting to trigger their OneDrive scheduled task.
+
 	.OUTPUTS
-		PSCustomObject with FoldersProcessed, FoldersFailed, and Folders properties.
-		Folders is a list of per-folder result objects (Folder, Status, Detail).
+		PSCustomObject with FoldersProcessed, FoldersFailed, Folders, and
+		OneDriveRestarts properties. Folders is a list of per-folder result objects
+		(Folder, Status, Detail). OneDriveRestarts is a list of per-user objects
+		(Sid, Account, Status, Detail) describing whether that user's OneDrive
+		startup task was triggered.
 
 	.NOTES
 		Adapted from a long-running community pattern (originally posted by u/criostage on
@@ -1862,6 +2282,13 @@ Function Invoke-OneDriveFreeUpSpace {
 
 		Uses one recursive attrib.exe call per sync folder rather than walking individual
 		files, which is many orders of magnitude faster on populated trees.
+
+		A folder whose root (or any subfolder under it) has no plain files directly
+		inside it, only nested subfolders, causes attrib to print "File not found - *"
+		for that level; this is a benign quirk of how attrib's wildcard matching works
+		with /S /D and does not stop it from recursing further or processing the
+		subfolders themselves, so it is filtered out of the failure detection rather
+		than reported as a per-folder failure.
 
 		Author: Maule Technologies
 #>
@@ -1880,7 +2307,10 @@ Function Invoke-OneDriveFreeUpSpace {
 
 		[Parameter()]
 		[ValidateNotNullOrEmpty()]
-		[string[]]$FolderFilter = @('OneDrive*')
+		[string[]]$FolderFilter = @('OneDrive*'),
+
+		[Parameter()]
+		[switch]$SkipOneDriveRestart
 	)
 
 	$ModeConfig = @{
@@ -1891,6 +2321,22 @@ Function Invoke-OneDriveFreeUpSpace {
 	$ActionVerb = $ModeConfig[$Mode].Verb
 
 	$FoldersToProcess = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+	# Maps each folder in $FoldersToProcess to the SID of the profile that owns it, so the
+	# OneDrive Startup Task restart step below knows which users were actually affected.
+	$FolderOwnerSid = @{}
+
+	# Push Special = false to WMI so SYSTEM/LocalService/NetworkService/defaultuser0
+	# are filtered server-side. LocalPath honors a redirected ProfilesDirectory. Queried
+	# up front (even in -Path mode) so folders can be attributed back to an owning SID
+	# for the OneDrive Startup Task restart step.
+	$AllUserProfiles = @()
+	$ProfileQueryError = $null
+	try {
+		$AllUserProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = false' -ErrorAction Stop |
+			Where-Object { Test-Path -LiteralPath $_.LocalPath })
+	} catch {
+		$ProfileQueryError = $_.Exception.Message
+	}
 
 	if ($Path) {
 		$Resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
@@ -1899,16 +2345,19 @@ Function Invoke-OneDriveFreeUpSpace {
 			return
 		}
 		$null = $FoldersToProcess.Add($Resolved.Path)
+
+		$OwningProfile = $AllUserProfiles | Where-Object {
+			$Resolved.Path -eq $_.LocalPath -or $Resolved.Path -like "$($_.LocalPath)\*"
+		} | Select-Object -First 1
+		if ($OwningProfile) {
+			$FolderOwnerSid[$Resolved.Path] = $OwningProfile.SID
+		}
 	} else {
-		# Push Special = false to WMI so SYSTEM/LocalService/NetworkService/defaultuser0
-		# are filtered server-side. LocalPath honors a redirected ProfilesDirectory.
-		try {
-			$Profiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = false' -ErrorAction Stop |
-				Where-Object { Test-Path -LiteralPath $_.LocalPath })
-		} catch {
-			Write-Warning "Could not query Win32_UserProfile: $($_.Exception.Message)"
+		if ($ProfileQueryError) {
+			Write-Warning "Could not query Win32_UserProfile: $ProfileQueryError"
 			return
 		}
+		$Profiles = $AllUserProfiles
 
 		if ($UserName) {
 			$Profiles = $Profiles | Where-Object { $UserName -contains (Split-Path $_.LocalPath -Leaf) }
@@ -1927,6 +2376,7 @@ Function Invoke-OneDriveFreeUpSpace {
 			foreach ($Filter in $FolderFilter) {
 				foreach ($Found in Get-ChildItem -LiteralPath $UserProfile.LocalPath -Directory -Filter $Filter -ErrorAction SilentlyContinue) {
 					$null = $FoldersToProcess.Add($Found.FullName)
+					$FolderOwnerSid[$Found.FullName] = $UserProfile.SID
 				}
 			}
 		}
@@ -1969,17 +2419,81 @@ Function Invoke-OneDriveFreeUpSpace {
 			if ($Pushed) { Pop-Location }
 		}
 
-		# attrib is silent on success and writes to stderr on per-file failure. Any
-		# captured output (locale-independent) means at least one item failed, even when
-		# the process exit code is 0.
-		$Failed = $LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($AttribOutput)
+		# attrib is silent on success and writes to stderr on per-file failure. But when
+		# a directory (at the root or anywhere under it, since /S recurses) contains only
+		# subfolders and no plain files directly inside it, attrib prints "File not found
+		# - *" for that directory level even though /D and /S still correctly process the
+		# subfolders and keep recursing. That specific line is therefore benign noise, not
+		# a failure; OneDrive folders routinely have no loose files at the root. Any other
+		# output (e.g. "Access is denied") is a genuine per-file failure. This benign-line
+		# match is locale-dependent (assumes English Windows); a non-English OS will fall
+		# back to treating all attrib output as failures, same as before.
+		$OutputLines = @($AttribOutput -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+		$RealIssueLines = @($OutputLines | Where-Object { $_.Trim() -notmatch '^File not found - \*$' })
+		$Failed = $LASTEXITCODE -ne 0 -or $RealIssueLines.Count -gt 0
 		if ($Failed) {
 			$FoldersFailed++
 			Write-Verbose "attrib.exe issues in ${Folder}: $AttribOutput"
-			$FolderResults.Add([pscustomobject]@{ Folder = $Folder; Status = 'Failed'; Detail = $AttribOutput })
+			$FolderResults.Add([pscustomobject]@{ Folder = $Folder; Status = 'Failed'; Detail = ($RealIssueLines -join "`n") })
 		} else {
 			$FoldersDone++
 			$FolderResults.Add([pscustomobject]@{ Folder = $Folder; Status = 'Done'; Detail = '' })
+		}
+	}
+
+	$OneDriveRestarts = [System.Collections.Generic.List[pscustomobject]]::new()
+	$AffectedSids = @()
+
+	if (-not $SkipOneDriveRestart) {
+		$AffectedSids = @($FolderOwnerSid.Values | Select-Object -Unique)
+
+		if ($AffectedSids.Count -gt 0) {
+			# One Win32_Process query covers every affected SID; GetOwner is the standard
+			# CIM way to map a running process back to the account it runs as, and is how
+			# a logged-on interactive user is detected here (via their explorer.exe shell).
+			$ExplorerOwners = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+			Get-CimInstance -ClassName Win32_Process -Filter "Name = 'explorer.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+				$Owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+				if ($Owner -and $Owner.ReturnValue -eq 0) {
+					$null = $ExplorerOwners.Add("$($Owner.Domain)\$($Owner.User)")
+				}
+			}
+
+			foreach ($Sid in $AffectedSids) {
+				$TaskName = "OneDrive Startup Task-$Sid"
+
+				$Account = $null
+				try {
+					$Account = ([System.Security.Principal.SecurityIdentifier]$Sid).Translate([System.Security.Principal.NTAccount]).Value
+				} catch {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $null; Status = 'Skipped'; Detail = 'Could not resolve SID to an account name' })
+					continue
+				}
+
+				if (-not $ExplorerOwners.Contains($Account)) {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Skipped'; Detail = 'User is not currently logged on interactively' })
+					continue
+				}
+
+				# Requires the ScheduledTasks module (built in on Windows 10/11 and Server 2012+).
+				$Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+				if (-not $Task) {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Skipped'; Detail = "Scheduled task '$TaskName' not found" })
+					continue
+				}
+
+				if (-not $PSCmdlet.ShouldProcess($TaskName, 'Start-ScheduledTask (trigger OneDrive sync)')) {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Skipped'; Detail = 'Skipped by -WhatIf' })
+					continue
+				}
+
+				try {
+					Start-ScheduledTask -InputObject $Task -ErrorAction Stop
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Triggered'; Detail = '' })
+				} catch {
+					$OneDriveRestarts.Add([pscustomobject]@{ Sid = $Sid; Account = $Account; Status = 'Failed'; Detail = $_.Exception.Message })
+				}
+			}
 		}
 	}
 
@@ -1989,19 +2503,25 @@ Function Invoke-OneDriveFreeUpSpace {
 	$FailColor = if ($FoldersFailed -gt 0) { 'Red' } else { 'Gray' }
 	Write-Host "  Folders with errors : $FoldersFailed" -ForegroundColor $FailColor
 	Write-Host "Note: OneDrive sync agent must be running for the disk-space change to materialize." -ForegroundColor Gray
+	if (-not $SkipOneDriveRestart -and $AffectedSids.Count -gt 0) {
+		$RestartedCount = @($OneDriveRestarts | Where-Object { $_.Status -eq 'Triggered' }).Count
+		Write-Host "  OneDrive tasks triggered : $RestartedCount of $($AffectedSids.Count)" -ForegroundColor Green
+	}
 
 	[pscustomobject]@{
 		FoldersProcessed = $FoldersDone
 		FoldersFailed    = $FoldersFailed
 		Folders          = $FolderResults
+		OneDriveRestarts = $OneDriveRestarts
 	}
 }
+
 
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDTmsSsEGpiZ3LE
-# WlEoAv/Hne3bkUuPiWnA92xocBhSMKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDwNxxcTfBh7Wnl
+# dCJc/4fwTmTVBHGVgEsgt3phNd1ZOKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -2102,44 +2622,44 @@ Function Invoke-OneDriveFreeUpSpace {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -2183,33 +2703,33 @@ Function Invoke-OneDriveFreeUpSpace {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IAx9bRuGN2TFfZmJ9iwq8ARtDM1J7FPwXjKrDLq5okPxMA0GCSqGSIb3DQEBAQUA
-# BIICAMio5b308B3TUmRrqxYahnGrT020kMf8p7o7UuZPUHogy0LIxyi62O3I0Vui
-# Jedwls3EjHQwl8c7CfLJZbrNPu2ldgfq+6txlk8cnrY+JM70QMB99v4NZSeg7flJ
-# uXpi08pztJWKBiY+Gm5RrIVgZ45qAI4YGCxRykIV7wh7WVM66pGqe6uFayP3J/Z/
-# 3+ajaUhE/1qZgc8raxOeenSqp0810b2DlMrOv6aoz9Bc81CFUAUFzWSoHUnnlhkB
-# XSklSqrHlHv+wUfH9YfRg4Bbolw02Z3pQMQYSk5vJBO0plC36p+6SKvzbd4m+ow0
-# 9te7mRE72sVPgDyD5FWXWC442B5wha8vgfI1ZuBrC3qvU/FV/amrkOFy2sLauwPT
-# EbzzM0FC+5txD8kjrol6YgTJL4i0KqlvIglA1M1bDWx+2dQoIOYeaxQgqxgIMFUN
-# SkL0yFG7FFrh2koJGta339qKvrcFNkwnqzyEkUwrhgFS73pZVMSCOSSGo51W4DyV
-# GrUrjmT1ztiklO1q1HyAmdBH6skmKfxh8ZGl0pMTUhvdvD5yNi5BtOFJ2Y1tfCHD
-# eyyayEkhva7vMXw+QaJnOAml2TQ8pgnlXv0wMjbcE64UfptBdeM5PD5MgbXaub5M
-# G4H/N4JIJb8D5WdI6MSruBra9h6WIjrkXbwGnxPtN/541uL6oYIDJjCCAyIGCSqG
+# IHXaXB/Dn3qiNf3pfHgfsofxiSdW64eF1OMOTIvbiFMTMA0GCSqGSIb3DQEBAQUA
+# BIICAD6m+YLGMKe8zDo1rAHwwVNF+nr5HAH4pJneLfsV80wOnn3mDz8ZgAwNyufO
+# XprMpRGsDVqvdYwmfVH+ysiEiierzPkInIBpCm/e1rcYb0H4+b6rOjJi/3FRvvCd
+# xRjnJMm/M45JiGBWpVUTr/seuUKyVhjfAdIYmiOAoXTnjp8tmow3JLdFrX/LkSVD
+# vmzNzbqfKgg5W+OyURjSdynkBiArb6qTOrYwLZFkY0yxlxIM1S/2JjF0jd6XCe9w
+# grXML7F19A8WwHwnRwiCvmxIgA4I9Bey5kMN1qgziFib6+v83vjDAbrY7O/9GcOU
+# TXGH60wRe/IXaWtINRygiqzCohflN0J1Zgh8eM1qWG/T4gAQmRtjelV5c+XqXfAu
+# 2qWo1SGCUwjpd1r5clMQ4IZZnuL1KQm1ggS+vDn9tDisHfh+HFHGv7GY2FOGc9jK
+# kCDI93OBSiHrqqEVtU2Ltul7hf2/MjGDbZ900LU0qNPAA4spzP5VuQeT4luGsjJj
+# hrdFtTWNSe5+lA0Nu4MgfHn5yObSkyFvGRjVz0V0FyW0P9G7b7Z2yVvCvFyE1aoZ
+# idCVIKfEAAXfB+Q704FZnDRN31rtLLI7fNUVjQSE8aL0RtbgbJzpXECf3tpENtzq
+# PcYTXd/YdJmY10EJiTaHMlWCp1B7dKyaMgvjuBDWfbCOA/mtoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NFowLwYJKoZIhvcNAQkEMSIEIAWwA6E6
-# /u9axSWOO6T4F9FL4Oy3elvxRMK8c1/M4WDlMA0GCSqGSIb3DQEBAQUABIICAJ/8
-# qmg/oEHWr9dOjBqDcLCkWBss4tC2SMJgyPG3IoFP+Hc2Exup8m+ts1TRjcSdu7Ej
-# 9o4FHg9u4S66w3SWy9NaAAsW/EiTGkXzXwlDa961H++gZQZByb2s4E58hFkf4xqk
-# 4t2Urd5w+SzK7lYRQvJbtzCMUav4Z/hiyB/SfF4bjFKfrKlXu+1IJkl+of3r63M3
-# +JTZcQD5afIl63Fk7NRqEC8KKLQluR7QwqzcWk8OAgn9BtNvK9Eifwd7hge+X0Hn
-# QV0HY+wvKcuOD08qDu3INe+Oce4y63lr8+Ddmu1X7WlNEC3lVU9ZiIT7mp1L1vXo
-# YLsClZj0rM2kU5UmrP2w2ZD7BKcfwK9Pypb8RviQp+6oktdP0hyyNRQzYslV/kMp
-# O7JgTH3UNxtMzuIWxIrZ8aC8W0+48D0F19FsEQQcXH6NFgkke4XM1lBvLXKhPzz2
-# MP4cNaEmbnI4gp35bELpXLrVli4ebj8IQvZefbI7SqwF4AUnq20yLPNrsNn7NPcD
-# PzhpNGbGodbVO1EU1LvDKrZhTPaIiIMMnjLIBv/rMt/w3jB5mY1z5gX2LszdvPE+
-# gXiT7tdUxqoB49GWzzunM4e98wzWy0VBNksjHZUaOgkxMre1L33kxbLvrhxDuZlc
-# X9zZV1xBkLWujeSv6f3QHH12Ke1pCO1bR3e9p1Sc
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOVowLwYJKoZIhvcNAQkEMSIEIMSof+60
+# MI9dYD+uFVD/x9tipVFsjNKuro9sesD0yA+hMA0GCSqGSIb3DQEBAQUABIICAG9M
+# vJxbzf4jaL34qAb67rF23EHMv3wqZtvKyMkzQ0D0Xla1qLW5NvrUCijopzZKbqE7
+# 8Dk6vV9rSLVmAomHib1PPWreDsVfNgbNQVG5NAskAJrjwt53bHc2aKd73OW48ZUm
+# Za6XUt3dDnsObyVzPuiOu4Pez9Vdfu6CIji2nlm/F3BZPxGfUGkScc4BeSKnEq+g
+# VYxorDaMvnwPhbxC/zrCsx9nRr5Sd8OuPdvHIs84H88mhL3flLfBp5XiViZtqlm5
+# w1Us+tFqYvelnAu/5RhGf9NHWp57KYK7hy+2U7VZlyhJYbCyvm6bl6xxyBWBPc5x
+# 7OnCALIHAAUWV8WwEDqtgrmc4D4vQ7ZrMeshhl9QpFSsmZQGAJmNL87litbzBGc8
+# 3sPHwsQ8P9P6W0VdogVI1rzbehWYLLiTSfFdgS30t1lRKBvRdQyp8RuJo+wggPKW
+# U0Mok1qw3XfCUpmkXwN3SBWGxPnUP43fv83WN7ui9TT4iN3/qm0Xfnc7sjrfzBmg
+# yWMfwozhF58cSlCCNAIWZGRsVh1mmLrCfDOpmhoahnktp+V4iWGtGjZVlZjfiDd6
+# jS3yNNELKCvTRjtdSQG9a8IUidtnroyppaI5Q9sSQO8Fr4dr67mcLlaXEMednspb
+# mR5JBeC3RhBW6tULLkKPiN2ukick3TYHZoyZVNPp
 # SIG # End signature block

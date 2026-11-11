@@ -39,6 +39,47 @@ Function Add-ChromeShortcut{
 	#>
 }
 
+Function Add-EdgeShortcut{
+	param
+	(
+		[Parameter(Mandatory=$true)]
+		[string]$Label,
+
+		[Parameter(Mandatory=$true)]
+		[string]$Url
+	)
+
+	If (Test-Path -Path 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe') {
+		$TargetFile = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+	} ElseIf (Test-Path -Path 'C:\Program Files\Microsoft\Edge\Application\msedge.exe') {
+		$TargetFile = "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+	} Else {
+		Write-Host "Microsoft Edge was not found. Please install manually or with Chocolatey:"
+		Write-Host "   Install-Choco"
+		Write-Host "   choco install microsoft-edge"
+	}
+
+	If ($TargetFile) {
+		$ShortcutFile = "$env:Public\Desktop\" + $Label + ".lnk"
+		$WScriptShell = New-Object -ComObject WScript.Shell
+		$Shortcut = $WScriptShell.CreateShortcut($ShortcutFile)
+		$Shortcut.TargetPath = $TargetFile
+		$Shortcut.Arguments = $Url
+		$Shortcut.Save()
+	}
+	<#
+	.SYNOPSIS
+		Creates a Microsoft Edge Shortcut on the "All Users" Desktop.
+		If Microsoft Edge is not found, prompts to install the program using Chocolatey.
+	.PARAMETER Label
+		The file name of the shortcut; ".lnk" is automatically appended.
+	.PARAMETER Url
+		The full URL that the shortcut intends to open: "https://www.google.com/"
+	.EXAMPLE
+		Add-EdgeShortcut -Label "Github PWSH" -Url "https://github.com/MauleTech/PWSH/"
+	#>
+}
+
 Function Add-FileFolderShortcut {
 	param
 	(
@@ -725,8 +766,8 @@ server port:i:3389
 
 			Write-Host "Creating Shortcut at $_"
 
-			# Write RDP file with UTF8 encoding
-			$CurrentRDPFile | Out-File $_ -Encoding UTF8
+			# Write RDP file with Unicode encoding
+			$CurrentRDPFile | Out-File $_ -Encoding Unicode
 
 			if (!(Test-Path $_ -ErrorAction SilentlyContinue)) {
 				Write-Error "Unable to create Shortcut at $_"
@@ -910,11 +951,120 @@ Function Add-RDPCertificate {
 	}
 }
 
+Function Add-WiFiProfile {
+	<#
+	.SYNOPSIS
+		Adds a Windows WiFi (WLAN) profile from profile XML.
+	.DESCRIPTION
+		Adds a wireless profile with "netsh wlan add profile". The profile can be passed as an XML
+		string or as a path to an XML file, such as one created by "netsh wlan export profile".
+		The XML is checked to be a WLANProfile document (DTDs are refused) before it is given to netsh.
+		When an XML string is passed, it is written to a uniquely named temporary file that is deleted
+		as soon as netsh finishes, because the XML may contain a plaintext network key.
+		Throws a terminating error if the profile could not be added, so callers can use try/catch.
+	.PARAMETER ProfileXml
+		The WLAN profile XML as a string.
+	.PARAMETER Path
+		Path to a WLAN profile XML file.
+	.PARAMETER User
+		All (default) makes the profile available to every user on this computer.
+		Current makes it available to the current user only.
+	.EXAMPLE
+		Add-WiFiProfile -Path "C:\IT\Wi-Fi-OfficeWifi.xml"
+		Adds the exported OfficeWifi profile for all users.
+	.EXAMPLE
+		Add-WiFiProfile -ProfileXml $Xml -User Current
+		Adds the profile in $Xml for the current user only.
+	.NOTES
+		Used by Connect-Wifi and Import-WiFiProfiles.
+		Adding all-user profiles normally requires administrative privileges.
+	#>
+	[CmdletBinding(DefaultParameterSetName = 'Xml')]
+	param(
+		[Parameter(Mandatory = $true, ParameterSetName = 'Xml')]
+		[ValidateNotNullOrEmpty()]
+		[string]$ProfileXml,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'Path')]
+		[ValidateNotNullOrEmpty()]
+		[string]$Path,
+
+		[ValidateSet('All', 'Current')]
+		[string]$User = 'All'
+	)
+
+	if ($PSCmdlet.ParameterSetName -eq 'Path') {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+			throw "File not found: $Path"
+		}
+		$profileFile = (Resolve-Path -LiteralPath $Path).ProviderPath
+		$ProfileXml = [System.IO.File]::ReadAllText($profileFile)
+	}
+
+	# Parse with DTD processing off so a crafted file cannot expand entities or reach external resources
+	$readerSettings = New-Object System.Xml.XmlReaderSettings
+	$readerSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+	$readerSettings.XmlResolver = $null
+	$xmlDoc = New-Object System.Xml.XmlDocument
+	$xmlDoc.XmlResolver = $null
+	$reader = [System.Xml.XmlReader]::Create((New-Object System.IO.StringReader($ProfileXml)), $readerSettings)
+	try {
+		$xmlDoc.Load($reader)
+	} catch {
+		throw "The WiFi profile is not valid XML: $($_.Exception.Message)"
+	} finally {
+		$reader.Dispose()
+	}
+
+	if ($xmlDoc.DocumentElement.LocalName -ne 'WLANProfile') {
+		throw "The XML is not a WLAN profile (root element is '$($xmlDoc.DocumentElement.LocalName)', expected 'WLANProfile')."
+	}
+	$nameNode = $xmlDoc.DocumentElement.SelectSingleNode("*[local-name()='name']")
+	if (-not $nameNode -or [string]::IsNullOrWhiteSpace($nameNode.InnerText)) {
+		throw "The WLAN profile has no <name> element."
+	}
+	$profileName = $nameNode.InnerText
+
+	$tempProfileXML = $null
+	try {
+		if ($PSCmdlet.ParameterSetName -eq 'Xml') {
+			# Drop any XML declaration (it may claim UTF-16) and write UTF-8 without BOM for netsh
+			if ($xmlDoc.FirstChild -is [System.Xml.XmlDeclaration]) {
+				[void]$xmlDoc.RemoveChild($xmlDoc.FirstChild)
+			}
+			$tempProfileXML = Join-Path -Path $env:TEMP -ChildPath ("WiFiProfile-" + [guid]::NewGuid().ToString('N') + ".xml")
+			$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+			[System.IO.File]::WriteAllText($tempProfileXML, $xmlDoc.OuterXml, $Utf8NoBom)
+			$profileFile = $tempProfileXML
+		}
+
+		Write-Verbose "Running: netsh wlan add profile filename=`"$profileFile`" user=$($User.ToLower())"
+		$addResult = & netsh wlan add profile filename="$profileFile" user=$($User.ToLower()) 2>&1
+		$addExitCode = $LASTEXITCODE
+		$addResultString = ($addResult | Out-String).Trim()
+	} finally {
+		if ($tempProfileXML -and (Test-Path -LiteralPath $tempProfileXML)) {
+			Remove-Item -LiteralPath $tempProfileXML -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	# netsh exit codes are unreliable, so also check the text. The profile name is removed first
+	# so a network called e.g. "ErrorFree" is not mistaken for a failure.
+	$outputWithoutName = $addResultString -replace [regex]::Escape($profileName), ''
+	if ($addExitCode -ne 0 -or $outputWithoutName -match 'is not valid|error|fail|denied') {
+		$isElevated = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+		$hint = if ($User -eq 'All' -and -not $isElevated) { " Try again from an elevated session, or use -User Current." } else { "" }
+		throw "Failed to add WiFi profile '$profileName': $addResultString$hint"
+	}
+
+	Write-Host "WiFi profile '$profileName' added." -ForegroundColor Green
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAYczuL0qNuPqe+
-# JKnfjHdcMK7UbWdK90bj/a8bhNyD6KCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAKV6XvBVGu/0mZ
+# +w9XblO8GaGRt5hzE8zJlTJCmFQ9X6CCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -1015,44 +1165,44 @@ Function Add-RDPCertificate {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -1096,33 +1246,33 @@ Function Add-RDPCertificate {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IPCPcuME4QYskt6C5jjNTynUb+f2Cg8d/vlVQCUwR5A2MA0GCSqGSIb3DQEBAQUA
-# BIICAFcRGqcxLXo8Tf8BfKvsrdcKAo53BOv0XqYpWTsVkBKNwoVVkOkeBmYwmRxn
-# cTOZBI5j+Q2UPVSlXQaw7cb+YvPM/q0uumn3tZhR95XTKTjmtGWLrb+R2clyuMgU
-# G9Ic+dx+H0mtFTYHj9gmpHv7hXVLO7hrl158iGMoN9MGw5cT3TBgNqyZqJsfLT6S
-# gvzrB9GyLJjEiVTDUaKD0ahhPEjuNMKu5J5Eue4rli12IgFbS1B44lz6a8g1JbRa
-# mW3EI+8UamjJcS+i+nG42O43YO49qDd+htv5LtYieLcvGDUp/fj5NWRjMg7pCKwX
-# uo7tB0EOa2LIofIBMMzr4zQH24vTSzX3y7Re7SheFbQ0l+N7EymKSzl2cOVAY8tW
-# Btpu/ObcghL5GOjhLhsd7G9OYxLa+p8Tk20e8oTcFkY0RhcTd2CVDDj/vW8L+t7v
-# irlgCkDvpwZFdJoXiPisWtPG9gSYYCroLM++Lt3nAjrpTNfhe1FkqbaI0Vssaqh0
-# bwgWnUCcNRIhaTUFElcorALE+of3Qa1qe57ph650U6C/013bbCRKx4sjq84JX6Bb
-# 2yuPK7X3JKre3sv3JbB6Wp29h5E4Iy652MSH7IHG9nKidNluyYZlFehTVhzkFTcz
-# mWBhF7GyQYchS6/lf011CJVLY8Srsr8hCryOnfGgoZG0fCD/oYIDJjCCAyIGCSqG
+# IISDDkwOdsZ/xj4rrKTz3SojCgqPM9WivnMnoBifDS0XMA0GCSqGSIb3DQEBAQUA
+# BIICAEfWSNBXMQV2IYoUhP5q+lIaxSV4uA862ANcEFThsgvWkhLHBJ9gI8wgFEDK
+# LaktbO4lRNRTnWs5HVbICkX4zwpuJtBnjmnVD/OWnzJwvYnbpPAjkUPgBpOGjzov
+# 2OlCkY//t7R50xDqVDTQb8w/sCaTqchvG+lVqmRjvS14xnodV1WFS7yCbf2QaZyd
+# iN52zdi1+C1B3Oi20pkz5bdkaPKLcZcztkGLGe+eVxRl+G40I6hqLFc+/PZz0gHW
+# irx2d6ypdRr/CKRLccdaOlBjb3V/UFHZdkNEbNXeWq1CX+UUXgOriZd+gmVpjBQb
+# FtCkSos9nqQu9y/eN5UqMD5RC61BP3Ftu0ETpdeVBL6FAtgXFyRMIGXd31kXaZ6e
+# QlkFjmeENxBpo2gjTapGwHoLaXgriZzl1Tii3a5qLF4HciqLnIqgeLfysSSAJNaC
+# VP/rRcWJiaoGN4aMm+94P2c7FQYNwekdWodrnJ1WpH1cIPYIagVk4tGTKHR3Py7c
+# ksZqHra/mICKi8nmxU1GJztqWCBHEGfUiwBPMqy81gU2lVPrH0CPLYXfolwwinOg
+# prQww/QSNwPsUkP+HlXxI4h+DgpY+a1/nQLvmmejLYxCI0jDWFv8EvPjCP4dbDqH
+# k0lT7CsPgbhyMbQ7tnDgdGSuFaZsYR9rz8sp/zVWbXHzuBh6oYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0MlowLwYJKoZIhvcNAQkEMSIEII41YZm8
-# sTWfyB+0inPxAHwY2U/4abh1qzgFuh6gQjEPMA0GCSqGSIb3DQEBAQUABIICAIjc
-# 7kNrx8z0qjDzcJh9j2mXubvINj+pOpTE4izFdD+Mfy/0Maxj4csna1w7ycCuv8Aq
-# 4QNn6oG+1CyUYny5IdeA7svLsKr709Aa3mE2UrHgjh2xhKNPrhc/vwrFD08zJOMY
-# 0MmvhCRRQKIJIxLiDd0l07tqq5k9UiYmGaM0QEi6MMF0gYWZddrFMV9o42WOKnyx
-# NGBS3YysNlr3H97oH48v9j3SMmQ5KluMhnclF1iX2AC36S1kTYWP91ytLBlCCeJZ
-# 2GP8H6mG68r2ws8gMYuQoI05JV/8RE5FGW2MTsn3xQIw3usU0SXVI16MhWCc9IvB
-# jRQKXUwgkgDVWOgHUtZc956D6SUxuKRAF0VEeeMG4C66Mtt9x/iL+hMJT7cSGEMh
-# SqQMDsozdMCXjRMprAwDk4Wh+OGS1yuL8lVN74BGcCyGxmZwKh+yJav5ciSfOhve
-# p1xgyyRiKxTg2O3xUCp6PNMOmDnVmxZTo5a296VNslQ+bwFTgRKqOqqSdWEQsWTM
-# ObR5GK2P1YVQrOX0sSPXgq6eHTPUXLSg0mIjcx2VzUlfAWLnTLg5Y1nVamRW7aK8
-# fpuIjydCHnHwkv2zfOoyI94pWu5+/QBRpFCGxgsYpGY/xZFf8Prgm4EnaI+l3Pqn
-# X2Lz43uFIhK3GOU+nV4VgLS3gcnhE4Tiy1ny8tpW
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxN1owLwYJKoZIhvcNAQkEMSIEIBI5q+Y6
+# 9BaEt5IbTEr2ck+27XuAD8IajtKxRHUgaOBSMA0GCSqGSIb3DQEBAQUABIICAFJq
+# 48F/ytPwVpGeApcQo8d15sQKLE1vZBExw7gu6anm8nP3wjAkEIvhHltLMduca/q8
+# 6Jl8JGgmhtDEc5vVFYBf0qlyEfH+5+0lNhd4wQ3WJB+RFKgx41mMGO8YbMcspaNT
+# nDfSrMtJB5EoeJaaM8gpHgfHtpRTkMbugzJKJowD5y2+8qe+ACWBM+ZhlKA/X8ZK
+# jlG5hCynVJxSiSjZiMmZAcqQE6CnhQqkXeFCqfc5bblnWTZd7RE37Kzd4OiLXNFe
+# Tr/G+Cgr5x38k5X/XVSLv6Tva37Yo5VigyRNFfMDEa9Bg+u6uQ3Bp4O2jQpaYxy4
+# Ss4U5aGIKqCAZUREvwSBISCKxnsczkyOM3t0aBAVNZ1o8vbb+WXBTMxMdZMNNWjp
+# 5sq+4bC7Tye8r6wItIDRV3tBw7TuJp+iayJ/jp0xB1R4YP5cE5qklzlHVX84u5C9
+# E74gNEw6i7FLXbdd15Tz+gJuTNJ+HKYKhItf2XQ49xDZ/y62vNdUA9ArpW73ZVMJ
+# LdKDfpUijAwzRvwmQ3GBMedYm2anmCN7/JFafDVvW2syZN9HkTrlsCpJHrlZLn0W
+# 0mPBRhj5Ab4iWapJioAPBUvMOxBKBnQ/SBGp/ppc9mSvtJIxNA0XB+2Z4ogVDw9F
+# rR8SbWufT1b14K/6OwoDOfWdEiUieWJKqwWCJIFD
 # SIG # End signature block

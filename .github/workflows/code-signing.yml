@@ -15,6 +15,21 @@ on:
 permissions:
   contents: write
 
+# Only one signing run at a time per branch.
+#
+# Two merges landing close together used to race: the first run checked out main, signed,
+# committed, then found main had already moved and its push was rejected non-fast-forward.
+# Its signatures were dropped on the floor and the run failed. Serialising means each run
+# checks out a main that already carries the previous run's signature commit.
+#
+# cancel-in-progress is false so an in-flight run is never killed part way through signing.
+# If several merges land at once GitHub keeps only the newest pending run and cancels the
+# rest, which is safe here: Sign-Scripts.ps1 signs every script in the repository, not just
+# the ones a given push changed, so the surviving run covers the cancelled ones' files too.
+concurrency:
+  group: code-signing-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   sign-scripts:
     name: Sign PowerShell Scripts
@@ -54,12 +69,32 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           $changes = git diff --name-only HEAD
-          if ($changes) {
-            git add -- $changes
-            git commit -m "chore: apply Authenticode signatures to scripts [skip ci]"
-            git push
-            Write-Host "Signed scripts committed and pushed."
-          }
-          else {
+          if (-not $changes) {
             Write-Host "No signing changes to commit."
+            exit 0
           }
+
+          git add -- $changes
+          git commit -m "chore: apply Authenticode signatures to scripts [skip ci]"
+          if ($LASTEXITCODE -ne 0) {
+            throw "git commit failed with exit code $LASTEXITCODE."
+          }
+
+          git push
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Signed scripts committed and pushed."
+            exit 0
+          }
+
+          # Do NOT "fix" a rejected push by rebasing onto the new main and pushing again.
+          # This commit only rewrites signature blocks, and each block is computed over the
+          # file contents THIS run checked out. A rebase would replay those blocks on top of
+          # someone else's newer file contents, and git would merge them cleanly because the
+          # two changes touch different parts of the file. The result is a well-formed
+          # Authenticode block over content that no longer matches it: a signature that is
+          # silently invalid, which is worse than an unsigned file.
+          #
+          # The only safe recovery is to sign again from the current main. The next push to
+          # main does that automatically; to do it now, use "Run workflow" on this workflow.
+          Write-Host "::error::Push rejected. main moved while this run was signing, so these signatures are stale and were not published. Re-run this workflow against the current main."
+          throw "git push failed with exit code $LASTEXITCODE."

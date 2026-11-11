@@ -32,11 +32,13 @@ Enable-SSL #Enables SSL Permanently
 [Add]
 -----
   Add-ChromeShortcut
+  Add-EdgeShortcut
   Add-FileFolderShortcut
   Add-IEShortcut
   Add-RDPCertificate
   Add-RDPShortcut
   Add-WebShortcut
+  Add-WiFiProfile
 
 [Backup]
 --------
@@ -109,6 +111,7 @@ Enable-SSL #Enables SSL Permanently
   Export-ExchangeDistributionList
   Export-LDAPSCertificate
   Export-UsersOneDrive
+  Export-WiFiProfiles
 
 [Find]
 ------
@@ -123,6 +126,7 @@ Enable-SSL #Enables SSL Permanently
   Get-ADUsersPasswordExpiring
   Get-BitLockerKey
   Get-ClaudeCodeStatus
+  Get-ClientDiscovery
   Get-ComputerEntraStatus
   Get-ComputerLifecycleAgeBasis
   Get-ComputerLifecycleAssessment
@@ -171,6 +175,7 @@ Enable-SSL #Enables SSL Permanently
   Import-PPESenderLists
   Import-PPESingleUserSenderLists
   Import-WindowsInstallerDrivers
+  Import-WiFiProfiles
 
 [Install]
 ---------
@@ -179,7 +184,6 @@ Enable-SSL #Enables SSL Permanently
   Install-Choco
   Install-ClaudeCode
   Install-Croc
-  Install-ITS247Agent
   Install-NetExtender
   Install-NiniteApps
   Install-NinitePro
@@ -242,6 +246,8 @@ Enable-SSL #Enables SSL Permanently
   Remove-PathForcefully
   Remove-PpkgInstallFolder
   Remove-StaleObjects
+  Remove-StaleProfiles
+  Remove-UserProfile
 
 [Rename]
 --------
@@ -249,6 +255,7 @@ Enable-SSL #Enables SSL Permanently
 
 [Repair]
 --------
+  Repair-AdobeCreativeCloud
   Repair-DomainTrust
   Repair-ExchangeDAGCopies
   Repair-NTPConfiguration
@@ -302,6 +309,11 @@ Enable-SSL #Enables SSL Permanently
 ------
   Stop-StuckService
 
+[Test]
+------
+  Test-PendingReboot
+  Test-SmtpRelay
+
 [Uninstall]
 -----------
   Uninstall-Application
@@ -314,13 +326,12 @@ Enable-SSL #Enables SSL Permanently
 [Update]
 --------
   Update-ClaudeCode
-  Update-DattoAgent
   Update-DellPackages
   Update-DellServer
   Update-DnsServerRootHints
   Update-Edge
   Update-Everything
-  Update-ITS247Agent
+  Update-ITFunctions
   Update-NiniteApps
   Update-NTPDateTime
   Update-O365Apps

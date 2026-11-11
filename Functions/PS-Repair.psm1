@@ -1920,11 +1920,1033 @@ try {
 	#endregion
 }
 
+Function Repair-ChocoDependency {
+<#
+	.SYNOPSIS
+		Repairs "unresolved package dependency constraints" errors that block Chocolatey installs and upgrades.
+	.DESCRIPTION
+		Chocolatey v2.x refuses to install or upgrade ANY package while one or more
+		already-installed packages declare a dependency that is not present in the
+		lib folder. The blocking error reads:
+
+			"One or more unresolved package dependency constraints detected in the
+			 Chocolatey lib folder. All dependency constraints must be resolved to
+			 add or update packages."
+
+		This commonly happens on machines where packages such as
+		dotnet-8.0-desktopruntime or dellcommandupdate were installed without their
+		chocolatey-core.extension and vcredist140 dependencies. Until those missing
+		dependencies are present, even unrelated operations (upgrading pwsh or
+		microsoft-edge, "choco upgrade all", etc.) fail.
+
+		This function installs the missing dependency packages in a single
+		"choco install" call so Chocolatey resolves them as a group. Installing them
+		one at a time can fail, because each pass still sees the others as unresolved
+		(for example "choco install chocolatey-core.extension" fails while vcredist140
+		is still missing). The well-known culprits (chocolatey-core.extension and
+		vcredist140) are always included, and any additional dependency names found in
+		supplied choco output are added to the repair set.
+	.PARAMETER ChocoOutput
+		Optional captured output from a failed "choco install" / "choco upgrade"
+		operation. Any package names referenced by the unresolved-dependency errors
+		are parsed out and added to the repair set.
+	.PARAMETER AdditionalPackage
+		Optional extra package id(s) to include in the repair install.
+	.EXAMPLE
+		Repair-ChocoDependency
+	.EXAMPLE
+		$Output = choco upgrade pwsh -y --force 2>&1
+		If ($Output -match 'Unable to resolve dependency') { Repair-ChocoDependency -ChocoOutput $Output }
+	.NOTES
+		Requires Chocolatey. If choco.exe is missing it is installed first via Install-Choco.
+#>
+	[CmdletBinding()]
+	Param(
+		[Parameter(ValueFromPipeline = $true)]
+		[string[]]$ChocoOutput,
+
+		[Parameter()]
+		[string[]]$AdditionalPackage
+	)
+
+	# Make sure choco is available before trying to repair anything.
+	If (!(Get-Command choco -ErrorAction SilentlyContinue)) {
+		Write-Host "Chocolatey not found. Installing it first." -ForegroundColor Yellow
+		Install-Choco
+	}
+	If (!(Get-Command choco -ErrorAction SilentlyContinue)) {
+		Write-Host "Chocolatey is still not available, cannot repair dependencies." -ForegroundColor Red
+		Return $false
+	}
+
+	# chocolatey-core.extension and vcredist140 are by far the most common missing
+	# constraints. vcredist140 itself depends on chocolatey-core.extension, so listing
+	# both in one install lets choco resolve the whole group at once.
+	$RepairSet = New-Object System.Collections.Generic.List[string]
+	ForEach ($Pkg in @('chocolatey-core.extension', 'vcredist140')) { $RepairSet.Add($Pkg) }
+
+	# Pull any other unresolved dependency names out of the choco output we were handed.
+	# The blocking errors look like:
+	#   Unable to resolve dependency 'vcredist140'.
+	#   Unable to find a version of 'chocolatey-core.extension' that is compatible...
+	If ($ChocoOutput) {
+		$Text = $ChocoOutput -join "`n"
+		$Patterns = @(
+			"Unable to resolve dependency '([^']+)'",
+			"Unable to find a version of '([^']+)'"
+		)
+		ForEach ($Pattern in $Patterns) {
+			ForEach ($Match in [regex]::Matches($Text, $Pattern)) {
+				$Name = $Match.Groups[1].Value.Trim()
+				If ($Name -and ($RepairSet -notcontains $Name)) { $RepairSet.Add($Name) }
+			}
+		}
+	}
+
+	# Caller-specified extras.
+	ForEach ($Pkg in $AdditionalPackage) {
+		If ($Pkg -and ($RepairSet -notcontains $Pkg)) { $RepairSet.Add($Pkg) }
+	}
+
+	Write-Host "Repairing Chocolatey dependency constraints by installing: $($RepairSet -join ', ')" -ForegroundColor Cyan
+
+	# Install the whole set in one call so choco resolves them together. Packages that
+	# are already present at a satisfying version are skipped, so this is a safe no-op
+	# when nothing is actually broken.
+	$ChocoArgs = @('install') + $RepairSet + @('-y')
+	$RepairOutput = & choco @ChocoArgs 2>&1
+	$RepairText = $RepairOutput | Out-String
+	Write-Host $RepairText
+
+	If ($RepairText -match 'packages failed') {
+		Write-Host "Dependency repair reported one or more failures. Review C:\ProgramData\chocolatey\logs\chocolatey.log." -ForegroundColor Red
+		Return $false
+	}
+
+	Write-Host "Chocolatey dependency constraints repaired." -ForegroundColor Green
+	Return $true
+}
+
+Function Repair-AdobeCreativeCloud {
+	<#
+	.SYNOPSIS
+		Clears the Adobe Creative Cloud OOBE cache to fix sign-in loops and startup failures.
+	.DESCRIPTION
+		Resets the Creative Cloud desktop app by stopping its background processes and renaming
+		the per-user OOBE folders out of the way. Creative Cloud rebuilds them on next launch,
+		which clears the state behind the usual crop of complaints:
+
+		- Creative Cloud asks for a sign in every launch, or loops back to the sign in screen
+		- "Unable to reach Adobe servers" on an otherwise healthy internet connection
+		- The desktop app opens to a permanent spinner or a blank white window
+		- Apps show as not installed when they are installed, or the Apps tab never populates
+		- The app stays signed in to a stale account after the user's email or plan changed
+
+		Two folders hold that state, and both are reset:
+
+		- <profile>\AppData\Local\Adobe\OOBE
+		- <profile>\AppData\Roaming\Adobe\OOBE
+
+		Each is renamed to OOBE.old rather than deleted, so the original is still on disk if a
+		reset turns out not to have been the problem. Nothing is ever deleted: on a machine that
+		has been reset before, where OOBE.old already exists, the new backup takes a timestamped
+		name instead, so the first backup (the one holding the state from before any reset) is
+		never overwritten.
+
+		Nothing is uninstalled, no licensing data is touched, and installed apps are left alone.
+		The only cost to the user is signing in to Creative Cloud once more.
+
+		By default the function works on the profile it is running under. That is the wrong
+		profile when the toolbox is launched from an RMM tool such as ScreenConnect, which runs
+		as SYSTEM: the SYSTEM profile has no Creative Cloud state, so the run would report
+		nothing to do on a machine that needs the reset. Running as SYSTEM without a target is
+		therefore refused with a pointer to -AllUsers or -UserName rather than quietly doing
+		nothing useful.
+	.PARAMETER UserName
+		Reset the named profiles instead of the current one. Matches on the profile folder name
+		or the account name, so both "jdoe" and "CONTOSO\jdoe" resolve, as does the profile folder
+		jdoe.CONTOSO that a second domain logon creates. A name that matches no profile exactly is
+		reported with what it did match rather than acted on, so "rob" does not silently reset
+		rob.smith; name that profile exactly, or add -Force. A name that matches several profiles
+		is treated the same way. Requires an elevated session.
+	.PARAMETER AllUsers
+		Reset every real user profile on the machine. Service and built in profiles (SYSTEM,
+		LOCAL SERVICE, NETWORK SERVICE, Default, Public) are skipped. This is the switch to use
+		from an RMM or remote support tool running as SYSTEM. Requires an elevated session.
+	.PARAMETER SkipProcessStop
+		Leave the Creative Cloud processes running. Only useful when they have already been
+		stopped by hand, or on a machine where stopping them is not wanted. A running CoreSync
+		or Adobe Desktop Service holds an open handle on the OOBE folder, so the rename will
+		usually fail with the processes up.
+	.PARAMETER StopAllSessions
+		Stop matching Adobe processes no matter which account owns them. By default only
+		processes owned by a targeted user are stopped, so that resetting one profile on a
+		terminal server or shared workstation does not kill Creative Cloud for everyone else
+		signed in. Use this switch when process ownership cannot be read, which shows up as a
+		rename that fails because the folder is in use.
+	.PARAMETER Force
+		Proceed past the cases that are otherwise refused:
+
+		- -AllUsers on a machine with more than one user signed in at once, where the sweep would
+		  kill Creative Cloud in every live session on a terminal server. Resetting one signed in
+		  user, the ordinary workstation case, is not refused and does not need this switch.
+		- a -UserName value that matches no profile exactly and only matches one on folder prefix,
+		  where "rob" would otherwise reach into rob.smith.
+		- a -UserName value that matches several profiles outright, such as a local jdoe and a
+		  domain CONTOSO\jdoe. With -Force all of them are reset; without it, qualify the name.
+
+		A name that matches several profiles on folder prefix alone is refused even with -Force,
+		since there is nothing there to tell the operator's intent from a coincidence. Name one
+		of the profiles exactly.
+
+		This switch does not override the junction and symlink refusal. That one has its own
+		switch, -AllowJunctions, deliberately: the shared machine message above tells an operator
+		to rerun with -Force, and a -Force that also waved through a redirected path would turn
+		routine advice into a way to get an elevated rename pointed at C:\Windows.
+	.PARAMETER AllowJunctions
+		Reset through a junction, symlink, or unreadable folder in the path instead of refusing.
+
+		Somebody who moved their Adobe folder onto another drive with a junction hits that refusal
+		legitimately, and this is how they get past it. So does an attempt to make an elevated
+		rename land somewhere else, which is why it is a separate switch and why the path is
+		printed either way. Read the reported path before using this.
+	.PARAMETER ProcessWaitSeconds
+		How long to wait for the stopped processes to actually exit before renaming, in seconds.
+		Default 20. Adobe Desktop Service in particular takes a moment to release its handles.
+		Applies per pass, and there are at most two, so this is half the worst case wait.
+	.PARAMETER PassThru
+		Return a result object per folder instead of only printing the report, for logging or
+		for feeding into a wider maintenance script.
+	.OUTPUTS
+		None by default; the report is written to the host.
+
+		[PSCustomObject] per folder with -PassThru, carrying UserName, SID, Scope (Local or
+		Roaming), Path, Action, BackupPath, Warning, and Error. Warning is normally $null and
+		carries the path that was reset through when -AllowJunctions was used, so a log cannot
+		hide that one from a reset that was simply clean. Action is one of Renamed, NotPresent,
+		Skipped (declined at a -Confirm prompt, or previewed under -WhatIf), Failed (the rename did
+		not go through, almost always a lock), Redirected (a junction or symlink stands in the path
+		and the rename was refused), or Unreadable (a folder in the path would not report its
+		attributes, so a junction could not be ruled out and the rename was refused).
+	.NOTES
+		Requires an elevated session for -AllUsers and -UserName, since those reach into other
+		users' profiles. Resetting the current profile does not need elevation.
+
+		Nothing is ever deleted, so the OOBE.old folders stay on disk until someone removes them.
+		Once the user has confirmed Creative Cloud signs in and behaves, they are safe to delete
+		by hand. They are the only thing this function leaves behind.
+
+		The user should be signed out of Creative Cloud, or at least not mid sync, before this
+		runs. Files already synced to the cloud are safe; the OOBE folder holds sign in state
+		and desktop app configuration, not user documents.
+
+		For a profile other than the current one, the AppData paths are derived from the profile
+		folder. If Roaming AppData has been redirected to a network share by Group Policy, the
+		derived path will not be the live one and the roaming folder will be reported as not
+		present. Run the reset in the user's own session, or under -UserName from a machine that
+		can see the redirected path, when folder redirection is in play.
+
+		Deliberately not touched: the SLStore and SLCache licensing folders, which some older
+		walkthroughs also rename. Those carry activation state, and clearing them turns a sign
+		in nuisance into a licensing problem. If the OOBE reset does not fix it, the next step
+		is the Adobe Creative Cloud Cleaner Tool, not more folder renaming.
+
+		Creative Cloud restarts its own background processes on next launch. No reboot needed.
+	.EXAMPLE
+		Repair-AdobeCreativeCloud
+		Resets Creative Cloud for the account running the command. This is the form to use from
+		the user's own session.
+	.EXAMPLE
+		Repair-AdobeCreativeCloud -AllUsers
+		Resets every user profile on the machine. This is the form to use from ScreenConnect or
+		any other tool that runs as SYSTEM.
+	.EXAMPLE
+		Repair-AdobeCreativeCloud -UserName jdoe
+		Resets a single named profile, leaving other signed in users alone.
+	.EXAMPLE
+		Repair-AdobeCreativeCloud -AllUsers -WhatIf
+		Shows which folders would be renamed and which processes would be stopped, without
+		changing anything.
+	.EXAMPLE
+		Repair-AdobeCreativeCloud -AllUsers -PassThru | Export-Csv "$ITFolder\AdobeReset.csv" -NoTypeInformation
+		Logs the outcome per folder for a maintenance record.
+	.LINK
+		https://helpx.adobe.com/x-productkb/global/adobe-background-processes.html
+	.LINK
+		https://helpx.adobe.com/creative-cloud/kb/creative-cloud-desktop-app-troubleshooting.html
+	#>
+	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium', DefaultParameterSetName = 'CurrentUser')]
+	[OutputType([PSCustomObject])]
+	param (
+		[Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'UserName')]
+		[ValidateNotNullOrEmpty()]
+		[string[]] $UserName,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'AllUsers')]
+		[switch] $AllUsers,
+
+		[switch] $SkipProcessStop,
+
+		[switch] $StopAllSessions,
+
+		[switch] $Force,
+
+		[switch] $AllowJunctions,
+
+		[ValidateRange(0, 300)]
+		[int] $ProcessWaitSeconds = 20,
+
+		[switch] $PassThru
+	)
+
+	# Platform is absent on Windows PowerShell 5.1 and 'Win32NT' on PowerShell 7 for Windows,
+	# so this catches PowerShell 7 on Linux or macOS without touching the $IsWindows automatic
+	# variable, which does not exist under 5.1 and would trip Set-StrictMode.
+	If ($PSVersionTable.PSVersion.Major -ge 6 -and $PSVersionTable.Platform -ne 'Win32NT') {
+		Throw 'Repair-AdobeCreativeCloud resets Windows user profiles and requires Windows.'
+	}
+
+	# Creative Cloud desktop and its background helpers. Any of these can hold an open handle on
+	# the OOBE folder. The licensing side (AGSService and its AdobeGCClient, AdobeUpdateService)
+	# is deliberately left running: those are service launched, they read SLStore and SLCache
+	# rather than OOBE, and stopping them only earns a restart from the service control manager.
+	$AdobeProcessNames = @(
+		'Creative Cloud',
+		'Creative Cloud Helper',
+		'Adobe Desktop Service',
+		'AdobeIPCBroker',
+		'AdobeNotificationClient',
+		'Adobe CEF Helper',
+		'CoreSync',
+		'CCXProcess',
+		'CCLibrary'
+	)
+	$ProtectedSIDs = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')
+	$ProtectedNames = @('All Users', 'Default', 'Default User', 'LocalService', 'NetworkService', 'Public')
+
+	Function Get-AncestorChain {
+		# $Path and the parents above it, stopping below $StopAt or after $MaxDepth entries.
+		#
+		# $StopAt is the profile folder and is deliberately excluded, not just used as a stop
+		# sign. The profile root is created by Windows and its owner cannot replace it, so it
+		# buys no protection to scan, and scanning it breaks real machines: an FSLogix profile
+		# container mounts at C:\Users\<user> as a reparse point by design, and every profile on
+		# such a host would be refused as tampered with.
+		#
+		# The depth cap covers the case where $StopAt is never reached, which is what a
+		# GPO-redirected AppData does: without it, the walk would climb to the volume or UNC
+		# root and start judging shares nobody in this function has any business judging. Four
+		# levels is the whole user-writable span of the path being renamed: OOBE, Adobe, Local
+		# or Roaming, and AppData.
+		param ([string] $Path, [string] $StopAt, [int] $MaxDepth = 4)
+		$Chain = @()
+		$Current = $Path
+		While ($Current -and ($Chain.Count -lt $MaxDepth)) {
+			If ($StopAt -and ($Current.TrimEnd('\') -ieq $StopAt.TrimEnd('\'))) { Break }
+			$Chain += $Current
+			$Parent = Split-Path -Path $Current -Parent
+			If (-not $Parent -or ($Parent -eq $Current)) { Break }
+			$Current = $Parent
+		}
+		Return $Chain
+	}
+
+	Function Find-ReparsePoint {
+		# Returns the first junction or symlink among the given paths, or $null.
+		#
+		# This runs elevated, and under -AllUsers it runs as SYSTEM against folders inside profile
+		# directories the owning user can write. A user who replaces AppData\Local\Adobe with a
+		# junction to C:\Windows turns the rename below into "rename C:\Windows\OOBE", performed
+		# with privileges they do not have. Every link in the chain is checked, not just the final
+		# folder, since the OOBE folder can be perfectly ordinary while a parent is the redirect.
+		#
+		# Best effort, and worth being clear about why: this is a path check, so a user who plants
+		# the junction in the window between this scan and the rename still wins the race. Closing
+		# that properly needs the rename done against a handle opened with FILE_FLAG_OPEN_REPARSE_
+		# POINT, which is out of reach from Windows PowerShell 5.1 without P/Invoke. What this does
+		# buy is that a junction sitting there in advance, the version of the trick that does not
+		# require the attacker to be watching, does not work.
+		param ([string[]] $Paths)
+		ForEach ($Path in $Paths) {
+			If (-not $Path) { Continue }
+			Try {
+				$Item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+			} Catch {
+				# A folder whose attributes will not read is not a folder that has been cleared.
+				# The owner of a profile can deny FILE_READ_ATTRIBUTES on a folder inside it while
+				# leaving traverse allowed, and treating that as clean would hand back exactly the
+				# redirect this function exists to catch.
+				Return [PSCustomObject]@{ Path = $Path; Kind = 'Unreadable'; Reason = "could not be inspected ($($_.Exception.Message))" }
+			}
+			If ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+				Return [PSCustomObject]@{ Path = $Path; Kind = 'Reparse'; Reason = 'is a junction or symlink' }
+			}
+		}
+		Return $null
+	}
+
+	Function Resolve-AccountName {
+		param ([string] $ProfileSID)
+		If (-not $ProfileSID) { Return $null }
+		Try {
+			Return (New-Object System.Security.Principal.SecurityIdentifier($ProfileSID)).Translate([System.Security.Principal.NTAccount]).Value
+		} Catch {
+			# Deleted domain accounts and unreachable domains both land here. The profile is
+			# still resettable by path, so an unresolvable SID is not fatal.
+			Write-Verbose "Could not translate SID $ProfileSID - $($_.Exception.Message)"
+			Return $null
+		}
+	}
+
+	Function Get-ProfileNameMatchRank {
+		# 2 for an exact match on the profile folder or the account name, 1 for a domain style
+		# suffix (a second logon by the same user produces jdoe.CONTOSO or jdoe.000 next to
+		# jdoe), 0 for no match. The ranks exist so an exact match wins outright: on a machine
+		# with both a jdoe and a john.smith profile, -UserName john must not reach into
+		# john.smith, which the suffix pattern on its own would happily match.
+		param ([string] $Name, [string] $Account, [string] $Path)
+		$Leaf = $(If ($Path) { Split-Path -Path $Path -Leaf } Else { $null })
+		If ($Leaf -and ($Leaf -ieq $Name)) { Return 2 }
+		If ($Account) {
+			If ($Account -ieq $Name) { Return 2 }
+			If (($Account -split '\\')[-1] -ieq $Name) { Return 2 }
+		}
+
+		# DOMAIN\jdoe has to fall back to matching the folder against jdoe, because the profile of
+		# a deleted or unreachable domain account is exactly the one whose SID will not translate,
+		# and the one most likely to be named in full. Only for profiles that failed to translate,
+		# though: doing it unconditionally would let -UserName CONTOSO\jdoe reach a local jdoe that
+		# resolved perfectly well and belongs to somebody else.
+		$Names = @($Name)
+		If (-not $Account) {
+			$ShortName = ($Name -split '\\')[-1]
+			If ($ShortName -ne $Name) {
+				If ($Leaf -and ($Leaf -ieq $ShortName)) { Return 2 }
+				$Names += $ShortName
+			}
+		}
+
+		If ($Leaf) {
+			ForEach ($Candidate in $Names) {
+				If ($Leaf -ilike ([System.Management.Automation.WildcardPattern]::Escape($Candidate) + '.*')) { Return 1 }
+			}
+		}
+		Return 0
+	}
+
+	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$CurrentSID = $Identity.User.Value
+	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+	$IsElevated = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+	# Binding -AllUsers:$false still selects the AllUsers parameter set, so a wrapper passing the
+	# switch from a variable would sweep the whole machine while asking for the opposite. Refused
+	# rather than reinterpreted, because either reading of the intent could be the wrong one.
+	If ($PSCmdlet.ParameterSetName -eq 'AllUsers' -and -not $AllUsers) {
+		Write-Host "-AllUsers was passed as false. Omit it to reset the current profile, or use -UserName." -ForegroundColor Red
+		Write-Error 'Repair-AdobeCreativeCloud: -AllUsers:$false is not a valid request.'
+		Return
+	}
+
+	# --- Resolve which profiles to work on ---
+	$Targets = [System.Collections.ArrayList]::new()
+	# Interactive desktop sessions found on the machine, or $null when they could not be counted.
+	$SessionCount = $null
+
+	If ($PSCmdlet.ParameterSetName -eq 'CurrentUser') {
+		# SYSTEM is what an RMM tool runs as, but a scheduled task can just as easily arrive as
+		# LOCAL SERVICE, NETWORK SERVICE, a virtual service account (NT SERVICE\..., S-1-5-80-*)
+		# or a gMSA, whose account name ends in $. None of them has a Creative Cloud profile, so
+		# every one of them would report a clean machine while the affected user stayed broken.
+		$IsServiceAccount = ($ProtectedSIDs -contains $CurrentSID) -or
+			($CurrentSID -like 'S-1-5-80-*') -or
+			($Identity.Name -like 'NT SERVICE\*') -or
+			($Identity.Name -like 'NT AUTHORITY\*') -or
+			($Identity.Name.EndsWith('$'))
+		If ($IsServiceAccount) {
+			Write-Host "Running as $($Identity.Name), a service account with no Creative Cloud state of its own." -ForegroundColor Red
+			Write-Host "Use -AllUsers to reset every profile, or -UserName <name> for one." -ForegroundColor Yellow
+			# Written to the error stream as well as the host, so a scripted caller can tell a
+			# refused run from a machine that simply had nothing to reset. Both produce no output
+			# objects, and only this sets $? to false.
+			Write-Error "Repair-AdobeCreativeCloud: running as a service account without -AllUsers or -UserName."
+			Return
+		}
+		# The live environment variables are used here rather than paths built from the profile
+		# folder, so a redirected AppData is followed correctly for the account we are in.
+		[void]$Targets.Add([PSCustomObject]@{
+			UserName       = $Identity.Name
+			SID            = $CurrentSID
+			Loaded         = $true
+			ProfileRoot    = $env:USERPROFILE
+			LocalAppData   = $env:LOCALAPPDATA
+			RoamingAppData = $env:APPDATA
+		})
+	} Else {
+		If (-not $IsElevated) {
+			Write-Host "Resetting another user's profile requires an elevated session. Run as Administrator." -ForegroundColor Red
+			Write-Error "Repair-AdobeCreativeCloud: -AllUsers and -UserName require an elevated session."
+			Return
+		}
+
+		Try {
+			$AllProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)
+		} Catch {
+			Write-Host "Failed to enumerate user profiles: $($_.Exception.Message)" -ForegroundColor Red
+			Write-Error "Repair-AdobeCreativeCloud: could not enumerate user profiles. $($_.Exception.Message)"
+			Return
+		}
+
+		# Win32_UserProfile rather than the ProfileList registry key: it is not subject to WOW64
+		# redirection, so this still works when an RMM tool launches the 32-bit powershell.exe.
+		$Candidates = @($AllProfiles | Where-Object {
+			$_.LocalPath -and
+			-not $_.Special -and
+			($ProtectedSIDs -notcontains $_.SID) -and
+			($ProtectedNames -notcontains (Split-Path -Path $_.LocalPath -Leaf))
+		})
+
+		# Translated once per profile rather than once per profile per name, since each lookup can
+		# cost a domain round trip.
+		$AccountNameBySID = @{}
+		ForEach ($Candidate in $Candidates) {
+			If ($Candidate.SID -and -not $AccountNameBySID.ContainsKey($Candidate.SID)) {
+				$AccountNameBySID[$Candidate.SID] = Resolve-AccountName -ProfileSID $Candidate.SID
+			}
+		}
+
+		If ($PSCmdlet.ParameterSetName -eq 'UserName') {
+			$Matched = [System.Collections.ArrayList]::new()
+			# Names that resolved to nothing. Collected rather than acted on one at a time so that
+			# -UserName alice,bob with a typo in bob still resets alice, and still reports a
+			# failure a scripted caller can see.
+			$Unresolved = [System.Collections.ArrayList]::new()
+			ForEach ($RawName in $UserName) {
+				$Name = "$RawName".Trim()
+				If (-not $Name) { Continue }
+				$Ranked = @($Candidates | ForEach-Object {
+					[PSCustomObject]@{
+						Profile = $_
+						Rank    = Get-ProfileNameMatchRank -Name $Name -Account $AccountNameBySID[$_.SID] -Path $_.LocalPath
+					}
+				} | Where-Object { $_.Rank -gt 0 })
+
+				If ($Ranked.Count -eq 0) {
+					Write-Host "No profile found for '$Name'." -ForegroundColor Yellow
+					[void]$Unresolved.Add($Name)
+					Continue
+				}
+
+				$BestRank = ($Ranked | Measure-Object -Property Rank -Maximum).Maximum
+				$Hits = @($Ranked | Where-Object { $_.Rank -eq $BestRank } | ForEach-Object { $_.Profile })
+				$Leaves = @($Hits | ForEach-Object { Split-Path -Path $_.LocalPath -Leaf })
+
+				If ($BestRank -lt 2) {
+					# No profile is named '$Name'; only the folder prefix matched. rob and
+					# rob.smith are different people at least as often as jdoe and jdoe.CONTOSO
+					# are the same one, so the guess is never acted on unasked. The matches are
+					# named, which is usually all the operator needs to retype it exactly.
+					If ($Hits.Count -gt 1) {
+						Write-Host "'$Name' is ambiguous. It matches $($Leaves -join ', '). Name one of those exactly." -ForegroundColor Red
+					} ElseIf ($Force) {
+						Write-Host "No profile is named exactly '$Name'. Matching on folder prefix instead: $($Leaves -join ', ')" -ForegroundColor Yellow
+					} Else {
+						Write-Host "No profile is named exactly '$Name'. Did you mean $($Leaves -join ', ')? Name it exactly, or add -Force." -ForegroundColor Red
+					}
+					If ($Hits.Count -gt 1 -or -not $Force) {
+						[void]$Unresolved.Add($Name)
+						Continue
+					}
+				} ElseIf ($Hits.Count -gt 1) {
+					# One name, several profiles that all match it outright: a local jdoe and a
+					# domain CONTOSO\jdoe are two different people who happen to share a short
+					# name. Qualifying the name picks one of them, so that is what is asked for.
+					If ($Force) {
+						Write-Host "'$Name' matches $($Hits.Count) profiles: $($Leaves -join ', '). Resetting all of them." -ForegroundColor Yellow
+					} Else {
+						Write-Host "'$Name' matches $($Hits.Count) profiles: $($Leaves -join ', '). Qualify it (DOMAIN\$Name or $env:COMPUTERNAME\$Name), or use -Force to reset all of them." -ForegroundColor Red
+						[void]$Unresolved.Add($Name)
+						Continue
+					}
+				}
+				ForEach ($Hit in $Hits) { [void]$Matched.Add($Hit) }
+			}
+
+			# Reported at the end rather than here: -UserName alice,bob with a typo in bob must
+			# still reset alice, and an -ErrorAction Stop caller would abort the whole run if the
+			# error were raised before any work happened.
+			$Selected = @($Matched | Sort-Object -Property SID -Unique)
+		} Else {
+			$Selected = $Candidates
+		}
+
+		# Owners of explorer.exe, one per interactive desktop session. Win32_UserProfile.Loaded is
+		# the obvious signal here and the wrong one: elevating with a separate admin account loads
+		# that account's hive, so an ordinary single user workstation reports two loaded profiles
+		# and would trip the shared machine guard below. A desktop shell is what actually marks a
+		# user as sitting in front of Creative Cloud.
+		$InteractiveSIDs = @()
+		$InteractiveSessionIds = @()
+		Try {
+			# rdpshell.exe as well as explorer.exe: a RemoteApp or published application host runs
+			# no desktop shell, so an explorer-only query comes back empty on a session host with
+			# a dozen people working in it.
+			$Shells = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'explorer.exe' OR Name = 'rdpshell.exe'" -ErrorAction Stop)
+		} Catch {
+			# Nothing at all was read, so there is no session list to work from. The coarse
+			# profile load state takes over, which over reports (an elevating admin's hive counts
+			# as loaded) and so errs toward refusing the sweep. That costs a -Force; the opposite
+			# error costs somebody their Creative Cloud session mid use.
+			Write-Verbose "Could not enumerate interactive sessions, falling back to profile load state - $($_.Exception.Message)"
+			$Shells = @()
+			$InteractiveSIDs = $null
+		}
+
+		If ($Shells.Count -eq 0) {
+			# Either nobody is signed in, or the shell on this host is something else again. Those
+			# two are indistinguishable from here and they call for opposite answers, so the
+			# question goes back to the coarse profile load state, which errs toward refusing.
+			$InteractiveSIDs = $null
+		}
+
+		$UnidentifiedSessionIds = @()
+		ForEach ($Shell in $Shells) {
+			$ShellOwner = $null
+			Try {
+				# GetOwnerSid reports access denied through ReturnValue rather than by throwing,
+				# and hands back a null Sid, so the return code has to be checked explicitly.
+				$OwnerResult = Invoke-CimMethod -InputObject $Shell -MethodName 'GetOwnerSid' -ErrorAction Stop
+				If ($OwnerResult.ReturnValue -eq 0) { $ShellOwner = $OwnerResult.Sid }
+			} Catch {
+				# One session logging off mid loop must not discard the sessions already read.
+				Write-Verbose "Could not read the owner of PID $($Shell.ProcessId) - $($_.Exception.Message)"
+			}
+
+			If ($ShellOwner) {
+				If ($InteractiveSIDs -notcontains $ShellOwner) { $InteractiveSIDs += $ShellOwner }
+				If ($InteractiveSessionIds -notcontains $Shell.SessionId) { $InteractiveSessionIds += $Shell.SessionId }
+			} ElseIf ($UnidentifiedSessionIds -notcontains $Shell.SessionId) {
+				$UnidentifiedSessionIds += $Shell.SessionId
+			}
+		}
+
+		# People, not sessions. One person with a console session and a disconnected RDP session to
+		# the same machine is one person, and counting the sessions would refuse the sweep on a
+		# single user workstation. Sessions whose owner would not read are added on top, since one
+		# of those could be anybody; a session that also produced a readable shell is not counted
+		# twice.
+		If ($null -ne $InteractiveSIDs) {
+			$SessionCount = $InteractiveSIDs.Count +
+				@($UnidentifiedSessionIds | Where-Object { $InteractiveSessionIds -notcontains $_ }).Count
+		}
+
+		ForEach ($UserProfile in $Selected) {
+			$ProfilePath = $UserProfile.LocalPath.TrimEnd('\')
+			If (-not (Test-Path -LiteralPath $ProfilePath)) {
+				Write-Verbose "Skipping $ProfilePath - the profile folder no longer exists."
+				# Under -AllUsers a registered profile with no folder is ordinary debris. Under
+				# -UserName it is the answer to a question somebody asked, so it goes on the
+				# unresolved list and gets reported instead of vanishing into -Verbose.
+				If ($PSCmdlet.ParameterSetName -eq 'UserName') {
+					[void]$Unresolved.Add("$(Split-Path -Path $ProfilePath -Leaf) (profile folder is gone)")
+				}
+				Continue
+			}
+			$Account = $AccountNameBySID[$UserProfile.SID]
+			[void]$Targets.Add([PSCustomObject]@{
+				UserName       = $(If ($Account) { $Account } Else { Split-Path -Path $ProfilePath -Leaf })
+				SID            = $UserProfile.SID
+				Loaded         = $(If ($null -ne $InteractiveSIDs) { $InteractiveSIDs -contains $UserProfile.SID } Else { [bool]$UserProfile.Loaded })
+				ProfileRoot    = $ProfilePath
+				LocalAppData   = Join-Path -Path $ProfilePath -ChildPath 'AppData\Local'
+				RoamingAppData = Join-Path -Path $ProfilePath -ChildPath 'AppData\Roaming'
+			})
+		}
+	}
+
+	If ($Targets.Count -eq 0) {
+		Write-Host "No matching user profiles to reset." -ForegroundColor Yellow
+		# Nothing resolved at all, so there is no work to preserve and the error can be raised
+		# here. The second message covers a name that matched a profile whose folder has since
+		# been deleted, and keeps both distinguishable from -AllUsers on a machine that genuinely
+		# has no profiles to reset.
+		If ($PSCmdlet.ParameterSetName -eq 'UserName') {
+			# $Unresolved carries the reason per name. It is empty only when every name was blank,
+			# in which case the names as given are the most useful thing to echo back.
+			$Detail = $(If ($Unresolved.Count -gt 0) { $Unresolved.ToArray() -join ', ' } Else { $UserName -join ', ' })
+			Write-Error "Repair-AdobeCreativeCloud: no profile resolved for $Detail."
+		}
+		Return
+	}
+
+	# Resetting a signed in user is the ordinary workstation case and is fine. Several at once is
+	# a terminal server, where an -AllUsers sweep would kill Creative Cloud in every live session
+	# at whatever moment the sweep happened to run.
+	# -WhatIf is exempt: a preview changes nothing, and a terminal server is precisely the machine
+	# an operator would want to preview before committing to the sweep.
+	$LoadedTargets = @($Targets | Where-Object { $_.Loaded })
+	# When the sessions could not be counted, the coarse profile load state stands in. It over
+	# reports, so it errs toward refusing the sweep, which costs a -Force rather than somebody's
+	# Creative Cloud session.
+	$SignedInCount = $(If ($null -ne $SessionCount) { $SessionCount } Else { $LoadedTargets.Count })
+	If ($PSCmdlet.ParameterSetName -eq 'AllUsers' -and $SignedInCount -gt 1 -and -not $Force -and -not $WhatIfPreference) {
+		$SessionNames = @($LoadedTargets | ForEach-Object { $_.UserName })
+		$Unidentified = $SignedInCount - $SessionNames.Count
+		If ($Unidentified -gt 0) { $SessionNames += "$Unidentified unidentified" }
+		Write-Host "$SignedInCount users are signed in right now: $($SessionNames -join ', ')" -ForegroundColor Red
+		Write-Host "-AllUsers would stop Creative Cloud in every one of those sessions. Use -UserName for the affected user, or -Force to sweep the machine anyway." -ForegroundColor Yellow
+		Write-Error "Repair-AdobeCreativeCloud: $SignedInCount users signed in; -AllUsers needs -Force on a shared machine."
+		Return
+	}
+
+	Write-Host "Resetting Adobe Creative Cloud for $($Targets.Count) profile(s):" -ForegroundColor Cyan
+	$Targets | ForEach-Object {
+		Write-Host "  $($_.UserName)$(If ($_.Loaded) { ' (signed in)' })"
+	}
+
+	# --- Work out what there is to reset, before anything is stopped ---
+	# Stopping first and looking afterwards would mean that -UserName jdoe on a machine where
+	# Creative Cloud was never installed still kills jdoe's session and any Libraries sync in
+	# flight, only to report that there was nothing to reset. The redirect check runs here too,
+	# and for the same reason: a profile that will be refused should not cost the user a session
+	# on the way to being refused.
+	$WorkItems = [System.Collections.ArrayList]::new()
+	ForEach ($Target in $Targets) {
+		ForEach ($Scope in @(
+			[PSCustomObject]@{ Name = 'Local'; Root = $Target.LocalAppData },
+			[PSCustomObject]@{ Name = 'Roaming'; Root = $Target.RoamingAppData }
+		)) {
+			$FolderPath = $(If ($Scope.Root) { Join-Path -Path $Scope.Root -ChildPath 'Adobe\OOBE' } Else { $null })
+			$Exists = [bool]($FolderPath -and (Test-Path -LiteralPath $FolderPath))
+			[void]$WorkItems.Add([PSCustomObject]@{
+				Target   = $Target
+				Scope    = $Scope.Name
+				Path     = $FolderPath
+				Exists   = $Exists
+				Redirect = $(If ($Exists) { Find-ReparsePoint -Paths (Get-AncestorChain -Path $FolderPath -StopAt $Target.ProfileRoot) } Else { $null })
+			})
+		}
+	}
+	$PresentCount = @($WorkItems | Where-Object { $_.Exists -and ((-not $_.Redirect) -or $AllowJunctions) }).Count
+
+	# --- Stop the processes holding the OOBE folder open ---
+	If ($PresentCount -eq 0) {
+		If (@($WorkItems | Where-Object { $_.Exists }).Count -gt 0) {
+			Write-Host "`nEvery OOBE cache found is behind a junction or an unreadable folder, so nothing was stopped." -ForegroundColor Yellow
+		} Else {
+			Write-Host "`nNo OOBE caches to reset, so nothing was stopped." -ForegroundColor Yellow
+		}
+	} ElseIf ($SkipProcessStop) {
+		Write-Host "`nSkipping process stop as requested." -ForegroundColor Yellow
+	} Else {
+		Write-Host "`nStopping Creative Cloud processes..." -ForegroundColor Cyan
+		# Only the users who actually have something to reset. -UserName alice,bob where only
+		# alice has a cache must not cost bob his session and whatever Libraries sync was in
+		# flight, and neither must a target whose only folder is about to be refused.
+		$TargetSIDs = @($WorkItems |
+			Where-Object { $_.Exists -and ((-not $_.Redirect) -or $AllowJunctions) } |
+			ForEach-Object { $_.Target.SID } |
+			Where-Object { $_ } |
+			Select-Object -Unique)
+		$StoppedAny = $false
+
+		# Two passes, because these processes supervise each other: Adobe Desktop Service and
+		# AdobeIPCBroker relaunch the Creative Cloud desktop app, so a single snapshot can stop a
+		# process and leave the thing that starts it again running one entry later in the list.
+		# The second pass catches whatever came back, and stops early when nothing did.
+		For ($Pass = 1; $Pass -le 2; $Pass++) {
+			$Running = @(Get-Process -Name $AdobeProcessNames -ErrorAction SilentlyContinue)
+
+			If ($Running.Count -eq 0) {
+				If ($Pass -eq 1) { Write-Host "  None running." -ForegroundColor Green }
+				Break
+			}
+			If ($Pass -eq 2) { Write-Verbose "Second pass: $($Running.Count) Adobe process(es) came back or were missed." }
+
+			$OwnerSIDByPid = @{}
+
+			If (-not $StopAllSessions) {
+				# One filtered query rather than a query per PID or a full process listing. Owner
+				# lookup scopes the kill to the accounts being reset, so a reset on a terminal
+				# server does not take Creative Cloud down for every other signed in user. The
+				# filter is built from Get-Process IDs, which are integers, so there is nothing
+				# to escape.
+				$ProcessFilter = ($Running | ForEach-Object { "ProcessId = $($_.Id)" }) -join ' OR '
+				Try {
+					$CimProcesses = @(Get-CimInstance -ClassName Win32_Process -Filter $ProcessFilter -ErrorAction Stop)
+				} Catch {
+					Write-Host "  Could not read process ownership: $($_.Exception.Message)" -ForegroundColor Yellow
+					$CimProcesses = @()
+				}
+				ForEach ($CimProcess in $CimProcesses) {
+					Try {
+						# As above, a non-zero ReturnValue means the owner could not be read. The
+						# process is then left alone rather than stopped on a guess.
+						$OwnerResult = Invoke-CimMethod -InputObject $CimProcess -MethodName 'GetOwnerSid' -ErrorAction Stop
+						If ($OwnerResult.ReturnValue -eq 0) {
+							$OwnerSIDByPid[[int]$CimProcess.ProcessId] = $OwnerResult.Sid
+						}
+					} Catch {
+						Write-Verbose "Could not read owner of PID $($CimProcess.ProcessId) - $($_.Exception.Message)"
+					}
+				}
+			}
+
+			$StoppedIds = [System.Collections.ArrayList]::new()
+			ForEach ($Process in $Running) {
+				$OwnerSID = $null
+				If ($OwnerSIDByPid.ContainsKey($Process.Id)) { $OwnerSID = $OwnerSIDByPid[$Process.Id] }
+
+				If (-not $StopAllSessions) {
+					If (-not $OwnerSID) {
+						If ($Pass -eq 1) {
+							Write-Host "  Leaving $($Process.ProcessName) (PID $($Process.Id)) - owner unknown. Use -StopAllSessions if the rename fails." -ForegroundColor Yellow
+						}
+						Continue
+					}
+					If ($TargetSIDs -notcontains $OwnerSID) {
+						Write-Verbose "Leaving $($Process.ProcessName) (PID $($Process.Id)) - owned by another user."
+						Continue
+					}
+				}
+
+				# -WhatIf is honored explicitly rather than through ShouldProcess. ShouldProcess
+				# shares one Yes-to-All / No-to-All answer across every call in the function, so
+				# a "No to All" at a process prompt would silently cancel all the renames that
+				# follow, and the run would report that it changed nothing without saying why.
+				# Stopping these processes is a prerequisite of the operation the operator asked
+				# for. The renames are the part worth confirming, and they are the only part that
+				# prompts, when -Confirm is passed: ConfirmImpact is Medium against a default
+				# $ConfirmPreference of High, so nothing prompts on its own.
+				If ($WhatIfPreference) {
+					Write-Host "  What if: Stopping $($Process.ProcessName) (PID $($Process.Id))"
+				} Else {
+					Try {
+						Stop-Process -Id $Process.Id -Force -Confirm:$false -ErrorAction Stop
+						[void]$StoppedIds.Add($Process.Id)
+						$StoppedAny = $true
+						Write-Host "  Stopped $($Process.ProcessName) (PID $($Process.Id))" -ForegroundColor Green
+					} Catch {
+						# A process that exited on its own between the enumeration and here is not
+						# a failure, and neither is one already gone by the time we reach it.
+						If (Get-Process -Id $Process.Id -ErrorAction SilentlyContinue) {
+							Write-Host "  Could not stop $($Process.ProcessName) (PID $($Process.Id)): $($_.Exception.Message)" -ForegroundColor Red
+						}
+					}
+				}
+			}
+
+			If ($StoppedIds.Count -gt 0 -and $ProcessWaitSeconds -gt 0) {
+				$Deadline = (Get-Date).AddSeconds($ProcessWaitSeconds)
+				While ((Get-Date) -lt $Deadline) {
+					If (@(Get-Process -Id $StoppedIds.ToArray() -ErrorAction SilentlyContinue).Count -eq 0) { Break }
+					Start-Sleep -Milliseconds 500
+				}
+			}
+			# Nothing was stopped this pass, so nothing can have respawned from it.
+			If ($StoppedIds.Count -eq 0) { Break }
+		}
+
+		If (-not $StoppedAny) { Write-Verbose 'No Adobe processes were stopped.' }
+	}
+
+	# --- Rename the OOBE folders ---
+	Write-Host "`nResetting OOBE caches..." -ForegroundColor Cyan
+	$Results = [System.Collections.ArrayList]::new()
+	$RenamedCount = 0
+	$FailedCount = 0
+	$SkippedCount = 0
+	$RedirectCount = 0
+	$UnreadableCount = 0
+
+	ForEach ($Item in $WorkItems) {
+		$Target = $Item.Target
+		$FolderPath = $Item.Path
+		$Action = 'NotPresent'
+		$ErrorText = $null
+		$WarningText = $null
+		$BackupPath = $(If ($FolderPath) { "$FolderPath.old" } Else { $null })
+
+		# Tested once, and both the redirect check and the rename hang off that one answer. Two
+		# separate existence tests would let a folder that appeared in between them reach the
+		# rename without ever being checked. Re-tested rather than trusting the pre-scan, because
+		# stopping the Creative Cloud processes happened in between and can change the picture.
+		$Exists = [bool]($FolderPath -and (Test-Path -LiteralPath $FolderPath))
+
+		If ($Exists) {
+			$Redirect = Find-ReparsePoint -Paths (Get-AncestorChain -Path $FolderPath -StopAt $Target.ProfileRoot)
+			If ($Redirect -and $AllowJunctions) {
+				# Relocating a folder onto another drive with a junction is a thing people do on
+				# purpose, and in the current-profile case nobody is crossing a privilege boundary
+				# anyway. Still said out loud, and recorded on the result, since it is the same
+				# shape as the attack and a log that hid it would be worse than useless.
+				$WarningText = "$($Redirect.Path) $($Redirect.Reason). Reset anyway because -AllowJunctions was given."
+				Write-Host "  [$($Target.UserName)] $($Item.Scope): $WarningText" -ForegroundColor Yellow
+			} ElseIf ($Redirect) {
+				# A confirmed link and a folder that would not answer are both refusals, but they
+				# send a tech to different places, so they are not reported as the same thing.
+				$Action = $(If ($Redirect.Kind -eq 'Reparse') { 'Redirected' } Else { 'Unreadable' })
+				$ErrorText = "$($Redirect.Path) $($Redirect.Reason). Refusing to rename through it, since it may lead somewhere other than this profile."
+			}
+		}
+
+		If ($Exists -and ($Action -eq 'NotPresent')) {
+			# Rename-Item will not overwrite an existing target, and deleting the old backup
+			# to make room would destroy the only pre-reset copy: after the first reset the
+			# live OOBE folder is one Creative Cloud rebuilt, so a second run would trade the
+			# real original for a regenerated one. A repeat run gets a timestamped name
+			# instead, and nothing on disk is thrown away.
+			If (Test-Path -LiteralPath $BackupPath) {
+				$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+				$BackupPath = "$FolderPath.old-$Stamp"
+				$Suffix = 1
+				While (Test-Path -LiteralPath $BackupPath) {
+					$BackupPath = "$FolderPath.old-$Stamp-$Suffix"
+					$Suffix++
+				}
+			}
+
+			If ($PSCmdlet.ShouldProcess($FolderPath, "Rename to $(Split-Path -Path $BackupPath -Leaf)")) {
+				# Handles on the OOBE folder are not always released the instant a process
+				# exits, so a locked folder is retried before it is called a failure.
+				For ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+					Try {
+						Rename-Item -LiteralPath $FolderPath -NewName (Split-Path -Path $BackupPath -Leaf) -Force -Confirm:$false -ErrorAction Stop
+						$Action = 'Renamed'
+						$ErrorText = $null
+						Break
+					} Catch {
+						$Action = 'Failed'
+						$ErrorText = $_.Exception.Message
+						If ($Attempt -lt 3) { Start-Sleep -Seconds 2 }
+					}
+				}
+			} Else {
+				$Action = 'Skipped'
+			}
+		}
+
+		Switch ($Action) {
+			'Renamed' {
+				$RenamedCount++
+				Write-Host "  [$($Target.UserName)] $($Item.Scope): reset $FolderPath -> $(Split-Path -Path $BackupPath -Leaf)" -ForegroundColor Green
+			}
+			'Failed' {
+				$FailedCount++
+				Write-Host "  [$($Target.UserName)] $($Item.Scope): FAILED on $FolderPath" -ForegroundColor Red
+				Write-Host "      $ErrorText" -ForegroundColor Red
+			}
+			'Redirected' {
+				$RedirectCount++
+				Write-Host "  [$($Target.UserName)] $($Item.Scope): REFUSED on $FolderPath" -ForegroundColor Red
+				Write-Host "      $ErrorText" -ForegroundColor Red
+			}
+			'Unreadable' {
+				$UnreadableCount++
+				Write-Host "  [$($Target.UserName)] $($Item.Scope): REFUSED on $FolderPath" -ForegroundColor Red
+				Write-Host "      $ErrorText" -ForegroundColor Red
+			}
+			'Skipped' {
+				$SkippedCount++
+			}
+			'NotPresent' {
+				Write-Verbose "[$($Target.UserName)] $($Item.Scope): no OOBE folder present."
+			}
+		}
+
+		[void]$Results.Add([PSCustomObject]@{
+			UserName   = $Target.UserName
+			SID        = $Target.SID
+			Scope      = $Item.Scope
+			Path       = $FolderPath
+			Action     = $Action
+			BackupPath = $(If ($Action -eq 'Renamed') { $BackupPath } Else { $null })
+			Warning    = $WarningText
+			Error      = $ErrorText
+		})
+	}
+
+	# --- Report ---
+	$ProblemCount = $FailedCount + $RedirectCount + $UnreadableCount
+	Write-Host ""
+	If ($SkippedCount -gt 0 -and $RenamedCount -eq 0 -and $ProblemCount -eq 0) {
+		# A preview and a declined prompt both leave everything in place, but only one of them
+		# means the operator said no. Reported differently, and the declined one sets $? false,
+		# so a wrapper cannot read a refusal as a dry run.
+		If ($WhatIfPreference) {
+			Write-Host "$SkippedCount folder(s) would be reset. Nothing was changed." -ForegroundColor Yellow
+		} Else {
+			Write-Host "$SkippedCount folder(s) were declined at the prompt. Nothing was changed." -ForegroundColor Yellow
+			Write-Error "Repair-AdobeCreativeCloud: all $SkippedCount folder(s) were declined."
+		}
+	} ElseIf ($RenamedCount -eq 0 -and $ProblemCount -eq 0) {
+		Write-Host "No Adobe OOBE caches were found. Creative Cloud may not be installed for the profiles checked." -ForegroundColor Yellow
+		If ($PSCmdlet.ParameterSetName -eq 'CurrentUser') {
+			# Elevating with a separate admin account puts this session in that account's profile,
+			# not the signed in user's, and the empty result above looks identical to a clean bill
+			# of health for the machine.
+			Write-Host "Only $($Identity.Name) was checked. If you elevated with a different account than the signed in user, use -AllUsers or -UserName <name>." -ForegroundColor Yellow
+		}
+	} Else {
+		If ($RenamedCount -gt 0) {
+			Write-Host "Adobe Creative Cloud cache reset complete. $RenamedCount folder(s) reset." -ForegroundColor Green
+		} ElseIf ($WhatIfPreference) {
+			# A refusal is found before any ShouldProcess call, so it shows up under -WhatIf too.
+			# Calling that a failed reset would be wrong: a preview did not reset anything.
+			Write-Host "Nothing was changed. $ProblemCount folder(s) would be refused; see above." -ForegroundColor Yellow
+		} Else {
+			Write-Host "Adobe Creative Cloud cache reset FAILED. No folders were reset." -ForegroundColor Red
+		}
+		If ($FailedCount -gt 0) {
+			Write-Host "$FailedCount folder(s) could not be reset. The usual cause is a Creative Cloud process still holding the folder open." -ForegroundColor Red
+			If ($SkipProcessStop) {
+				Write-Host "This run used -SkipProcessStop, so nothing was stopped. Run it again without that switch." -ForegroundColor Yellow
+			} ElseIf (-not $StopAllSessions) {
+				Write-Host "Signing the user out and running it again is the safe fix." -ForegroundColor Yellow
+				Write-Host "-StopAllSessions also clears it, but it drops the per-owner scoping and stops Creative Cloud for everyone signed in. Fine on a single user workstation; check who else is on before using it on a session host." -ForegroundColor Yellow
+			} Else {
+				Write-Host "Sign the user out, or reboot, and run it again." -ForegroundColor Yellow
+			}
+		}
+		If ($RedirectCount -gt 0) {
+			# Kept apart from the lock failures above: no amount of stopping processes or signing
+			# users out will move a junction, and sending a tech round that loop wastes their time.
+			Write-Host "$RedirectCount folder(s) were refused because a junction or symlink stands in the path. That is not a lock, and retrying will not clear it." -ForegroundColor Red
+			Write-Host "Check who placed the link before going further. Inside a user-writable profile it is a way to get a privileged process to rename something else." -ForegroundColor Yellow
+		}
+		If ($UnreadableCount -gt 0) {
+			Write-Host "$UnreadableCount folder(s) were refused because a folder in the path would not report its attributes, so a junction could not be ruled out." -ForegroundColor Red
+			Write-Host "Usually a permissions problem on the profile. Check the ACLs on the path shown above; retrying will not clear it either." -ForegroundColor Yellow
+		}
+		If ($SkippedCount -gt 0) {
+			# A declined -Confirm prompt, or a -WhatIf mixed with real work. Either way the folder
+			# is still there, and a report that only counted the successes would read as complete.
+			Write-Host "$SkippedCount folder(s) were left alone." -ForegroundColor Yellow
+		}
+		If ($RenamedCount -gt 0) {
+			Write-Host "Have the user launch Creative Cloud and sign in again. The old caches are kept beside the originals, named on each line above." -ForegroundColor Cyan
+		}
+	}
+
+	If ($PassThru) { Write-Output $Results.ToArray() }
+
+	# Last, so they do not break up the report above. A run where every rename failed still emits
+	# result objects, so the error stream is the only thing separating it from a clean run.
+	If ($PSCmdlet.ParameterSetName -eq 'UserName' -and $Unresolved.Count -gt 0) {
+		Write-Error "Repair-AdobeCreativeCloud: no profile resolved for $($Unresolved.ToArray() -join ', ')."
+	}
+	# Not under -WhatIf: a preview that changed nothing has not failed at anything, and an
+	# -ErrorAction Stop caller would have its dry run aborted by a refusal it was asking about.
+	If ($ProblemCount -gt 0 -and -not $WhatIfPreference) {
+		Write-Error "Repair-AdobeCreativeCloud: $ProblemCount of $($RenamedCount + $ProblemCount) folder(s) could not be reset."
+	}
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAFSlQsNOX5g7Ae
-# fEJYxAP1btpvTzW36dnzuRO1LHphLKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDqXdzpiEsZpqye
+# Si1coW/Kui9sHCjVzo2RF1pfY0itP6CCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -2025,44 +3047,44 @@ try {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -2106,33 +3128,33 @@ try {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# INqtZjk25A4aK7jn0/iWSlDDFWtRcTl+XUIS1BuXYGNdMA0GCSqGSIb3DQEBAQUA
-# BIICAE7RVzZXJY4cWvxnVU4DXw1vhKKQ71+sM+ihmljnmyzsrrtqor1I7n6oh+z4
-# SjTT4/mFgBdz7mTy2zWvEaEaVj+Db2zVUzNabRLQlqgIOTqlAe0m/yB4EQu/zc1u
-# ZHddroCy3uPjywk4NZPhyYud4YyDHnLyQbMbcwb83Oavlde4EiCcll4/E5TkrGRC
-# w1XVic5RslnqHlSyYECqgLIS5RCJY2MmXTnSOYVqKTaJFYH5SIZyfmFrNNZJRa3i
-# YXEY77C5xhzLuo4+0eP2C0carieGN7UpWS+IMOD0RvIqS5kfTdFi9bXeDBDdOXGE
-# Uk/6fp7hxBYMC+XkXfvUMM/vZbfWaNyOcU3bh1jjSpLTtUS7FVtwOt89Czq6RXpu
-# gRllJJ747NUKh5Ey/Lkpn9rGud0kbbKcj4f/PWSzJXXueV3so3lItgiqQ9Wp8Epg
-# skQXBxVBya6l6vuN7W8dr5wgCNIHAAhQTvGNE5AIC5SeqY5NIv4ghF3pdVaOLS3t
-# xXCxVt3fkntMUqSO/vnnThCNO8Tq9VcwJSqJfEBhlqvSG9oQIds97IRr+O223I8W
-# uRivc5iKTWfLRRDL0Cn98iG/jRjo/DrpT5/dTQATANy2o2HwA68Kn4epB9y+eQtK
-# ihPiqNxdgZlyohNJoHmajaaOkYGHJvzS+kYmHk9NEz6YOmG7oYIDJjCCAyIGCSqG
+# ID6twuhBoW+peVwdqVl+xd2NLIj3dxluX8rqN0nM8+3fMA0GCSqGSIb3DQEBAQUA
+# BIICAG+0qZefViubCOVjxRHfrziLJBL3C5opjvRXqVO9HWMlbGD/Og78OnPhM2Sk
+# HcdbXwFD/X1hWQfLMg1KmiIcslPfgOl6OZhTQWsWT+UYnvmLI5a9VTF7Cj+WFJi4
+# yZHLABF1/B3ARnZr9kind0R53YFo7ma5rbXdoaSj1LrhK5m/HqPXwXOg8zOe9aje
+# 7Z5XBb97/e1WinXywtcvkHGbY4839oGen+iykuJWdRns7LW/XXBYhYrD1Oeumu6X
+# 03nYm0N4ZoFM5Z0YSNy6Q9xXexwyl2g05adNyyVfPppbvRE0PdwAAn8t5nnGKxB9
+# Fh12h8mZKGw9aSjpf779hAFRzgPJvml+jYSo7JeQKf2FoiziRqhTzivXrYxmu4W+
+# yP6Cnze+GhtZGrW9vC19AqOurz8NX7igresL6kDhkggizrNjzr4gQi7nylUaP0ur
+# d4m3m+pnR4XNF3c74ZdbwHzCN+9bkbBfUmjCDCRUhWK8occ+LqBxY0juUAVUbvDD
+# nvvpCGhgAVojbgIvK8ql5r+bVOnzNHYhRxkx70z75YR9scTqNMPaWq/TiOvU/0Wa
+# uj5gcvurTFla8h2dMvi/Y6UQgruL2LxmjDDmk0HeEleSG1Ah/KS9D29nkQIG42DV
+# jJZK2MuSRc3lpTFpdmkoY280P6d5sgCTSltVVJ7plI+jQSwEoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NVowLwYJKoZIhvcNAQkEMSIEIKGM/KgJ
-# HnVvyxo5Fhses12k7x9hnB0pHQL1GEMhrSr/MA0GCSqGSIb3DQEBAQUABIICAJp+
-# k8GAsPU6/i6AJfwzUI4daVdrR2H9d5XW4airMtDGQUNqQt0+oZMWVfJaCVZAs5KX
-# 2sXFqo6nbhDuNdGX4NncRljVP+qe7muHPV3Dfof3uVsygmTO2LCkMLWdpUx2cCun
-# t8djaUyqmZQcDQSaKPqDZNPxSKG0xXdAsKmjAVdASv0bmtce+nqI60PZPOJRlS5M
-# HoVfTjfiP7g+RYk9U47X3y3scS4KSZDELx8OniSzVWpwcmlzTRTU4rkTgKZ/gjf8
-# t2LARk542g75GuLEpsBMX7yJKZKtorf/8cukArX6ZJv5UBka+9PgxhaqkHzGt/gT
-# x5O8E1bD+CFVunvQ5ROrHG0jGrRBFs+XJT+KgSCsoZqBX345vrvk/eZmCAGYJq1t
-# +FR/eTFKkopjbZWNYwELK4GenyybU3coVzawtI4fBPlrjGMlaed3yQI3b9qBKSCO
-# SBOHdjBYJNkposwWe4jFtk0zS+akc5UHSSZsbKppkSxKPvXsr0FF+v0VkwASyUkz
-# au+PW5xQPFqtB3u2flgHSGvlUX+hBxX8owWvjs3RpwrgFZb8xiNCJTBeyWsKxNoY
-# qREBaSnYSufZPViO2OqoQCWluHUpjoKVfwcRPYF/HKuNZuXGhDUoaBFKVvLUw4iq
-# ZtJjEBTi3RjUetl76xfUn2CkG8uU9FPfc4pKdabr
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOVowLwYJKoZIhvcNAQkEMSIEINfsDCIl
+# 3tFXBPUaLSYfDy3p+mzd2VPoDJGqWvGrWHVFMA0GCSqGSIb3DQEBAQUABIICAATL
+# I5R/NUW6xTaOP8L71JFvwTmx3N+KUhlFNRk09g0VhVDA9ReTesXws8yNElvMWhNx
+# j1bbv+sEmzVeSQWTksiSQCMo6tgQ75QRhNLgKUbn7Nm2LSZZqngEfusihQ+ZXZ47
+# BcJhu7ziQUgvXXf83asSokIIE1/1D4mJ54vL7ySCmXa9OzMw3EWfP3PDptlt0d5G
+# cma7NJCh/7s0XXK7WFUq6g3rWXsTMy+rZCyd0RGh1R6E7H7RhTaxTsZO/d68STp/
+# j2w+YSogQyRBNU3iOCu0c4ccstSFi4sSwqK3y1LtMD9eeBDxbxcB8RQryboUrTxg
+# 0CPe2v4Ga2xIGOM6dYtMJHGGn+5UvHOIxjNZfCVDe/1DufTxNA14yqRJwjSt5qoX
+# sd3D7F0NLlccEQXX1cGM4bCgxXTpcFw0WmDRw4J0h3tBwG/Nvgoz+c7ulk6hcEKc
+# RVY4TIPgmR3jnElYCnXUV/vHlnTyLymPRzCmiNIzbn47OcApWR5DCKVvfJbEziil
+# 6K6JYwTYEw+sDrDMvmAdLrV4JCWzCAzMcrdjwkXvbeU7DrHHEe8/aR1QFn8tPQRh
+# L64IWfyatL4a4tWHgv4UOBxDolGlLXmqAQ9TK8OlwlnmXXEdXRYz0kxLR/zQ/p4b
+# IPBjFB7ogydPum5mY/ZXQWfw0CwjdxlaJSBGXwmv
 # SIG # End signature block

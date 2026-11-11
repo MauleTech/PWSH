@@ -566,7 +566,10 @@ Function Connect-Wifi {
 	.NOTES
 		Requires administrative privileges to add WiFi profiles.
 		The profile is configured for automatic connection when the network is in range.
+		A 64-character hexadecimal NetworkPassword is treated as a raw PSK; anything else must be an 8-63 character passphrase.
+		Uses Add-WiFiProfile to add the profile. To move every saved network to another computer, see Export-WiFiProfiles.
 	#>
+	[CmdletBinding()]
 	param
 	(
 		[Parameter(Mandatory = $true)]
@@ -612,6 +615,17 @@ Function Connect-Wifi {
 		}
 	}
 
+	# A 64-digit hex string is a raw pre-shared key (networkKey); otherwise it is an 8-63 character passphrase
+	$KeyType = 'passPhrase'
+	If ($Authentication -ne 'Open') {
+		If ($NetworkPassword -match '^[0-9a-fA-F]{64}$') {
+			$KeyType = 'networkKey'
+		} ElseIf ($NetworkPassword.Length -lt 8 -or $NetworkPassword.Length -gt 63) {
+			Write-Error "NetworkPassword must be 8-63 characters (or a 64-character hexadecimal key) for $Authentication authentication."
+			return
+		}
+	}
+
 	# Escape XML special characters in SSID and password to prevent malformed XML
 	$XmlEscapedSSID = [System.Security.SecurityElement]::Escape($NetworkSSID)
 	$XmlEscapedPassword = if ($NetworkPassword) { [System.Security.SecurityElement]::Escape($NetworkPassword) } else { "" }
@@ -636,7 +650,7 @@ Function Connect-Wifi {
 				<useOneX>false</useOneX>
 			</authEncryption>
 			<sharedKey>
-				<keyType>passPhrase</keyType>
+				<keyType>$KeyType</keyType>
 				<protected>false</protected>
 				<keyMaterial>$XmlEscapedPassword</keyMaterial>
 			</sharedKey>
@@ -662,39 +676,28 @@ $SecurityXml
 </WLANProfile>
 "@
 
-	# Create a temporary XML file for the profile
-	$random = Get-Random -Minimum 1111 -Maximum 99999999
-	$tempProfileXML = Join-Path -Path $env:TEMP -ChildPath "tempProfile$random.xml"
+	# Add the WiFi profile for all users on this computer (temp file handling is in Add-WiFiProfile)
+	Write-Host "Adding WiFi profile for SSID: $NetworkSSID"
+	Try {
+		Add-WiFiProfile -ProfileXml $WirelessProfile -User All -ErrorAction Stop
+	}
+	Catch {
+		Write-Error $_.Exception.Message
+		return
+	}
 
 	Try {
-		# Write the profile XML to the temp file using UTF-8 without BOM for netsh compatibility
-		# PowerShell 5.1's -Encoding UTF8 includes BOM which can cause issues
-		$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
-		[System.IO.File]::WriteAllText($tempProfileXML, $WirelessProfile, $Utf8NoBom)
-
-		# Add the WiFi profile using netsh (run synchronously to ensure completion)
-		# Use user=all to make profile available to all users on this computer
-		Write-Host "Adding WiFi profile for SSID: $NetworkSSID"
-		$addResult = & netsh wlan add profile filename="$tempProfileXML" user=all 2>&1
-		$addResultString = $addResult | Out-String
-
-		# Check both exit code and output for errors (netsh exit codes can be unreliable)
-		If ($LASTEXITCODE -ne 0 -or $addResultString -match "is not valid|error|failed") {
-			Write-Error "Failed to add WiFi profile: $addResultString"
-			return
-		}
-		Write-Host "WiFi profile added successfully." -ForegroundColor Green
-
-		# Check if the network is currently visible
+		# Check if the network is currently visible. Match the whole SSID line so "Office" does not match "Office-Guest".
+		$escapedSSID = [regex]::Escape($NetworkSSID)
 		$WifiNetworks = & netsh wlan show networks 2>&1
-		If ($WifiNetworks -match [regex]::Escape($NetworkSSID)) {
+		If ($WifiNetworks -match "^\s*SSID\s+\d+\s*:\s*$escapedSSID\s*$") {
 			Write-Host "Found SSID: $NetworkSSID - Attempting to connect..."
 
 			$connectResult = & netsh wlan connect name="$NetworkSSID" 2>&1
 			$connectResultString = $connectResult | Out-String
 
-			# Check both exit code and output for errors
-			If ($LASTEXITCODE -ne 0 -or $connectResultString -match "error|failed") {
+			# Check both exit code and output for errors (SSID removed so its name cannot trigger a false match)
+			If ($LASTEXITCODE -ne 0 -or ($connectResultString -replace $escapedSSID, '') -match "error|failed") {
 				Write-Error "Failed to connect to WiFi network: $connectResultString"
 				return
 			}
@@ -705,8 +708,7 @@ $SecurityXml
 
 			# Verify connection status
 			$interfaceStatus = & netsh wlan show interfaces 2>&1
-			$escapedSSID = [regex]::Escape($NetworkSSID)
-			If ($interfaceStatus -match "State\s*:\s*connected" -and $interfaceStatus -match $escapedSSID) {
+			If ($interfaceStatus -match "State\s*:\s*connected" -and $interfaceStatus -match "^\s*SSID\s*:\s*$escapedSSID\s*$") {
 				Write-Host "Successfully connected to $NetworkSSID" -ForegroundColor Green
 			} Else {
 				Write-Warning "Connection command sent, but connection state is uncertain. Check your network status."
@@ -722,19 +724,13 @@ $SecurityXml
 	Catch {
 		Write-Error "An error occurred: $_"
 	}
-	Finally {
-		# Clean up the temporary XML file
-		If (Test-Path -Path $tempProfileXML) {
-			Remove-Item -Path $tempProfileXML -Force -ErrorAction SilentlyContinue
-		}
-	}
 }
 
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDBF83CNFNFmhgr
-# RDnw/5WxhDuqWC0BhgQbx1dmT1sOEaCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA6Q+0fg3FtySkm
+# VecY1FsUfgsunT/jnpTtGKpdfGYHwqCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -835,44 +831,44 @@ $SecurityXml
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -916,33 +912,33 @@ $SecurityXml
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IPgfEtKSC39lSgHOJ+kBV+GQtrgtVqZs8m7GweDxEuhKMA0GCSqGSIb3DQEBAQUA
-# BIICAHHoKEUb3nH2fqsc8EcBWxmw/ki7DSHDrDWElwCGaoIexN9tf2qVfPEcJUUC
-# drHj3ueIQatWzPbMgleQC2qLBqxqQm/paKOXuKXvqWsoXZ64YlMXxFxdlSwxLLAI
-# pqGyvGciUtvTo/GGPI9RYFgZ/F1Rj8dK45LCTa+KzAdiGBe53kyHb2yC/5FhbmFM
-# hhVNYY+d5LPq4pGwugUw2yZnXOebnBcvvPCmm9cmORpVao8ds7P68oHwnv83oINH
-# BXXL/ndzo4AxmrsmfPq0GU0IrZxyJGjK170r/ndvmW6XTjaYz4s1I62ge7dXAPOi
-# QoCIeIgyXnRLHksDx447/Kf+LLlmCel71y4aJHQT2oNCvcAg8p3KBQAjLEDvSOyh
-# 5isU/xdmv5Y3U1vcEjKh+M+LOfoyeh3SXJZVKnB/bAcCSFIOW6PAcsMDWouBC1A3
-# rcbudDvjbKW+UJEBzECuZDe9xdUqmL6yF9cP2oo+ZwmPTvLVR4E48S5s2Jb3CMED
-# c0AQyFKX080N16v6+KTcp58kpk6uzF4j7ZPKtMVcOk0kh38BJDrb0h5hW0J9/BKP
-# MsoUy/W16/535kFS5WzT/F0En1WkxXxe8fCU8Q/evFYiOuG3S9nX8YaLuSnB9FBd
-# 42XSMv3OkLUNoShP01Me1utr4VSaXfnZU102Ft6TSvq7gRsBoYIDJjCCAyIGCSqG
+# IJZ7hX/Uhh0kN4IU7rs25DcqOpaNVhVfGQ7xqZRnWMGHMA0GCSqGSIb3DQEBAQUA
+# BIICAIkANG3p7Bw0596jtgOorthYmGRAJhmcp6RxyxaMIdK+JsvVlQqOfqpy4e3s
+# nzdQVkbMeU5hyR4Y6w5/gNpa2XbeipGilRzvVjPpFrDrMmgUgBhx+M4w2LqcPsso
+# zHcwnXcytnNMVSaFxjBLQnJB8tt9jRB7tcp6ARoh/vhIUWUOwt7C262k42dxQjX5
+# kixYl71GkX66F8G7FDxWSrieKc2dDiBHbLYnefY2um0sDVqu1R0Br7dJM+5AAxIQ
+# EGrL5yTO4VXAFDPU2ak2nm9yj3zypJhKltAg3psZWvLg6v3KnbDG3wffQXicK9h7
+# uTTJQKeFEt58PamY55mYS5S83Z6CQ5do27jtS9FScOKbjOUnQl4Vnb0zPpr9cFdS
+# YBb4YtSmfPSBc5+HwIHJQYY+USSK4qvNExN7HYHo0RQq/Drsv5wFQlngn9B82HfN
+# q/aGBRzXf0G3U4egFqiLhr71i9tZJlRKMiPgmy8c9MpLGKAQClEjM/QzpyG1Wep9
+# FYEER1G3AhEMJrg/4lZ08JNWha6vynRFSbxpqAmyZgeM/Gc3Xtqgb+Ajj0mEeUvD
+# ike+Gcwqf0Ib/7/udFUvVbpfCpjKnE6LReKY3tpEGRlgqg1kO2AtUmEyM6LfUEl4
+# Y429TdsU98q7fDbPAg2hRc2RQpuH6BImyoFPTzAVdHcca65RoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0MlowLwYJKoZIhvcNAQkEMSIEIBsA+fb9
-# gBLXLflfWzBZr1cFVK4sqzGMEWt1SPBgVojYMA0GCSqGSIb3DQEBAQUABIICAAVZ
-# kTOj5OhbO1cPk4/CTY7QIZOqLtnX30NrQAI7mLbAQJt1pRLhc8mlIkm2HO3aK9XD
-# cPyyAIMvEKjw510tjYPp90qg5tCVQPaqCWHn6QRovH/EY0KMgdxMbXPFIlmBY0Bj
-# iZ5Z6VUjtbJGOpQPFUwrMauaoKYeq5GjLrp7GMHjLTEw1Vg1nVbQy1/1KW+SRqZB
-# MhFGRSb6WbR+l+tbrHNO6rQwsetlTKSWc+akKbHwUrBdaINJmUi12yzr6bY/2SKL
-# hgUcqFjeR1HegVEvZxd0k+0i9RZBEpfMeajFNgwgkbvWVywACL1fJLr6+4sSBbcT
-# RIG1dBvoWaUvnmKEAZcVvyEv4/+sXMvTOL8pjdVRSAACXNTPnFvS1WTXe9D6LzvQ
-# 7rFWThgT+kD2/YSYVWm6oc/P9MSF+8s0TDfELbR2+tBVwvsjP2wlXNhFyjtP0fhD
-# PbHLAa0ZxJ929ReToFnqttgOzyxKzGdzfwsG3Y9MUwot2qIaTIa3Jn66Fa7rZdTX
-# Ta1p0oL2BY5edLSaxqCab3f5FTIMaM991yHYCz6FcBGt0s9VkBFUNp9SifiHMKnP
-# DDUI4Ck847ms3loNKwi3ZOk58OGW/1xHyJaA6nGdHC1CeQBvw6hwBxDBDueutgJh
-# A6gVs7C6x2IcQR4qhI37gfnd1qfiw5oe51mGTQyT
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOFowLwYJKoZIhvcNAQkEMSIEIKKEZeP9
+# 4OLsZz+i1SvWIA/r0TY4o6Rtz3ut6hxodaM6MA0GCSqGSIb3DQEBAQUABIICAIhe
+# HCJfqQd4dzQoqk1OCr2GqnP5tea8nXrgguYLWLfmU+wtWUW8r05msJFp5gdasD2D
+# RuYikS2bzWJC/unl+lMHRWtWfAwzXOawpYZjt0z6gOm5AxIFxc+wXbVfWP1ixE8o
+# rnSxXKlyDbuRN1eNGuoRFOsBMG/qNeufPO7AtJ9+kKRBYoTxAg7q/2GRYzpL8sev
+# sagLl2iG53Yc9Ku6WRUOeU1MXXv3UDIYEnaXXtXqQgCL6dealeOmgyIAiHxH9GbF
+# gLppKYi81JWjPFIS8A3a7v4Xc3K7vaEYbbM4j0wEuuyv9aJcKtFxJTF+Ah5G3kTC
+# 4ERmA6UTwkUFUfr/WlXjKhUrQmRyyfLCB2PP2Majrj4c0fKxVHUjPd+/FTa5YyUl
+# tZsn4VkC2gmOgBbHqS1t7AGfuiLYVvalfRzYAyh1Yt1BkJt0h8CNPG3LRYgDPpfd
+# cqpLL0F0ugPrkcgY7tAgMXm7rNoyUSJVfggAON56Oo0q5P0hYgAgIyB6qenjwEj6
+# 3yVJVycRdxcZLAUD6y4g2jdU/ehgvjZ/GSal2kPKtiQaCatnklfuhpeGs8kaP7je
+# 5jP5rwKjZdh/+cgJMm+pkJpYRcQNu2fDlqUl/LXCxTzjff0X3tsevB6vY5wnshNk
+# pJsJezEgKggG+Y1uGdUpdmXFWMgUPDGaAWB0S5KR
 # SIG # End signature block

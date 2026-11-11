@@ -881,11 +881,1162 @@ Stop-Transcript | Out-Null
 	}
 }
 
+Function Remove-StaleProfiles {
+<#
+	.SYNOPSIS
+		Removes local user profiles that have had no activity within a given number of days or months.
+
+	.DESCRIPTION
+		Enumerates Win32_UserProfile and removes profiles considered stale. A profile is only
+		removed when ALL of the following are true:
+		  - The profile is not currently loaded.
+		  - The profile is not a special system profile (systemprofile, LocalService, NetworkService).
+		  - The profile path does not match ExcludePattern (default: 'Remote Support|admin').
+		  - The profile was created before the staleness cutoff.
+		  - No other ProfileList entry points at the same folder.
+		  - The SID has no mounted registry hive and no logon session.
+		  - The folder's NTUSER.DAT can be opened exclusively, proving nothing has it loaded.
+		  - The most recent activity on the profile is older than the staleness cutoff.
+
+		The four in-use tests run before any timestamp is consulted, because age is an argument
+		about the past and those are about the present. Win32_UserProfile.Loaded alone is not
+		enough: it describes one SID's hive at one instant, and it says nothing about a folder
+		that a second ProfileList entry also claims. Two entries pointing at one folder is a
+		routine repair artifact (an account deleted and recreated keeps the folder but gets a new
+		SID, and the usual hand fix for a temporary profile is to repoint ProfileImagePath at the
+		live folder), and the abandoned entry then ages out on its own timestamps while the
+		current user is still working out of that folder.
+
+		Activity is determined the way Windows itself has aged profiles since Windows 10 1809 and
+		Server 2019: from the profile service's unload and cleanup-check timestamps stored under
+		HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID>. These values only
+		change when the profile is genuinely unloaded or checked for cleanup, so Windows Update
+		servicing and antivirus hive scans do not inflate them.
+
+		LocalProfileLoadTime is NOT one of them. A load time newer than both of the others means
+		the profile was loaded and never came back down: the session is still open, or the machine
+		lost power mid-session. Microsoft's reference script (see .LINK) excludes it for that
+		reason, noting that a winning load time "would most likely indicate profile currently
+		loaded or machine crashed", and falls back to the NTUSER.DAT timestamp. Treating a load
+		time as activity reports a user signed in continuously since that date as idle since that
+		date, which deletes a profile that is in daily use. A load time inside the threshold is
+		still proof of a recent sign-in, so it keeps the profile.
+
+		Where the profile service timestamps are absent or describe an earlier session, activity
+		falls back to the newest LastWriteTime found among the profile folder itself, its
+		NTUSER.DAT registry hive, and its first-level subfolders (hidden folders such as AppData
+		included). The fallback can be inflated by servicing activity, which errs toward keeping
+		profiles.
+
+		Win32_UserProfile.LastUseTime is deliberately not used as the activity signal because
+		Windows servicing and antivirus scans update it, making profiles untouched for years
+		appear recently used.
+
+		Removal is performed with Remove-CimInstance, which deletes both the ProfileList registry
+		entry and the profile folder. Files remaining afterwards are force-removed with
+		Remove-PathForcefully only if the folder re-tests as idle; a folder still locked at that
+		point is left alone, because Remove-PathForcefully deletes what it can and queues the rest
+		for delete-on-reboot, which would destroy data belonging to whoever holds the lock.
+		Profile registry entries whose folder no longer exists on disk are treated as orphans and
+		removed. Profiles that cannot be assessed are left alone.
+
+		Also removes that profile's per-user scheduled tasks. Windows suffixes the task name with
+		the profile's SID for several tasks it creates automatically (OneDrive's Startup,
+		Reporting, and Standalone Update tasks are the common ones); once the profile is gone
+		these become orphaned entries that clutter Task Scheduler and can error on their next
+		scheduled run.
+
+		Deleting a profile permanently destroys any data stored only in that profile. Supports
+		-WhatIf to preview, and prompts for confirmation on each profile when run interactively.
+		Pass -Confirm:$false for unattended use. Requires an elevated (Administrator) session.
+		Use caution on RDS/terminal servers where many profiles are expected.
+
+	.PARAMETER Days
+		Number of days without activity before a profile is considered stale.
+		Defaults to 730 (2 years). Minimum 30 as a safety floor. Cannot be combined with -Months.
+
+	.PARAMETER Months
+		Number of calendar months without activity before a profile is considered stale.
+		Minimum 1. Cannot be combined with -Days.
+
+	.PARAMETER ExcludePattern
+		Case-insensitive regular expression tested against each profile's LocalPath. Matching
+		profiles are never touched. Defaults to 'Remote Support|admin'.
+
+	.PARAMETER PassThru
+		Outputs a result object for each assessed profile (ProfilePath, SID, LastActivity,
+		ActivitySource, Action). Action is one of Removed, RemovedOrphan, Kept, InUse, Declined,
+		Unreadable or Failed.
+
+	.EXAMPLE
+		Remove-StaleProfiles -WhatIf
+		Previews which profiles would be removed using the default 730-day threshold.
+
+	.EXAMPLE
+		Remove-StaleProfiles -Months 18
+		Interactively removes profiles with no activity in the last 18 months, prompting per profile.
+
+	.EXAMPLE
+		Remove-StaleProfiles -Days 365 -Confirm:$false
+		Removes profiles idle for over a year without prompting. Suitable for RMM deployment.
+
+	.EXAMPLE
+		Remove-StaleProfiles -Days 365 -ExcludePattern 'Remote Support|admin|svc_' -Confirm:$false -PassThru
+		Also protects service account profiles and returns result objects for logging.
+
+	.LINK
+		https://learn.microsoft.com/en-us/troubleshoot/windows-server/support-tools/scripts-to-retrieve-profile-age
+#>
+	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Days')]
+	param (
+		[Parameter(ParameterSetName = 'Days')]
+		[ValidateRange(30, 3650)]
+		[int] $Days = 730,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'Months')]
+		[ValidateRange(1, 120)]
+		[int] $Months,
+
+		[ValidateNotNullOrEmpty()]
+		[string] $ExcludePattern = 'Remote Support|admin',
+
+		[switch] $PassThru
+	)
+
+	Function Convert-ProfileListTime {
+		# ProfileList stores FILETIMEs as paired DWORDs. PowerShell reads DWORDs back as
+		# signed Int32, so negative values must be restored to their unsigned bit pattern
+		# before the two halves are recombined.
+		param($High, $Low)
+		If ($null -eq $High -or $null -eq $Low) { Return $null }
+		$H = [Int64]$High
+		If ($H -lt 0) { $H += 4294967296 }
+		$L = [Int64]$Low
+		If ($L -lt 0) { $L += 4294967296 }
+		$FileTime = ($H -shl 32) -bor $L
+		If ($FileTime -le 0) { Return $null }
+		Try { Return [datetime]::FromFileTime($FileTime) } Catch { Return $null }
+	}
+
+	Function Test-ProfileFolderInUse {
+		# Decides whether anyone is working out of a profile folder right now, without
+		# trusting any bookkeeping that can be stale or can describe a different account.
+		# A loaded profile holds an exclusive kernel lock on NTUSER.DAT, so if the hive
+		# cannot be opened for exclusive read/write the folder is live no matter what
+		# Win32_UserProfile.Loaded and the ProfileList timestamps say about it.
+		# Returns $true when the folder is in use and $true when the answer cannot be
+		# determined, so an unreadable profile is kept rather than deleted.
+		param ([string] $ProfileFolder)
+		$HivePath = Join-Path -Path $ProfileFolder -ChildPath 'NTUSER.DAT'
+		If (-not (Test-Path -LiteralPath $HivePath)) { Return $false }
+		$Stream = $null
+		Try {
+			$Stream = [System.IO.File]::Open($HivePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+			Return $false
+		} Catch {
+			Return $true
+		} Finally {
+			If ($Stream) { $Stream.Dispose() }
+		}
+	}
+
+	Function Remove-ProfileScheduledTasks {
+		# Windows suffixes the task name with the profile's SID for several per-user tasks it
+		# creates automatically (OneDrive's Startup, Reporting, and Standalone Update tasks are
+		# the common ones). Once the profile is gone these become orphaned entries that clutter
+		# Task Scheduler and can error on their next scheduled run.
+		param ([string] $ProfileSID)
+		If (-not $ProfileSID) { Return }
+		ForEach ($OrphanedTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "*-$ProfileSID" })) {
+			Try {
+				Unregister-ScheduledTask -InputObject $OrphanedTask -ErrorAction Stop
+				Write-Host "Removed orphaned scheduled task $($OrphanedTask.TaskName)." -ForegroundColor Green
+			} Catch {
+				Write-Host "Failed to remove scheduled task $($OrphanedTask.TaskName): $($_.Exception.Message)" -ForegroundColor Red
+			}
+		}
+	}
+
+	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+	If (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Write-Host "Remove-StaleProfiles requires an elevated session. Run as Administrator." -ForegroundColor Red
+		Return
+	}
+
+	# A malformed exclusion regex must fail closed, not fall through to deletions.
+	Try {
+		$null = [regex]::new($ExcludePattern)
+	} Catch {
+		Write-Host "ExcludePattern '$ExcludePattern' is not a valid regular expression: $($_.Exception.Message)" -ForegroundColor Red
+		Return
+	}
+
+	If ($PSCmdlet.ParameterSetName -eq 'Months') {
+		$CutoffDate = (Get-Date).AddMonths(-$Months)
+		$ThresholdText = "$Months month(s)"
+	} Else {
+		$CutoffDate = (Get-Date).AddDays(-$Days)
+		$ThresholdText = "$Days day(s)"
+	}
+
+	Write-Host "Checking for user profiles with no activity since $($CutoffDate.ToString('yyyy-MM-dd')) ($ThresholdText)..." -ForegroundColor Cyan
+
+	Try {
+		$AllProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)
+		# A null CreationTime (seen on damaged profiles) passes the age gate; the activity
+		# check below is still required before anything is removed.
+		$Candidates = $AllProfiles | Where-Object {
+			($_.Loaded -eq $false) -and
+			($_.Special -ne $true) -and
+			($_.LocalPath) -and
+			($_.LocalPath -notmatch $ExcludePattern) -and
+			((-not $_.CreationTime) -or ($_.CreationTime -lt $CutoffDate))
+		}
+	} Catch {
+		Write-Host "Failed to enumerate user profiles: $($_.Exception.Message)" -ForegroundColor Red
+		Return
+	}
+
+	If (-not $Candidates) {
+		Write-Host "No unloaded user profiles older than $ThresholdText found." -ForegroundColor Green
+		Return
+	}
+
+	# SIDs whose registry hive is mounted right now. This is the state
+	# Win32_UserProfile.Loaded is meant to report, read straight from HKEY_USERS so a stale
+	# or wrong WMI snapshot cannot green-light a profile whose owner is signed in.
+	$InUseSIDs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+	ForEach ($HiveKey in @(Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+		$HiveSID = $HiveKey.PSChildName -replace '_Classes$', ''
+		# Any SID shape counts. An Entra ID account on an Entra-joined machine is S-1-12-1,
+		# not S-1-5-21, and matching only the latter would leave that user unprotected.
+		If ($HiveSID -match '^S-1-') { [void]$InUseSIDs.Add($HiveSID) }
+	}
+
+	# SIDs holding a logon session. Catches a disconnected session that still owns running
+	# processes, and any build where the hive enumeration above comes back short.
+	ForEach ($LogonLink in @(Get-CimInstance -ClassName Win32_LoggedOnUser -ErrorAction SilentlyContinue)) {
+		Try {
+			$Account = New-Object System.Security.Principal.NTAccount($LogonLink.Antecedent.Domain, $LogonLink.Antecedent.Name)
+			$ResolvedSID = $Account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+			If ($ResolvedSID -match '^S-1-') { [void]$InUseSIDs.Add($ResolvedSID) }
+		} Catch { }
+	}
+
+	# Folder -> every SID that claims it. Two entries pointing at one folder is a real and
+	# common repair artifact: an account deleted and recreated keeps the folder but gets a new
+	# SID, and the usual hand fix for a temporary profile is to repoint ProfileImagePath at the
+	# live folder. The abandoned entry then ages out on its own timestamps while the current
+	# user is still working out of that folder, so no folder may be deleted on the strength of
+	# a single entry's timestamps. The .bak suffix Windows adds to a failed profile load is
+	# stripped first: that is the same account, not a second claimant.
+	$SelfProfilePath = ''
+	If ($env:USERPROFILE) { $SelfProfilePath = $env:USERPROFILE.TrimEnd('\') }
+
+	$FolderClaims = @{}
+	$ClaimList = @()
+	$ClaimList += @($AllProfiles | ForEach-Object { [PSCustomObject]@{ Path = $_.LocalPath; SID = $_.SID } })
+	$ClaimList += @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
+		[PSCustomObject]@{
+			Path = (Get-ItemProperty -Path $_.PSPath -Name 'ProfileImagePath' -ErrorAction SilentlyContinue).ProfileImagePath
+			SID  = $_.PSChildName -replace '\.bak$', ''
+		}
+	})
+	ForEach ($Claim in $ClaimList) {
+		If (-not $Claim.Path -or -not $Claim.SID) { Continue }
+		$ClaimKey = $Claim.Path.TrimEnd('\')
+		If (-not $FolderClaims.ContainsKey($ClaimKey)) { $FolderClaims[$ClaimKey] = @() }
+		If ($FolderClaims[$ClaimKey] -notcontains $Claim.SID) { $FolderClaims[$ClaimKey] += $Claim.SID }
+	}
+
+	$Results = [System.Collections.ArrayList]::new()
+
+	ForEach ($StaleProfile in $Candidates) {
+		$ProfilePath = $StaleProfile.LocalPath
+		$ProfileSID = $StaleProfile.SID
+		Write-Host "Assessing $ProfilePath" -ForegroundColor Cyan
+		$Action = 'Kept'
+		$LastActivity = $null
+		$ActivitySource = $null
+
+		If (-not (Test-Path -LiteralPath $ProfilePath)) {
+			If ($PSCmdlet.ShouldProcess("$ProfilePath (SID: $ProfileSID)", "Remove orphaned profile registry entry")) {
+				Try {
+					Remove-CimInstance -InputObject $StaleProfile -ErrorAction Stop
+					Write-Host "Removed orphaned profile entry for $ProfilePath (no folder on disk)." -ForegroundColor Green
+					$Action = 'RemovedOrphan'
+					Remove-ProfileScheduledTasks -ProfileSID $ProfileSID
+				} Catch {
+					Write-Host "Failed to remove orphaned profile entry for ${ProfilePath}: $($_.Exception.Message)" -ForegroundColor Red
+					$Action = 'Failed'
+				}
+			} Else {
+				$Action = 'Declined'
+			}
+		} Else {
+			$ProfileRoot = Get-Item -LiteralPath $ProfilePath -Force -ErrorAction SilentlyContinue
+			If (-not $ProfileRoot) {
+				Write-Host "Unable to read $ProfilePath. Leaving the profile alone." -ForegroundColor Yellow
+				$Action = 'Unreadable'
+			} Else {
+				# Prove the folder is idle before any timestamp is even consulted. Age is an
+				# argument about the past; these three are about right now, and any one of them
+				# firing means deleting would destroy data somebody is still using.
+				$OtherClaimants = @()
+				$ClaimKey = $ProfilePath.TrimEnd('\')
+				If ($FolderClaims.ContainsKey($ClaimKey)) {
+					$OtherClaimants = @($FolderClaims[$ClaimKey] | Where-Object { $_ -ne $ProfileSID })
+				}
+				$InUseReason = $null
+				If ($OtherClaimants) {
+					$InUseReason = "another profile entry ($($OtherClaimants -join ', ')) points at the same folder, so these timestamps do not describe whoever is using it"
+				} ElseIf ($InUseSIDs.Contains($ProfileSID)) {
+					$InUseReason = 'its registry hive is loaded or it holds a logon session, so the account is signed in'
+				} ElseIf ($SelfProfilePath -and ($ClaimKey -eq $SelfProfilePath)) {
+					$InUseReason = 'it is the profile of the account running this command'
+				} ElseIf (Test-ProfileFolderInUse -ProfileFolder $ProfilePath) {
+					$InUseReason = 'its NTUSER.DAT hive is locked, so the profile is loaded right now'
+				}
+
+				If ($InUseReason) {
+					Write-Host "Keeping $ProfilePath ($InUseReason)." -ForegroundColor Yellow
+					$Action = 'InUse'
+					$ActivitySource = 'In use'
+					[void]$Results.Add([PSCustomObject]@{
+						ProfilePath    = $ProfilePath
+						SID            = $ProfileSID
+						LastActivity   = $LastActivity
+						ActivitySource = $ActivitySource
+						Action         = $Action
+					})
+					Continue
+				}
+
+				# Primary signal: the profile service's unload and cleanup-check timestamps, the
+				# two values Windows itself ages profiles from since Windows 10 1809 and Server
+				# 2019. They only move on a real unload or cleanup check, unlike file timestamps,
+				# which Windows Update servicing and antivirus hive scans inflate.
+				#
+				# LocalProfileLoadTime is deliberately not one of them. A load time newer than
+				# both of the others means the profile was loaded and never came back down, which
+				# is either a session that is still open or a machine that lost power mid-session.
+				# Microsoft's reference script (see .LINK) excludes it for that exact reason, with
+				# the note that a winning load time "would most likely indicate profile currently
+				# loaded or machine crashed". Ageing a profile from its load time reports a user
+				# who has been signed in continuously since that date as idle since that date,
+				# which is how a profile in daily use gets deleted as stale.
+				$LoadTime = $null
+				$RegInfo = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$ProfileSID" -ErrorAction SilentlyContinue
+				If ($RegInfo) {
+					$LoadTime = Convert-ProfileListTime -High $RegInfo.LocalProfileLoadTimeHigh -Low $RegInfo.LocalProfileLoadTimeLow
+					$RegTimes = @()
+					ForEach ($ValueName in 'LocalProfileUnLoadTime', 'LocalProfileCleanupCheckTime') {
+						$Converted = Convert-ProfileListTime -High $RegInfo."$($ValueName)High" -Low $RegInfo."$($ValueName)Low"
+						If ($Converted) { $RegTimes += $Converted }
+					}
+					# Only trust the unload/cleanup pair while the load that produced them has
+					# already been accounted for. Once the load time is the newest of the three the
+					# pair describes an earlier session, not the last one, and Windows falls back to
+					# the NTUSER.DAT timestamp instead.
+					If ($RegTimes) {
+						$NewestRegTime = $RegTimes | Sort-Object -Descending | Select-Object -First 1
+						If ((-not $LoadTime) -or ($LoadTime -le $NewestRegTime)) {
+							$LastActivity = $NewestRegTime
+							$ActivitySource = 'Profile service registry'
+						}
+					}
+				}
+
+				# A load with no matching unload is not activity, but a recent one is still proof
+				# the profile was signed into inside the threshold, so it keeps the profile.
+				If ((-not $LastActivity) -and $LoadTime -and ($LoadTime -ge $CutoffDate)) {
+					Write-Host "Keeping $ProfilePath (signed in on $($LoadTime.ToString('yyyy-MM-dd')) and never unloaded, which is within $ThresholdText)." -ForegroundColor Yellow
+					$Action = 'InUse'
+					$ActivitySource = 'Profile service registry (load time)'
+					[void]$Results.Add([PSCustomObject]@{
+						ProfilePath    = $ProfilePath
+						SID            = $ProfileSID
+						LastActivity   = $LoadTime
+						ActivitySource = $ActivitySource
+						Action         = $Action
+					})
+					Continue
+				}
+
+				If (-not $LastActivity) {
+					# Fallback for builds without usable profile service timestamps, and for the
+					# abandoned-mid-session case above. Inflated by servicing, which errs toward
+					# keeping profiles.
+					$ActivityTimes = @($ProfileRoot.LastWriteTime)
+					$Hive = Get-Item -LiteralPath (Join-Path -Path $ProfilePath -ChildPath 'NTUSER.DAT') -Force -ErrorAction SilentlyContinue
+					If ($Hive) { $ActivityTimes += $Hive.LastWriteTime }
+					$SubDirs = Get-ChildItem -LiteralPath $ProfilePath -Directory -Force -ErrorAction SilentlyContinue
+					If ($SubDirs) { $ActivityTimes += @($SubDirs | ForEach-Object { $_.LastWriteTime }) }
+					$LastActivity = $ActivityTimes | Sort-Object -Descending | Select-Object -First 1
+					$ActivitySource = 'File timestamps'
+				}
+
+				$IdleDays = [int][math]::Floor(((Get-Date) - $LastActivity).TotalDays)
+				Write-Host "Most recent activity on $ProfilePath was $IdleDays day(s) ago ($($LastActivity.ToString('yyyy-MM-dd'))). Source: $ActivitySource."
+
+				If ($LastActivity -ge $CutoffDate) {
+					Write-Host "Keeping $ProfilePath (activity within $ThresholdText)." -ForegroundColor Yellow
+				} ElseIf ($PSCmdlet.ShouldProcess("$ProfilePath (SID: $ProfileSID, idle $IdleDays days)", "Permanently remove user profile and all of its files")) {
+					Try {
+						Remove-CimInstance -InputObject $StaleProfile -ErrorAction Stop
+						Write-Host "Removed profile $ProfilePath (SID: $ProfileSID)." -ForegroundColor Green
+						$Action = 'Removed'
+						Remove-ProfileScheduledTasks -ProfileSID $ProfileSID
+						If (Test-Path -LiteralPath $ProfilePath) {
+							# Files surviving the profile service's own delete are usually transient
+							# handles from the search indexer or antivirus. A locked hive is not that:
+							# it means something is still working out of this folder, and
+							# Remove-PathForcefully would delete what it can and queue the rest for
+							# delete-on-reboot, destroying live data. Re-test before touching anything.
+							If (Test-ProfileFolderInUse -ProfileFolder $ProfilePath) {
+								Write-Host "Folder $ProfilePath is still in use after profile removal. Leaving the files in place; clear them once the machine has been rebooted and the folder is idle." -ForegroundColor Red
+							} Else {
+								Write-Host "Folder still present after profile removal. Force-removing leftovers..." -ForegroundColor Yellow
+								Remove-PathForcefully -Path $ProfilePath
+							}
+						}
+					} Catch {
+						# Do not force-delete files when profile removal failed; a ProfileList entry
+						# pointing at a gutted folder breaks that user's next logon.
+						Write-Host "Failed to remove profile ${ProfilePath}: $($_.Exception.Message)" -ForegroundColor Red
+						$Action = 'Failed'
+					}
+				} Else {
+					$Action = 'Declined'
+				}
+			}
+		}
+
+		[void]$Results.Add([PSCustomObject]@{
+			ProfilePath    = $ProfilePath
+			SID            = $ProfileSID
+			LastActivity   = $LastActivity
+			ActivitySource = $ActivitySource
+			Action         = $Action
+		})
+	}
+
+	$RemovedCount = @($Results | Where-Object { $_.Action -in @('Removed', 'RemovedOrphan') }).Count
+	$FailedCount = @($Results | Where-Object { $_.Action -eq 'Failed' }).Count
+	$InUseCount = @($Results | Where-Object { $_.Action -eq 'InUse' }).Count
+	Write-Host "Stale profile cleanup complete. Removed: $RemovedCount. Failed: $FailedCount. Held back as in use: $InUseCount. Assessed: $($Results.Count)." -ForegroundColor Cyan
+	If ($PassThru) {
+		Write-Output $Results
+	}
+}
+
+Function Remove-SyncroAgent {
+	<#
+	.SYNOPSIS
+		Removes the Syncro RMM agent from a Windows machine without an uninstall authorization code.
+
+	.DESCRIPTION
+		Built for MSP takeover scenarios where the previous provider's Syncro agent must be
+		removed but the Syncro uninstall token is not available (e.g. the prior IT provider
+		ghosted the client). Performs a manual teardown rather than calling the vendor
+		uninstaller: disables and stops services, kills processes, deletes services with
+		sc.exe, removes scheduled tasks, deletes program and data folders, and cleans the
+		registry.
+
+		The vendor uninstaller is deliberately NOT used. Syncro's uninstaller is what prompts
+		for the authorization code, and run as SYSTEM with no interactive desktop it would hang
+		waiting for input. sc.exe delete is used instead of Remove-Service because Remove-Service
+		does not exist in Windows PowerShell 5.1, which is what most RMM deployment shells use.
+
+		Designed to be pushed as SYSTEM from the new RMM. Idempotent and safe to re-run. Honors
+		-WhatIf and -Confirm. Reuses the MauleTech PWSH library (Remove-PathForcefully,
+		Get-InstalledApplication) when it can be loaded.
+
+	.PARAMETER RemoveSplashtop
+		Also removes the Splashtop Streamer that Syncro bundles for remote control. Off by
+		default so an unrelated or legitimate Splashtop install is not touched. Enable only
+		after confirming the Splashtop instance belongs to Syncro.
+
+	.EXAMPLE
+		Remove-SyncroAgent -Verbose
+		Detects and removes Syncro, logging each step.
+
+	.EXAMPLE
+		Remove-SyncroAgent -WhatIf
+		Shows what would be removed without changing anything.
+
+	.EXAMPLE
+		Remove-SyncroAgent -RemoveSplashtop -Verbose
+		Removes Syncro and its bundled Splashtop Streamer.
+
+	.NOTES
+		Run elevated or as SYSTEM. A reboot may be required to finalize deletion of files that
+		were locked at runtime (Remove-PathForcefully schedules those for delete-on-reboot).
+	#>
+	[CmdletBinding(SupportsShouldProcess = $True, ConfirmImpact = 'Medium')]
+	param(
+		[switch] $RemoveSplashtop
+	)
+
+	# --- Load MauleTech PWSH helpers if not already present in the session ---
+	If (-not (Get-Command Remove-PathForcefully -ErrorAction SilentlyContinue)) {
+		Write-Verbose 'Remove-PathForcefully not found. Attempting to load MauleTech PWSH library.'
+		Try {
+			# 3072|768|192 = TLS 1.2|1.1|1.0 as integers. Literal form so it still parses on old .NET where the named enum members are undefined.
+			[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192
+			Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt' | Invoke-Expression
+		} Catch {
+			Write-Verbose "Could not load PWSH library: $($_.Exception.Message). Falling back to built-in removal only."
+		}
+	}
+
+	# --- Warn (do not block) if not elevated ---
+	$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+	If (-not $IsAdmin) { Write-Warning 'Not running elevated. Service and registry removal will likely fail. Run as Administrator or SYSTEM.' }
+
+	# --- Known Syncro component identifiers ---
+	# Wildcard patterns catch every version-specific name in one shot:
+	# Syncro, SyncroLive, SyncroOvermind (display "SyncroRecovery", the watchdog), and legacy Kabuto.*
+	$ServicePatterns = @('Syncro*', 'Kabuto*')
+	$ProcessPatterns = @('Syncro*', 'Kabuto*')
+	$FolderPaths = @(
+		"$env:ProgramFiles\RepairTech\Syncro",
+		"${env:ProgramFiles(x86)}\RepairTech\Syncro",
+		"$env:ProgramFiles\RepairTech\Kabuto",
+		"$env:ProgramData\Syncro",
+		"$env:ProgramData\RepairTech"
+	)
+	$RegPaths = @(
+		'HKLM:\SOFTWARE\RepairTech',
+		'HKLM:\SOFTWARE\WOW6432Node\RepairTech'
+	)
+	$TaskMatch    = 'Syncro|RepairTech|Kabuto'
+	$DisplayMatch = 'Syncro|Kabuto'
+
+	If ($RemoveSplashtop) {
+		Write-Verbose 'RemoveSplashtop set. Splashtop Streamer will also be targeted.'
+		$ServicePatterns += 'SplashtopRemoteService'
+		$ProcessPatterns += @('SRService', 'SRManager', 'SRFeature')
+		$FolderPaths  += @(
+			"$env:ProgramFiles\Splashtop\Splashtop Remote\Server",
+			"${env:ProgramFiles(x86)}\Splashtop\Splashtop Remote\Server"
+		)
+		$DisplayMatch  = 'Syncro|Kabuto|Splashtop'
+	}
+
+	# --- Detection: is anything Syncro present? ---
+	$FoundServices = @(Get-Service -Name $ServicePatterns -ErrorAction SilentlyContinue)
+	$FoundFolders  = $FolderPaths | Where-Object { Test-Path -LiteralPath $_ }
+	$FoundReg      = $RegPaths    | Where-Object { Test-Path -LiteralPath $_ }
+	$AppHit        = $False
+	If (Get-Command Get-InstalledApplication -ErrorAction SilentlyContinue) {
+		$AppHit = [bool](Get-InstalledApplication -Name $DisplayMatch)
+	}
+
+	If (-not ($FoundServices -or $FoundFolders -or $FoundReg -or $AppHit)) {
+		Write-Host 'Syncro does not appear to be installed. Nothing to do.' -ForegroundColor Cyan
+		return [PSCustomObject]@{ Computer = $env:COMPUTERNAME; SyncroFound = $False; Removed = $False; RebootRecommended = $False }
+	}
+
+	Write-Host 'Syncro components detected. Beginning removal.' -ForegroundColor Cyan
+	$RebootRecommended = $False
+
+	# --- 1. Disable startup on ALL matched services first, then stop them. ---
+	# --- Disabling before stopping prevents SyncroOvermind (the watchdog) from relaunching siblings. ---
+	ForEach ($svc in $FoundServices) {
+		If ($PSCmdlet.ShouldProcess($svc.Name, 'Disable service startup')) {
+			Write-Verbose "Disabling service: $($svc.Name)"
+			Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction SilentlyContinue
+		}
+	}
+	ForEach ($svc in $FoundServices) {
+		If ($PSCmdlet.ShouldProcess($svc.Name, 'Stop service')) {
+			Write-Verbose "Stopping service: $($svc.Name)"
+			Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	# --- 2. Kill processes ---
+	$ProcNames = @(Get-Process -Name $ProcessPatterns -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique)
+	ForEach ($pn in $ProcNames) {
+		If ($PSCmdlet.ShouldProcess($pn, 'Stop process')) {
+			Write-Verbose "Stopping process: $pn"
+			Stop-Process -Name $pn -Force -ErrorAction SilentlyContinue
+		}
+	}
+	Start-Sleep -Seconds 3
+
+	# --- 3. Delete services (sc.exe for 5.1 compatibility) ---
+	ForEach ($svc in @(Get-Service -Name $ServicePatterns -ErrorAction SilentlyContinue)) {
+		If ($PSCmdlet.ShouldProcess($svc.Name, 'Delete service')) {
+			Write-Verbose "Deleting service: $($svc.Name)"
+			$null = & "$env:SystemRoot\System32\sc.exe" delete "$($svc.Name)"
+		}
+	}
+
+	# --- 4. Remove scheduled tasks ---
+	$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { ($_.TaskName + $_.TaskPath) -match $TaskMatch }
+	ForEach ($task in $tasks) {
+		If ($PSCmdlet.ShouldProcess("$($task.TaskPath)$($task.TaskName)", 'Unregister scheduled task')) {
+			Write-Verbose "Removing scheduled task: $($task.TaskPath)$($task.TaskName)"
+			Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$False -ErrorAction SilentlyContinue
+		}
+	}
+
+	# --- 5. Delete folders ---
+	ForEach ($path in $FolderPaths) {
+		If (Test-Path -LiteralPath $path) {
+			If ($PSCmdlet.ShouldProcess($path, 'Delete folder')) {
+				Write-Verbose "Removing folder: $path"
+				If (Get-Command Remove-PathForcefully -ErrorAction SilentlyContinue) {
+					Remove-PathForcefully -Path $path
+				} Else {
+					Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+				}
+				If (Test-Path -LiteralPath $path) { $RebootRecommended = $True }
+			}
+		}
+	}
+
+	# --- 6. Clean registry: RepairTech keys ---
+	ForEach ($reg in $RegPaths) {
+		If (Test-Path -LiteralPath $reg) {
+			If ($PSCmdlet.ShouldProcess($reg, 'Remove registry key')) {
+				Write-Verbose "Removing registry key: $reg"
+				Remove-Item -LiteralPath $reg -Recurse -Force -ErrorAction SilentlyContinue
+			}
+		}
+	}
+
+	# --- 6b. Clean registry: Uninstall entries whose DisplayName matches ---
+	$UninstallRoots = @(
+		'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+		'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+	)
+	ForEach ($root in $UninstallRoots) {
+		If (Test-Path -LiteralPath $root) {
+			Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+				$dn = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).DisplayName
+				If ($dn -and $dn -match $DisplayMatch) {
+					If ($PSCmdlet.ShouldProcess("$dn ($($_.PSChildName))", 'Remove Uninstall registry entry')) {
+						Write-Verbose "Removing Uninstall entry: $dn"
+						Remove-Item -LiteralPath $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+					}
+				}
+			}
+		}
+	}
+
+	# --- 7. Verify ---
+	$StillServices = @(Get-Service -Name $ServicePatterns -ErrorAction SilentlyContinue)
+	$StillFolders  = $FolderPaths | Where-Object { Test-Path -LiteralPath $_ }
+	$StillReg      = $RegPaths    | Where-Object { Test-Path -LiteralPath $_ }
+	$Clean         = -not ($StillServices -or $StillReg)
+	$FullyClean    = ($Clean -and -not $StillFolders)
+
+	If ($FullyClean) {
+		Write-Host 'Syncro removal complete. No remaining services, folders, or registry keys detected.' -ForegroundColor Green
+	} ElseIf ($Clean -and $RebootRecommended) {
+		Write-Host 'Syncro services and registry removed. Some files are locked and scheduled for delete-on-reboot. Reboot to finalize.' -ForegroundColor Yellow
+	} Else {
+		Write-Warning 'Some Syncro components could not be removed. Review remaining items below.'
+		If ($StillServices) { Write-Warning ("Remaining services: " + ($StillServices.Name -join ', ')) }
+		If ($StillFolders)  { Write-Warning ("Remaining folders: "  + ($StillFolders  -join ', ')) }
+		If ($StillReg)      { Write-Warning ("Remaining reg keys: " + ($StillReg      -join ', ')) }
+	}
+
+	return [PSCustomObject]@{
+		Computer          = $env:COMPUTERNAME
+		SyncroFound       = $True
+		Removed           = $FullyClean
+		RebootRecommended = $RebootRecommended
+	}
+}
+
+Function Remove-UserProfile {
+<#
+	.SYNOPSIS
+		Removes a specific local user profile, stale or not, the way Windows removes it.
+
+	.DESCRIPTION
+		Targeted counterpart to Remove-StaleProfiles. Rather than aging every profile on the
+		machine, this removes the profile you name, no matter how recently it was used. Useful
+		for prepping a machine for a new user, or for rebuilding a corrupt profile (the
+		"You've been signed in with a temporary profile" case).
+
+		A profile can be named by user name, by SID, or by profile folder path. For each match
+		the function:
+		  - Deletes the profile with Remove-CimInstance against Win32_UserProfile, which
+			removes the ProfileList registry entry and the profile folder together. Deleting
+			the folder by hand leaves the registry entry orphaned, which is exactly what makes
+			the next logon land in a temporary profile.
+		  - Force-removes anything left on disk afterwards with Remove-PathForcefully.
+		  - Removes leftover ProfileList entries for the same SID or folder, including the
+			<SID>.bak entry left behind by a failed profile load.
+		  - Removes orphaned ProfileGuid entries that referenced the deleted SID.
+		  - Removes that user's per-user scheduled tasks. Windows suffixes the task name with
+			the profile's SID for several tasks it creates automatically (OneDrive's Startup,
+			Reporting, and Standalone Update tasks are the common ones); once the profile is
+			gone these become orphaned entries that clutter Task Scheduler and can error on
+			their next scheduled run.
+		  - Handles the half-deleted states too: a ProfileList entry whose folder is already
+			gone, and a profile folder that no ProfileList entry points at.
+
+		Never touches the special service profiles (S-1-5-18, S-1-5-19, S-1-5-20), the
+		All Users, Default, Default User, LocalService, NetworkService and Public folders, or
+		the profile of the account running the command.
+
+		Profiles that are currently loaded (the user is still signed in) are skipped unless
+		-Force is supplied. Sign the user out first where possible; removing a loaded profile
+		usually leaves locked files that only clear on reboot.
+
+		Deleting a profile permanently destroys any data stored only in that profile. Use
+		-BackupPath first when the data matters. Supports -WhatIf and prompts per profile;
+		pass -Confirm:$false for unattended RMM use. Requires an elevated session.
+
+	.PARAMETER UserName
+		One or more user names to remove. Matched against the profile folder name (including
+		domain-suffixed folders such as jdoe.CONTOSO) and against the account name the SID
+		resolves to, in either 'jdoe' or 'CONTOSO\jdoe' form. If no profile matches but a
+		leftover folder of that name exists under the profiles directory, the folder is
+		treated as an orphan and removed.
+
+	.PARAMETER SID
+		One or more security identifiers to remove, e.g. 'S-1-5-21-1234567890-...'. Use this
+		when the account is already deleted from AD and the profile shows as "Unknown Account".
+
+	.PARAMETER ProfilePath
+		One or more full profile folder paths to remove, e.g. 'C:\Users\jdoe'. Matched against
+		Win32_UserProfile.LocalPath and against ProfileList\ProfileImagePath.
+
+	.PARAMETER BackupPath
+		Copies the profile folder into this directory before deleting it. Each profile lands in
+		its own timestamped subfolder. The copy uses robocopy with /XJ so the AppData junctions
+		inside a profile do not send it into a loop. If the backup fails, the profile is left
+		alone. The backup destination cannot live inside the profile being removed.
+
+	.PARAMETER Force
+		Removes the profile even if it is currently loaded (the user is signed in). Expect
+		locked files and a reboot to finish the cleanup. Without this switch loaded profiles
+		are reported and skipped.
+
+	.PARAMETER PassThru
+		Outputs a result object for each target (Target, ProfilePath, SID, Loaded, BackupPath,
+		Action).
+
+	.EXAMPLE
+		Remove-UserProfile -UserName jdoe -WhatIf
+		Shows exactly what would be removed for jdoe without changing anything.
+
+	.EXAMPLE
+		Remove-UserProfile -UserName jdoe
+		Removes jdoe's profile and registry entries after a confirmation prompt. Run this with
+		jdoe signed out, then have them sign back in to get a freshly built profile.
+
+	.EXAMPLE
+		Remove-UserProfile -UserName jdoe -BackupPath 'D:\ProfileBackups'
+		Copies C:\Users\jdoe to D:\ProfileBackups\jdoe-20250114-101500 first, then removes the
+		profile. Nothing is deleted if the copy fails.
+
+	.EXAMPLE
+		Remove-UserProfile -UserName 'olduser1','olduser2','contractor' -Confirm:$false
+		Clears several profiles unattended, e.g. when prepping a machine for a new user.
+
+	.EXAMPLE
+		Remove-UserProfile -SID 'S-1-5-21-1004336348-1177238915-682003330-1013' -Confirm:$false
+		Removes a profile whose account no longer exists and shows as "Unknown Account".
+
+	.EXAMPLE
+		Remove-UserProfile -ProfilePath 'C:\Users\jdoe.CONTOSO' -Force -PassThru
+		Removes a domain-suffixed profile even though it is loaded, and returns a result object
+		for logging.
+
+	.LINK
+		https://learn.microsoft.com/en-us/troubleshoot/windows-server/user-profiles-and-logon/delete-user-profile
+
+	.LINK
+		https://learn.microsoft.com/en-us/troubleshoot/windows-server/support-tools/scripts-to-cleanup-profile-folder-information-and-prevent-temp-user-profiles-from-being-created
+#>
+	[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'UserName')]
+	param (
+		[Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'UserName')]
+		[ValidateNotNullOrEmpty()]
+		[string[]] $UserName,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'SID')]
+		[ValidatePattern('^S-1-[0-9\-]+$')]
+		[string[]] $SID,
+
+		[Parameter(Mandatory = $true, ParameterSetName = 'ProfilePath')]
+		[ValidateNotNullOrEmpty()]
+		[string[]] $ProfilePath,
+
+		[ValidateNotNullOrEmpty()]
+		[string] $BackupPath,
+
+		[switch] $Force,
+
+		[switch] $PassThru
+	)
+
+	$ProfileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+	$ProfileGuidKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileGuid'
+	# Service SIDs and shared/template folders that must never be deleted, per the Microsoft
+	# orphaned-profile cleanup guidance linked above.
+	$ProtectedSIDs = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')
+	$ProtectedNames = @('All Users', 'Default', 'Default User', 'LocalService', 'NetworkService', 'Public')
+
+	Function Get-ProfileRegistryEntry {
+		# Every ProfileList child key, including the <SID>.bak entries that Win32_UserProfile
+		# does not surface.
+		param ([string] $KeyPath)
+		Get-ChildItem -Path $KeyPath -ErrorAction SilentlyContinue | ForEach-Object {
+			$ImagePath = (Get-ItemProperty -LiteralPath $_.PSPath -Name 'ProfileImagePath' -ErrorAction SilentlyContinue).ProfileImagePath
+			[PSCustomObject]@{
+				KeyName  = $_.PSChildName
+				SID      = ($_.PSChildName -replace '\.bak$', '')
+				Path     = $(If ($ImagePath) { $ImagePath.TrimEnd('\') } Else { $null })
+				PSPath   = $_.PSPath
+				IsBackup = ($_.PSChildName -like '*.bak')
+			}
+		}
+	}
+
+	Function Resolve-ProfileAccountName {
+		param ([string] $ProfileSID)
+		If (-not $ProfileSID) { Return $null }
+		Try {
+			Return (New-Object System.Security.Principal.SecurityIdentifier($ProfileSID)).Translate([System.Security.Principal.NTAccount]).Value
+		} Catch {
+			Return $null
+		}
+	}
+
+	Function Test-ProfileNameMatch {
+		param ([string] $Name, [string] $Account, [string] $Path)
+		If ($Path) {
+			$Leaf = Split-Path -Path $Path -Leaf
+			# Domain logons produce jdoe.CONTOSO / jdoe.000 style folders for the same user.
+			If (($Leaf -ieq $Name) -or ($Leaf -ilike ([System.Management.Automation.WildcardPattern]::Escape($Name) + '.*'))) { Return $true }
+		}
+		If ($Account) {
+			If ($Account -ieq $Name) { Return $true }
+			If (($Account -split '\\')[-1] -ieq $Name) { Return $true }
+		}
+		Return $false
+	}
+
+	Function Backup-ProfileFolder {
+		# Robocopy rather than Copy-Item: profile folders contain junctions such as
+		# AppData\Local\Application Data that point back at themselves, and Copy-Item -Recurse
+		# follows them until it dies. /XJ skips them.
+		param ([string] $Source, [string] $Destination)
+		$Robocopy = Join-Path -Path $env:SystemRoot -ChildPath 'System32\robocopy.exe'
+		Try {
+			$null = & $Robocopy $Source $Destination /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:DAT /NFL /NDL /NP /NJH /NJS
+			Return $LASTEXITCODE
+		} Catch {
+			Write-Host "Robocopy could not be run: $($_.Exception.Message)" -ForegroundColor Red
+			Return 16
+		}
+	}
+
+	Function Remove-ProfileScheduledTasks {
+		# Windows suffixes the task name with the profile's SID for several per-user tasks it
+		# creates automatically (OneDrive's Startup, Reporting, and Standalone Update tasks are
+		# the common ones). Once the profile is gone these become orphaned entries that clutter
+		# Task Scheduler and can error on their next scheduled run.
+		param ([string] $ProfileSID)
+		If (-not $ProfileSID) { Return }
+		ForEach ($OrphanedTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "*-$ProfileSID" })) {
+			Try {
+				Unregister-ScheduledTask -InputObject $OrphanedTask -ErrorAction Stop
+				Write-Host "Removed orphaned scheduled task $($OrphanedTask.TaskName)." -ForegroundColor Green
+			} Catch {
+				Write-Host "Failed to remove scheduled task $($OrphanedTask.TaskName): $($_.Exception.Message)" -ForegroundColor Red
+			}
+		}
+	}
+
+	$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+	If (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Write-Host "Remove-UserProfile requires an elevated session. Run as Administrator." -ForegroundColor Red
+		Return
+	}
+	$CurrentSID = $Identity.User.Value
+
+	$ProfilesDirectory = (Get-ItemProperty -Path $ProfileListKey -Name 'ProfilesDirectory' -ErrorAction SilentlyContinue).ProfilesDirectory
+	If (-not $ProfilesDirectory) { $ProfilesDirectory = Join-Path -Path $env:SystemDrive -ChildPath 'Users' }
+	$ProfilesDirectory = $ProfilesDirectory.TrimEnd('\')
+
+	If ($BackupPath) {
+		$BackupPath = $BackupPath.TrimEnd('\')
+		If (-not (Test-Path -LiteralPath $BackupPath)) {
+			Try {
+				$null = New-Item -Path $BackupPath -ItemType Directory -Force -ErrorAction Stop
+			} Catch {
+				Write-Host "Unable to create backup folder ${BackupPath}: $($_.Exception.Message)" -ForegroundColor Red
+				Return
+			}
+		}
+	}
+
+	Try {
+		$AllProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)
+	} Catch {
+		Write-Host "Failed to enumerate user profiles: $($_.Exception.Message)" -ForegroundColor Red
+		Return
+	}
+	$RegEntries = @(Get-ProfileRegistryEntry -KeyPath $ProfileListKey)
+
+	$AccountNameBySID = @{}
+	ForEach ($UserProfile in $AllProfiles) {
+		If ($UserProfile.SID -and -not $AccountNameBySID.ContainsKey($UserProfile.SID)) {
+			$AccountNameBySID[$UserProfile.SID] = Resolve-ProfileAccountName -ProfileSID $UserProfile.SID
+		}
+	}
+
+	Switch ($PSCmdlet.ParameterSetName) {
+		'SID'         { $Targets = $SID }
+		'ProfilePath' { $Targets = $ProfilePath }
+		Default       { $Targets = $UserName }
+	}
+
+	$Results = [System.Collections.ArrayList]::new()
+
+	ForEach ($RawTarget in $Targets) {
+		$Target = "$RawTarget".Trim()
+		If (-not $Target) { Continue }
+
+		# --- Resolve the target to zero or more profiles ---
+		$WorkItems = [System.Collections.ArrayList]::new()
+		$CandidatePath = $null
+		$MatchedProfiles = @()
+
+		Switch ($PSCmdlet.ParameterSetName) {
+			'SID' {
+				$MatchedProfiles = @($AllProfiles | Where-Object { $_.SID -ieq $Target })
+				$CandidatePath = $RegEntries | Where-Object { ($_.SID -ieq $Target) -and $_.Path } | Select-Object -First 1 -ExpandProperty Path
+			}
+			'ProfilePath' {
+				$CandidatePath = $Target.TrimEnd('\')
+				$MatchedProfiles = @($AllProfiles | Where-Object { $_.LocalPath -and ($_.LocalPath.TrimEnd('\') -ieq $CandidatePath) })
+			}
+			Default {
+				$MatchedProfiles = @($AllProfiles | Where-Object {
+					Test-ProfileNameMatch -Name $Target -Account $AccountNameBySID[$_.SID] -Path $_.LocalPath
+				})
+				# A plain user name maps to <ProfilesDirectory>\<name> when nothing else matches.
+				If ($Target.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -lt 0) {
+					$CandidatePath = Join-Path -Path $ProfilesDirectory -ChildPath $Target
+				}
+			}
+		}
+
+		ForEach ($Match in $MatchedProfiles) {
+			[void]$WorkItems.Add([PSCustomObject]@{
+				CimProfile = $Match
+				Path       = $(If ($Match.LocalPath) { $Match.LocalPath.TrimEnd('\') } Else { $null })
+				SID        = $Match.SID
+				Loaded     = [bool]$Match.Loaded
+				Special    = [bool]$Match.Special
+			})
+		}
+
+		If (($WorkItems.Count -eq 0) -and $CandidatePath) {
+			# Nothing in Win32_UserProfile. Look for the half-deleted leftovers: a ProfileList
+			# entry (or .bak entry) pointing at the folder, or a folder with no entry at all.
+			$LeftoverEntries = @($RegEntries | Where-Object { $_.Path -and ($_.Path -ieq $CandidatePath) })
+			If ($PSCmdlet.ParameterSetName -eq 'SID') {
+				$LeftoverEntries += @($RegEntries | Where-Object { $_.SID -ieq $Target })
+			}
+			$LeftoverEntries = @($LeftoverEntries | Sort-Object -Property PSPath -Unique)
+
+			If ($LeftoverEntries -or (Test-Path -LiteralPath $CandidatePath)) {
+				[void]$WorkItems.Add([PSCustomObject]@{
+					CimProfile = $null
+					Path       = $CandidatePath
+					SID        = $(If ($LeftoverEntries) { $LeftoverEntries[0].SID } Else { $null })
+					Loaded     = $false
+					Special    = $false
+				})
+			}
+		}
+
+		If ($WorkItems.Count -eq 0) {
+			Write-Host "No profile found for '$Target'." -ForegroundColor Yellow
+			[void]$Results.Add([PSCustomObject]@{
+				Target = $Target; ProfilePath = $null; SID = $null; Loaded = $false; BackupPath = $null; Action = 'NotFound'
+			})
+			Continue
+		}
+
+		If ($WorkItems.Count -gt 1) {
+			Write-Host "'$Target' matched $($WorkItems.Count) profiles: $(($WorkItems | ForEach-Object { $_.Path }) -join ', ')" -ForegroundColor Yellow
+		}
+
+		# --- Process each resolved profile ---
+		ForEach ($Item in $WorkItems) {
+			$ItemPath = $Item.Path
+			$ItemSID = $Item.SID
+			$Action = 'Skipped'
+			$BackupDestination = $null
+			$Leaf = $null
+			$Display = "SID $ItemSID"
+			If ($ItemPath) {
+				$Leaf = Split-Path -Path $ItemPath -Leaf
+				$Display = $ItemPath
+			}
+
+			Write-Host "Assessing $Display" -ForegroundColor Cyan
+
+			# --- Guards. Anything shared, system owned, or in use by this session is off limits. ---
+			$ProtectReason = $null
+			If ($Item.Special) { $ProtectReason = 'it is a special system profile' }
+			ElseIf ($ItemSID -and ($ProtectedSIDs -contains $ItemSID)) { $ProtectReason = 'it belongs to a well-known service account' }
+			ElseIf ($ItemSID -and ($ItemSID -ieq $CurrentSID)) { $ProtectReason = 'it belongs to the account running this command' }
+			ElseIf ($Leaf -and ($ProtectedNames -icontains $Leaf)) { $ProtectReason = 'it is a shared or template profile folder' }
+			ElseIf ($ItemPath -and ($ItemPath -ieq $ProfilesDirectory)) { $ProtectReason = 'it is the profiles directory itself' }
+			ElseIf ($ItemPath -and ($ItemPath -imatch '^[A-Za-z]:\\?$')) { $ProtectReason = 'it is a drive root' }
+			ElseIf ($ItemPath -and ($ItemPath -ieq $env:SystemRoot.TrimEnd('\'))) { $ProtectReason = 'it is the Windows directory' }
+			ElseIf ($ItemPath -and $ItemPath.StartsWith((Join-Path -Path $env:SystemRoot -ChildPath 'ServiceProfiles\'), [System.StringComparison]::OrdinalIgnoreCase)) { $ProtectReason = 'it is a service account profile' }
+
+			If ($ProtectReason) {
+				Write-Host "Refusing to remove $Display because $ProtectReason." -ForegroundColor Red
+				[void]$Results.Add([PSCustomObject]@{
+					Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $null; Action = 'Protected'
+				})
+				Continue
+			}
+
+			If ($Item.Loaded -and -not $Force) {
+				Write-Host "$Display is currently loaded (the user is still signed in). Sign the session out and re-run, or use -Force." -ForegroundColor Yellow
+				[void]$Results.Add([PSCustomObject]@{
+					Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $true; BackupPath = $null; Action = 'Loaded'
+				})
+				Continue
+			}
+			If ($Item.Loaded) {
+				Write-Warning "$Display is loaded. Removing it anyway because -Force was supplied. Expect locked files and a reboot to finish the cleanup."
+			}
+
+			If (-not $PSCmdlet.ShouldProcess("$Display (SID: $ItemSID)", "Permanently remove user profile and all of its files")) {
+				[void]$Results.Add([PSCustomObject]@{
+					Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $null; Action = 'Declined'
+				})
+				Continue
+			}
+
+			# --- Optional backup, taken before anything is destroyed ---
+			If ($BackupPath -and $ItemPath -and (Test-Path -LiteralPath $ItemPath)) {
+				If (($BackupPath -ieq $ItemPath) -or $BackupPath.StartsWith(($ItemPath + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+					Write-Host "Backup path $BackupPath is inside the profile being removed. Skipping $Display." -ForegroundColor Red
+					[void]$Results.Add([PSCustomObject]@{
+						Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $null; Action = 'BackupFailed'
+					})
+					Continue
+				}
+				$BackupDestination = Join-Path -Path $BackupPath -ChildPath "$Leaf-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+				Write-Host "Backing up $ItemPath to $BackupDestination..." -ForegroundColor Cyan
+				$RoboExit = Backup-ProfileFolder -Source $ItemPath -Destination $BackupDestination
+				# Robocopy returns a bit map; anything under 8 means the copy succeeded.
+				If ($RoboExit -ge 8) {
+					Write-Host "Backup of $ItemPath failed (robocopy exit code $RoboExit). Leaving the profile alone." -ForegroundColor Red
+					[void]$Results.Add([PSCustomObject]@{
+						Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $BackupDestination; Action = 'BackupFailed'
+					})
+					Continue
+				}
+				Write-Host "Backup complete." -ForegroundColor Green
+			}
+
+			# --- Removal ---
+			If ($Item.CimProfile) {
+				Try {
+					Remove-CimInstance -InputObject $Item.CimProfile -ErrorAction Stop
+					$Action = 'Removed'
+					Write-Host "Removed profile $Display (SID: $ItemSID)." -ForegroundColor Green
+				} Catch {
+					# Do not force-delete the folder when the profile removal itself failed; a
+					# ProfileList entry pointing at a gutted folder breaks that user's next logon.
+					Write-Host "Failed to remove profile ${Display}: $($_.Exception.Message)" -ForegroundColor Red
+					[void]$Results.Add([PSCustomObject]@{
+						Target = $Target; ProfilePath = $ItemPath; SID = $ItemSID; Loaded = $Item.Loaded; BackupPath = $BackupDestination; Action = 'Failed'
+					})
+					Continue
+				}
+			} Else {
+				Write-Host "No Win32_UserProfile entry for $Display. Cleaning up the leftovers directly." -ForegroundColor Yellow
+				$Action = 'RemovedOrphan'
+			}
+
+			# Leftover ProfileList entries: duplicates pointing at the same folder, and the
+			# <SID>.bak entry that a failed profile load leaves behind.
+			ForEach ($Entry in @(Get-ProfileRegistryEntry -KeyPath $ProfileListKey)) {
+				$SameSID = ($ItemSID -and ($Entry.SID -ieq $ItemSID))
+				$SamePath = ($ItemPath -and $Entry.Path -and ($Entry.Path -ieq $ItemPath))
+				If (-not ($SameSID -or $SamePath)) { Continue }
+				Try {
+					Remove-Item -LiteralPath $Entry.PSPath -Recurse -Force -ErrorAction Stop
+					Write-Host "Removed leftover ProfileList entry $($Entry.KeyName)." -ForegroundColor Green
+				} Catch {
+					Write-Host "Failed to remove ProfileList entry $($Entry.KeyName): $($_.Exception.Message)" -ForegroundColor Red
+				}
+			}
+
+			# Orphaned ProfileGuid entries pointing at a SID with no ProfileList key left.
+			If ($ItemSID -and (Test-Path -LiteralPath $ProfileGuidKey)) {
+				ForEach ($GuidKey in @(Get-ChildItem -Path $ProfileGuidKey -ErrorAction SilentlyContinue)) {
+					$SidString = (Get-ItemProperty -LiteralPath $GuidKey.PSPath -Name 'SidString' -ErrorAction SilentlyContinue).SidString
+					If ($SidString -and ($SidString -ieq $ItemSID) -and -not (Test-Path -LiteralPath (Join-Path -Path $ProfileListKey -ChildPath $SidString))) {
+						Try {
+							Remove-Item -LiteralPath $GuidKey.PSPath -Recurse -Force -ErrorAction Stop
+							Write-Host "Removed orphaned ProfileGuid entry $($GuidKey.PSChildName)." -ForegroundColor Green
+						} Catch {
+							Write-Host "Failed to remove ProfileGuid entry $($GuidKey.PSChildName): $($_.Exception.Message)" -ForegroundColor Red
+						}
+					}
+				}
+			}
+
+			Remove-ProfileScheduledTasks -ProfileSID $ItemSID
+
+			# Whatever is still on disk.
+			If ($ItemPath -and (Test-Path -LiteralPath $ItemPath)) {
+				Write-Host "Folder still present. Force-removing $ItemPath..." -ForegroundColor Yellow
+				Remove-PathForcefully -Path $ItemPath
+				If (Test-Path -LiteralPath $ItemPath) {
+					Write-Warning "$ItemPath still exists. Files were locked; reboot to finish the cleanup."
+					$Action = 'RemovedPendingReboot'
+				}
+			}
+
+			[void]$Results.Add([PSCustomObject]@{
+				Target      = $Target
+				ProfilePath = $ItemPath
+				SID         = $ItemSID
+				Loaded      = $Item.Loaded
+				BackupPath  = $BackupDestination
+				Action      = $Action
+			})
+		}
+	}
+
+	$RemovedCount = @($Results | Where-Object { $_.Action -in @('Removed', 'RemovedOrphan', 'RemovedPendingReboot') }).Count
+	$FailedCount = @($Results | Where-Object { $_.Action -in @('Failed', 'BackupFailed') }).Count
+	Write-Host "Profile removal complete. Removed: $RemovedCount. Failed: $FailedCount. Targets processed: $($Results.Count)." -ForegroundColor Cyan
+	If ($PassThru) {
+		Write-Output $Results
+	}
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAmO4G8TE53yOJY
-# Sc4zXx/uZWt4Z8/i3FPMvEoW6euYzqCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBKLubAQzs05uS2
+# Zh1lQ71D7p0DCfoHy3l8S8vREZUuG6CCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -986,44 +2137,44 @@ Stop-Transcript | Out-Null
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -1067,33 +2218,33 @@ Stop-Transcript | Out-Null
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IMvp6d+cQHVTcWXH7HXfsLAZ5efteCTUJL/q4iQ2P3EfMA0GCSqGSIb3DQEBAQUA
-# BIICAH+FMbtr8/ZdQRz7y9u9cI7On0ObdXDSuNukC0lHmUXCdUk+IWpQFWBlqbvK
-# gJwbOmsJROf4SVzSj7MhMJoBMWdME0fQrAVRDGDGho6+PPc0Oe15FtSPhhX6klyP
-# CusnOgQFddhA7HiTXiBq+KYUHJonJhhLxQHMii/sPO3MfW0SiZ7qKV1/QsC2nDEU
-# WtknPJ5hpqJgXLUKCbC9xw1YQ7S+mC1ZfnCGPRgB68wbfjEPxy3QU6nlViwYklwE
-# 70Xxdu9tB1FGfUha7Yl70sltzPfYHSjKhSjWUwM2tM1p5VY8Oljcmv2jTE5BGyGC
-# x/l9ea3dlR+UXEWmjlBg1JBE8Un4yGUW55M14Owx44aBiUMrCBmrsUV0WOYIa77L
-# lcBde8/sPdc8okC3HWpurzk21YJ6UwffaDwtss9rJVRltabp4Aj31bkqCwdYGn8m
-# 997kUkOsWtorMWO13iLcd1DNqrQAqo7ZHpODPENJEEvqbkOVXkdtbouxNaFkKyDx
-# ijeTEOolksgQxwE006hksf7+0Lg4wRIKaeapYJb7UNuwlAeHDTRO6EsD0GPGaZkr
-# YQgg9zA85sa532TogRq+p4YVzy/qXpzuh0I+JiDEdSo4dejmduEgjU7SfwPMVCJ9
-# ilDHGSdYsNYTK+TxOEsgtppW0QbwvPXycyUBq3KlMQu+0J33oYIDJjCCAyIGCSqG
+# ION2Rqaj4vkjSHVficZ0UCYv/bJIPC7r7F5+5yxhPMSkMA0GCSqGSIb3DQEBAQUA
+# BIICAGiyR7XSqnSKUi5rcgQbFZYCxZcgQpZdW5ejbgoZba24h2MtC8n2pVDWQ+D1
+# iiJ4vjWM37lsrMJ+D6tUF5tgwOMR76fgstS58WHu3L28SWLKa4ZLS25hIv4KFyvY
+# +8Iq5LulzaMWnTaXAEAtLFuO82FQegJDPJryRBmAnExtp6vmyW/zQucIJecjk4an
+# kwOG1B+BC3wK9a6nLnwseGKCKu5j605D3glXTFajy1Tppt2/OI22UIdZISvpGj5P
+# xn47SNyn5mUs0Qj7A+DmVk+cgswdp3DNoJ1RRIHXokf3ZK/74Va/RBCb9bFrdf3t
+# coX9kwBcvd45kDup5JEY/RnOH6QCdYXe98fLsJzZPS0XhyUHxiPQqiW1+sFCu71t
+# sI3WLFlyvWSNErXtox3bh3iOUy+7Daz2ULU2L5NDqMXXh2zju3S5C8YlOBmHVlde
+# n/M8dxiTiluuww1wxC1Pa7mMI0gCYACXay7zRPMFl11ncnlCSuVAeLOCwC8/YK2B
+# 0T/tZ7hBo0TdTLw0t7AIr3NTZjDfwSS1AJNENAa/gF4w14VxiWdspJL0gFnOjvSj
+# F5ZhAOVogpLvdgdXAhtr9CyhFL6wu3uTMQMiFoMK3b53Dt9D1w1+qBfohzDoXuen
+# vTeVP3qWXlxaaxsetD4eOdBTMQnCFdtchBD+OkTZaqExfZwboYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NVowLwYJKoZIhvcNAQkEMSIEIAO3hbil
-# sAEwPSBMWofT4gF9U27hLvUvwX04tO8cxfwWMA0GCSqGSIb3DQEBAQUABIICAAq7
-# xLUKqv0xV4g6fQQgvWtckeNKaQxeDsQoo+RPHT5sQlmZz+0hZEIko16+GsyzWyIU
-# kX3hNNe6uCFadV6PWPc2EBN25Gzh4UWZwYI2rhLj9irkxZ5f/bLR4KNqv2LmaKQT
-# QFcFcXGtwfUsFWt0wYZA11//qBJDnemFDU9QcaCykd4awlPLri+IyqTSKsjd5oeQ
-# Spi9CuZvQV8o/RQsiDCK76EjbqnZGpjb1WsVa5dZOl1E8lvSOoi6dzmU5MxWs8M9
-# B8EEU616N6ZZ1sB65+DFuVaTqh+nqWzNtqbxSFW+PNT772pS1suvmdiAEBiyE+nW
-# O0CNNs/+h+vOAUYb8LOAkcdM19DxdW+mC4r98dSH/4kwPLNa12RT8IpF3kiEXq2l
-# iTL9rnGevEwJqpN6BIiJ4PQC/DHlx4DkDrooJUxHUjGG6x84/CgItUFQdMnWpfy+
-# eiOJRj55jdIiMJ6RXMSewXkmR3NNe+PR4aO385FYGFojyMHDdgIFNX0KNfVLk//o
-# yjAjY98h/j41sJQ0MG8TCJcNIgQoKOHYUO0ofGyX7bsP72m3VPuQ9QsNVmwkTO6o
-# 3KjcV3UxkzAVT8k22HbIE70vm4EHbz36ouKK4Oj/efxizmps6Z2HfcOBLLewMnkQ
-# 75TungXotrB3z7vAOYiv8OKaHaBlEggZ06nEQQeZ
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOVowLwYJKoZIhvcNAQkEMSIEIE5Elf51
+# cbJdiEIjzuQzS16CgEqar/L0hM0d5P2zmmgnMA0GCSqGSIb3DQEBAQUABIICABh8
+# 59ejLhh+Edrz1yMCve3Qmq1W3rNWNcUn4C7M/Pz9p6y0SgXYOOMKvicaPKl11H/I
+# edtDqvPGMOi+wDacfym2qrXzX4qdWgSs3BdlaDKC2S8sDjtoulch8fnY8YpU7QY/
+# WlEuyiJolDGJXmBQncXnlRghDniyp8pAyC8weoRKpf5B2NLV/Jl4UOOQNDXUSfoK
+# WdwgKSfnTmkh9s9shq/inzq43XzF5Q2g6HXWoRK9BSaMvYn5UCHkqnXU8RtXmxHt
+# mKFywTmfVepU7n/Ix6GMlyu7Nx/CkJ6NxohXo7+0F4GTtNJI3h/jFPBBOcObKy9f
+# um9zUXCA8t4dVP+iWtW2sc8Jh1ksZNCevv7Vr2m1Qy8sLTlUGxb2hw6mutfsRu0f
+# OkPL+vMi8alq5kz1kZkSAX4fjDNe75fQryH1nvG8k4QTVACLrbtOhzN3kA6KdeCN
+# Lxu5IbtjEXbTv5I41T83LJVxkotzWHiTI1uL1pEB9WQcvJsk+4fTSjPaAVY1ckig
+# q41mbzYavbDu5b0x/8hAHXak2gVamNmMxcueHwPpdFH3XM3pt37MSiklsGnYuxqq
+# NeajRTmE5ScCCZwJJTegtDAt6q7whQXzNKsIV+kR/AwtxqgHeb4WeDiHdBvsbvFq
+# ZrtZMQ6mrTqpQ26WcQs9k3oOp65McITwZZRriJxn
 # SIG # End signature block

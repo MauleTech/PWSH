@@ -31,11 +31,45 @@ Function Optimize-Powershell {
 			$remainder = $width - ($InputString.Length * $repetitions)
 			# Make line(s)
 			1..$Count | % {
-				Write-Host ($InputString * $repetitions) + $InputString.Substring(0,$remainder) @ColorSplat
+				Write-Host (($InputString * $repetitions) + $InputString.Substring(0,$remainder)) @ColorSplat
 			}
 		}
+		# Prompt loop guard. If the console line editor (PSReadLine or the built-in one) fails, it
+		# returns without waiting for input and the host redraws the prompt forever. A burst of
+		# prompts in quick succession with no new history entry means input is not being read.
+		# First trip: unload PSReadLine so the host falls back to its built-in line editor.
+		# Second trip: the console input itself is broken, so close the window instead of spinning.
+		$Global:PromptLoopGuard = @{ Count = 0; Last = [datetime]::MinValue; HistoryId = 0; Trips = 0 }
+
 		# Custom prompt function
 		Function prompt {
+		    $guard = $Global:PromptLoopGuard
+		    $now = [datetime]::UtcNow
+		    $lastHistory = Get-History -Count 1
+		    $historyId = if ($lastHistory) { $lastHistory.Id } else { 0 }
+		    if ((($now - $guard.Last).TotalMilliseconds -lt 250) -and ($historyId -eq $guard.HistoryId)) {
+		        $guard.Count++
+		    } else {
+		        $guard.Count = 0
+		    }
+		    $guard.Last = $now
+		    $guard.HistoryId = $historyId
+		    if ($guard.Count -ge 40) {
+		        $guard.Count = 0
+		        $guard.Trips++
+		        if ($guard.Trips -eq 1) {
+		            Write-Host "Prompt loop detected: the line editor is returning without reading input." -ForegroundColor Yellow
+		            Write-Host "Unloading PSReadLine and falling back to the built-in console line editor." -ForegroundColor Yellow
+		            Remove-Item -Path Function:\PSConsoleHostReadLine -Force -ErrorAction SilentlyContinue
+		            Remove-Module -Name PSReadLine -Force -ErrorAction SilentlyContinue
+		        } else {
+		            Write-Host "Prompt loop still detected without PSReadLine. Console input is not readable." -ForegroundColor Red
+		            Write-Host "Closing this window in 15 seconds. Start PowerShell with -NoProfile to troubleshoot." -ForegroundColor Red
+		            Start-Sleep -Seconds 15
+		            [System.Environment]::Exit(1)
+		        }
+		    }
+
 		    $curdir = $ExecutionContext.SessionState.Path.CurrentLocation
 		    if ($curdir.Path.Length -eq 0) {
 		        $curdir = "$($ExecutionContext.SessionState.Drive.Current.Name):\"
@@ -52,17 +86,18 @@ Function Optimize-Powershell {
 		    "[Command]: "
 		}
 
-		# Module installation and configuration
+		# Module installation and configuration. Restored at the end of the profile so the
+		# interactive session does not inherit SilentlyContinue and hide real errors.
+		$profileErrorActionPreference = $ErrorActionPreference
 		$ErrorActionPreference = 'SilentlyContinue'
 
-		# Try importing AdvancedHistory directly (skip slow Get-Module -ListAvailable check)
-		$stepTimer.Restart()
-		$advHistoryLoaded = $false
-		try {
-		    Import-Module AdvancedHistory -Force -ErrorAction Stop
-		    $advHistoryLoaded = $true
-		} catch {
-		    # Module not installed - need PackageManagement for install
+		# Import a module if it is not already loaded, installing it from PSGallery when missing.
+		# Never force-reimport: reloading PSReadLine while it is servicing console input can leave
+		# the line editor in a broken state. Skips the slow Get-Module -ListAvailable check.
+		$importOrInstallModule = {
+		    param([string]$Name)
+		    if (Get-Module -Name $Name) { return $true }
+		    try { Import-Module $Name -ErrorAction Stop; return $true } catch {}
 		    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
 		        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
 		    }
@@ -70,50 +105,36 @@ Function Optimize-Powershell {
 		        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
 		    }
 		    try {
-		        Install-Module AdvancedHistory -Force -AllowClobber
-		        Import-Module AdvancedHistory -Force -ErrorAction Stop
-		        $advHistoryLoaded = $true
-		    } catch {}
+		        Install-Module $Name -Force -AllowClobber
+		        Import-Module $Name -ErrorAction Stop
+		        return $true
+		    } catch { return $false }
 		}
-		if ($advHistoryLoaded) {
+
+		# PSReadLine first: AdvancedHistory depends on it
+		$stepTimer.Restart()
+		$psrlLoaded = & $importOrInstallModule PSReadLine
+		$profileTimings.Add("PSReadLine: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
+
+		# Configure PSReadLine prediction source (parameter does not exist in PSReadLine 2.0.x,
+		# which is the version that ships with Windows PowerShell 5.1)
+		if ($psrlLoaded -and (Get-Command Set-PSReadLineOption).Parameters.ContainsKey('PredictionSource')) {
+		    foreach ($source in 'HistoryAndPlugin', 'History', 'None') {
+		        try { Set-PSReadLineOption -PredictionSource $source -ErrorAction Stop; break } catch {}
+		    }
+		}
+
+		$stepTimer.Restart()
+		$advHistoryLoaded = & $importOrInstallModule AdvancedHistory
+		if ($advHistoryLoaded -and $psrlLoaded) {
+		    # Enable-AdvancedHistory throws if the PSReadLine history file does not exist yet (new profiles)
+		    $historyPath = (Get-PSReadLineOption).HistorySavePath
+		    if ($historyPath -and -not (Test-Path -LiteralPath $historyPath)) {
+		        New-Item -ItemType File -Path $historyPath -Force | Out-Null
+		    }
 		    try { Enable-AdvancedHistory -Unique } catch {}
 		}
 		$profileTimings.Add("AdvancedHistory: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
-
-		# Try importing PSReadLine directly (skip slow Get-Module -ListAvailable check)
-		$stepTimer.Restart()
-		$psrlLoaded = $false
-		try {
-		    Import-Module PSReadline -Force -ErrorAction Stop
-		    $psrlLoaded = $true
-		} catch {
-		    # Module not installed - ensure PackageManagement is ready
-		    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
-		        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force | Out-Null
-		    }
-		    if ((Get-PSRepository -Name "PSGallery").InstallationPolicy -eq "Untrusted") {
-		        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
-		    }
-		    try {
-		        Install-Module PSReadline -Force -AllowClobber
-		        Import-Module PSReadline -Force -ErrorAction Stop
-		        $psrlLoaded = $true
-		    } catch {}
-		}
-		$profileTimings.Add("PSReadLine: $("{0:N0}ms" -f $stepTimer.Elapsed.TotalMilliseconds)")
-
-		# Configure PSReadLine prediction source
-		if ($psrlLoaded) {
-		    try {
-		        Set-PSReadLineOption -PredictionSource HistoryAndPlugin
-		    } catch {
-		        try {
-		            Set-PSReadLineOption -PredictionSource History
-		        } catch {
-		            Set-PSReadLineOption -PredictionSource None
-		        }
-		    }
-		}
 
 		# Execute additional configurations
 		$stepTimer.Restart()
@@ -123,6 +144,8 @@ Function Optimize-Powershell {
 		if ($PSScriptRoot -notlike "C:\Program Files (x86)\ITSPlatform\tmp\scripting\*") {
 		    Expand-Terminal
 		}
+
+		$ErrorActionPreference = $profileErrorActionPreference
 
 		$profileTimer.Stop()
 		Write-Host " Profile loaded in $("{0:N1}s" -f $profileTimer.Elapsed.TotalSeconds) [$($profileTimings -join ' | ')]" -ForegroundColor DarkGray
@@ -221,8 +244,8 @@ Function Optimize-Powershell {
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCxmeDZ/b7LQnYm
-# l9uIe8klPJAvFenYcT8YOlygCkdQj6CCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCACmNMyIx46M1ug
+# ktfTdsImt+zw2q/Qdt4/h4ksOgMnWqCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -323,44 +346,44 @@ Function Optimize-Powershell {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -404,33 +427,33 @@ Function Optimize-Powershell {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# ILUgNVP48pykWMOc7f3hAdIGOG2yHxUGB2elLUvYVySxMA0GCSqGSIb3DQEBAQUA
-# BIICAIRWkA5FMlgh3XZ8VRvSzDzS5RvxK1OQF9pft7bcZlpQGiPTGzCwZVUqQrVi
-# jc/dJTj9YOeAAdSyh0v8Zu/qPUlDwDVUFSOe48tlXVvi9NGrjCXM1gYe9Cp1tfMa
-# tw1DCsD5zchqCqkOld8nTzCOJ+Wq4lABpZqerB9/SJzh/FYEutwQyLdoLX554iOM
-# +SrKrRzpw9jr3rCdFCGohjbvjo+xrF8r6D1XixaKqVJi7QJKRSLyBFaxI0EpbO23
-# e1UCXMXlCGpOxa8C1DmC3BvY0w9pztzvlqzIcwZguZXo3rN//SHVfqCFCfU6CbaD
-# iIQDq5iJyAPiu1XLWjxn0xv+JPs6wsmkRNqJoqEyhgIQjKevq0wR0o/9nkIeEHK5
-# 4+oPgJTMIzo5lzGQkflrTg/hHBJs+f1zu4bSt6PAq1/4yafA40CmrD4/DYYsKFoE
-# tgrSDxOoPI+8FhKkjhwKzGRb47Gi2MgTsY32wRZwXMRJ25SsJsXhIndw3tIep+iP
-# 8KUwgVG7TGUR5prShdfeRwLP/DKVHdQ1dm6a0EsKRkmvwdglwZSbAVau2d6gV3hF
-# kx9RhNjpxD2WAfgq1lipQKQ9zMkCnTNpXxRnufV9Q8H2x9G0gpzm2j4TXi+IPoI0
-# I2FPn6S0PM2E/BoJJUxWyYZeKsyMdSTURenROMKJpPXrSREYoYIDJjCCAyIGCSqG
+# IP3wuXL102Ph5hPVh0reclyBBcSkxdc3RIkTvHiagBx5MA0GCSqGSIb3DQEBAQUA
+# BIICAItmpR9jgTznNxdS1ttXSTapEOwR15KH3wyAFFl1MoDgOgvHqEj2rUeTnTig
+# gd/Lk9neZuo4u7fP+KZ3Qkibb5rKRQPjh6xqede5QHae7m+Xy/Pp37rU0X0D4u4y
+# H7YF4gnDy6WTsw0daHpkecKXmj9afwneLTS0GVNakIamlpIvwT4E/Tb/K8kLmpRl
+# twRf5dZg2Z8KsjydT46FxORjcfsDuj1T8rqgODS8mLZgz1pDSEHLzDhNmtz9U+Xx
+# YuK9BzVbSDOYNvGrX/gBapAhIvO7u2Zo7KF92vRLVyPWGuVxWJiCIxxcjzBFFEco
+# wIJhEIrcmSmdEQH/crXDIWK71+xaLocdYc/pFdwCYgACtFT5vqPQ/FXblcB4Hj3x
+# ftMBKEopsiS0uJHrgzXU1XckJGJU0EQi8ri06wng4p5vtZ8parlxZNp7aY5ZrB39
+# zH66I09xH3I/LdwpqrgMyJerHG6RjOrATrSvOz9AR6CmMhMOFPpJOahRQhtHMb0x
+# t42iYoRpspNIp8d+3mLbc43JxeqbxEN/LsoZ68olpZ40Uu0jsPtyhsBNwm3AYDEk
+# Ni7Nn12XM/u8zjK6IgabOxgKUdQvdHwP08KfWaliQQzTsTRFwBJGc5wBT323ZLTT
+# n1m6V8fL6+q1F7gQ4QPL8sAbTdkvZcT02RhQoxVN0Aoe5E/zoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NFowLwYJKoZIhvcNAQkEMSIEIAwA1Fek
-# XV+/TkiycN6vOqSmbL0eEwTLYrRcjfEy7DpVMA0GCSqGSIb3DQEBAQUABIICAGVN
-# 3Gu6QjQWlh1gm+V1keqv6i6PP6BFDJcpYxJeJqzZP9w8CxxWwNklbrRg8JuPsUKT
-# uN0M4jfI13N6PRNNxQVAUZdxCHG0+rWWRfFQx4dl73eHe9MEFfN32ah6Fz9v0pfF
-# gKlhBMFc+viHlFuP4s3iHn/3qAqv3bGrNrJUp9xCSgtfigivxWmczC0hQhoj8vKx
-# bZTcn0zmEXe6jcG63omN4oLGW+kgR+v05D/+9O72/HRGUNB6gbuXu/cR2x7SeFli
-# u/fkBKjuh71tDjYKfMxhBW0WfAGymrZFiy8GjvVZADm5jqmj2Xr4ykd1HVPI3bbD
-# no3RNgtk/HD6SPr4bZ27WQHqRtE4WrI4iwVGWifvwYDgyUT09TzHN2Jja9saKNgZ
-# GsMlP5U1dSX0pdyCAmOru/ga+qyAwNw0oGElOPZaeEfrxbLAUY0yIRkXO2eTBbOJ
-# puZmrR5VTAJUrT2d0dXxw3geKg9rgBT2IjQxJd7yNAfxrxuyycDsHkzVJgWPlFvL
-# yXJNc0saohLIzd474lCjEnDGL9lVHcBoXVGfjTZ8aJQ/mLWazFsq/qQc/OifV/Eo
-# ACCqAZj+ZcQDXNMnSviu9MB2VJEVTSmWbj07CnV+5WziI5Hc9JiBTZEzix64yYe9
-# MswzLmlHLNzpGo034ExiEGYl+kTjbAekdl2Qbpoy
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOVowLwYJKoZIhvcNAQkEMSIEIEk3TvAB
+# RZ5dupweu2MKKM2VN5KMXgQl2SxtnxLoDUzjMA0GCSqGSIb3DQEBAQUABIICAHAH
+# eE7dinRmtw7rYz9u1dGWI9oWjFgFvmWsrZovyrckCCFZ43WTaFHZt5qZQ5ooACjh
+# JK2YqjcTBeKuAcSd83L/bef5unPaOJqbDj/1YOOHivE/y1kFQIJUP/9aCTVBSwiF
+# 0sGlwCL/WkwS6wQYRNSFH1j76CFjM1ixVICrizyT6jUHwsmjZQAUME7+eKyh6tf1
+# CzDPhi3/kqOI7yWSZCNUOy94tqCywOH+eplhiZnpii9hHwsV+W2EhDQkF+rNytfo
+# PqSssrhHp9fWTL1mAe4VtC1uOag17f+DpmV6epYulKFuNW5ifpEtl7lO8d+dPN0P
+# 8+GcXPIyes1DMSCqgOZEE0wxYRedNRjI4mC51/Y0ycZnjE/L9PL4m2J+J4aweZYX
+# 2wYkWsEVrcMN2ydlyGHiUtrld6W5XtRo5qmx3oH8ns14UgrymiJcetZiQnXWBCsk
+# 2DcHY58AsON/BbKPxBQcpzW61vECYA6bD4+yyjZRcnersJXDfobI6CAMpdTcyVju
+# BkSk6PmkVkHFEoji7+tvrfg/GUVHmycA7+P8anVCaG7uhOQUNURW6dbaUQmVjXbt
+# IVEO/Mf6LX8Jv8VCjdS9dGu7WQyYEbl8gaPuTj5ALgFOS1k54gnOXRSBf0eMMnNw
+# IGSvlpyhY8lJ7e9hW4nJyKaD1x+/qmtMjIWMGCSv
 # SIG # End signature block

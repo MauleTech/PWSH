@@ -399,11 +399,183 @@ Function Export-UsersOneDrive {
 	Write-Host "`nComplete!" -ForegroundColor Green
 }
 
+Function Export-WiFiProfiles {
+	<#
+	.SYNOPSIS
+		Exports all saved WiFi networks, including their passwords, to a single config file.
+	.DESCRIPTION
+		Uses "netsh wlan export profile key=clear" to export every saved WiFi profile on this computer,
+		then bundles the profile XML (including the network key) into one JSON config file that
+		Import-WiFiProfiles can load on another computer. Intended for computer migrations.
+
+		By default the file is plain JSON and the WiFi passwords in it are readable by anyone who
+		opens it. When -Password is specified, the file is encrypted with Protect-ConfigFile
+		(AES-256-CBC, HMAC-SHA256, PBKDF2-SHA256) and nothing unencrypted is written to the output.
+
+		Windows only exports keys in plain text to a local administrator, so this must run elevated.
+		netsh writes the individual profiles to a private temporary folder, which is deleted when done.
+	.PARAMETER Path
+		Output file path. Defaults to $ITFolder (or the current folder) with the name
+		WiFiProfiles-<COMPUTERNAME>-<yyyyMMdd-HHmmss>.json, or .enc when -Password is used.
+	.PARAMETER Password
+		Encrypts the output file with this password. Only enabled when specified.
+		The same password is needed by Import-WiFiProfiles.
+	.PARAMETER Name
+		Only export profiles whose name matches one of these wildcard patterns. Defaults to all profiles.
+	.EXAMPLE
+		Export-WiFiProfiles
+		Exports all WiFi profiles to an unencrypted JSON file in $ITFolder.
+	.EXAMPLE
+		Export-WiFiProfiles -Password "MySecurePassword"
+		Exports all WiFi profiles to an encrypted .enc file in $ITFolder.
+	.EXAMPLE
+		Export-WiFiProfiles -Path "E:\Migration\WiFi.enc" -Password "MySecurePassword" -Name "Office*", "Home"
+		Exports only the matching profiles to an encrypted file on a USB drive.
+	.NOTES
+		Enterprise (802.1X) profiles are exported without user credentials; users sign in again after import.
+		Delete the export file once the migration is finished, especially if it is not encrypted.
+		Returns the exported file as a FileInfo object.
+	#>
+	[CmdletBinding()]
+	param(
+		[string]$Path,
+
+		[ValidateNotNullOrEmpty()]
+		[string]$Password,
+
+		[ValidateNotNullOrEmpty()]
+		[string[]]$Name = '*'
+	)
+
+	$Encrypt = $PSBoundParameters.ContainsKey('Password')
+
+	$isElevated = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+	if (-not $isElevated) {
+		Write-Error "Export-WiFiProfiles must run from an elevated session. Windows only exports WiFi passwords in plain text to administrators."
+		return
+	}
+
+	$wlanService = Get-Service -Name WlanSvc -ErrorAction SilentlyContinue
+	if (-not $wlanService -or $wlanService.Status -ne 'Running') {
+		Write-Error "The WLAN AutoConfig service (WlanSvc) is not running, so there are no WiFi profiles to export."
+		return
+	}
+
+	if (-not $Path) {
+		$outFolder = if ((Test-Path Variable:ITFolder) -and $ITFolder) { $ITFolder } else { (Get-Location).ProviderPath }
+		$extension = if ($Encrypt) { 'enc' } else { 'json' }
+		$Path = Join-Path $outFolder ("WiFiProfiles-{0}-{1}.{2}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss'), $extension)
+	}
+	$outputFullPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
+	$outputFolder = Split-Path -Path $outputFullPath -Parent
+	if (-not (Test-Path -LiteralPath $outputFolder)) {
+		New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
+	}
+
+	# netsh writes one XML file per profile per interface, with keys in plain text
+	$tempFolder = Join-Path -Path $env:TEMP -ChildPath ("WiFiExport-" + [guid]::NewGuid().ToString('N'))
+	$profiles = New-Object System.Collections.Generic.List[object]
+	try {
+		New-Item -ItemType Directory -Path $tempFolder -Force | Out-Null
+
+		Write-Host "Exporting WiFi profiles..." -ForegroundColor Cyan
+		$exportResult = & netsh wlan export profile folder="$tempFolder" key=clear 2>&1
+		$exportExitCode = $LASTEXITCODE
+		$profileFiles = @(Get-ChildItem -LiteralPath $tempFolder -Filter '*.xml' -File)
+		if ($exportExitCode -ne 0 -and $profileFiles.Count -eq 0) {
+			Write-Error "netsh failed to export WiFi profiles: $(($exportResult | Out-String).Trim())"
+			return
+		}
+
+		$seenNames = @{}
+		foreach ($file in $profileFiles) {
+			$profileXml = [System.IO.File]::ReadAllText($file.FullName)
+			$xmlDoc = New-Object System.Xml.XmlDocument
+			$xmlDoc.XmlResolver = $null
+			try {
+				$xmlDoc.LoadXml($profileXml)
+			} catch {
+				Write-Warning "Skipping unreadable profile file '$($file.Name)': $($_.Exception.Message)"
+				continue
+			}
+			$root = $xmlDoc.DocumentElement
+			$profileName = $root.SelectSingleNode("*[local-name()='name']").InnerText
+
+			# The same profile is exported once per wireless adapter; keep the first copy
+			if ($seenNames.ContainsKey($profileName)) { continue }
+			$matchesFilter = $false
+			foreach ($pattern in $Name) {
+				if ($profileName -like $pattern) { $matchesFilter = $true; break }
+			}
+			if (-not $matchesFilter) { continue }
+			$seenNames[$profileName] = $true
+
+			$ssidNode = $root.SelectSingleNode("*[local-name()='SSIDConfig']/*[local-name()='SSID']/*[local-name()='name']")
+			$authNode = $root.SelectSingleNode("//*[local-name()='authEncryption']/*[local-name()='authentication']")
+			$encNode = $root.SelectSingleNode("//*[local-name()='authEncryption']/*[local-name()='encryption']")
+			$modeNode = $root.SelectSingleNode("*[local-name()='connectionMode']")
+			$keyNode = $root.SelectSingleNode("//*[local-name()='sharedKey']/*[local-name()='keyMaterial']")
+			$protectedNode = $root.SelectSingleNode("//*[local-name()='sharedKey']/*[local-name()='protected']")
+
+			$hasSharedKey = [bool]$keyNode
+			$keyIsProtected = $protectedNode -and $protectedNode.InnerText -eq 'true'
+			if ($hasSharedKey -and $keyIsProtected) {
+				Write-Warning "The key for '$profileName' could not be exported in plain text. It will not work on another computer."
+			}
+
+			$profiles.Add([ordered]@{
+				Name           = $profileName
+				SSID           = if ($ssidNode) { $ssidNode.InnerText } else { $profileName }
+				Authentication = if ($authNode) { $authNode.InnerText } else { '' }
+				Encryption     = if ($encNode) { $encNode.InnerText } else { '' }
+				ConnectionMode = if ($modeNode) { $modeNode.InnerText } else { '' }
+				Key            = if (-not $hasSharedKey) { 'None' } elseif ($keyIsProtected) { 'NotExportable' } else { 'Included' }
+				Xml            = $profileXml
+			})
+		}
+	} finally {
+		if (Test-Path -LiteralPath $tempFolder) {
+			Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	if ($profiles.Count -eq 0) {
+		Write-Warning "No WiFi profiles matched. Nothing was exported."
+		return
+	}
+
+	$export = [ordered]@{
+		Format       = 'MauleTech.WiFiProfiles'
+		Version      = 1
+		ComputerName = $env:COMPUTERNAME
+		ExportedBy   = "$env:USERDOMAIN\$env:USERNAME"
+		ExportedAt   = (Get-Date).ToString('o')
+		Profiles     = $profiles.ToArray()
+	}
+	$json = ConvertTo-Json -InputObject $export -Depth 5
+
+	if ($Encrypt) {
+		Protect-ConfigFile -Content $json -Password $Password -OutputPath $outputFullPath
+	} else {
+		$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+		[System.IO.File]::WriteAllText($outputFullPath, $json, $Utf8NoBom)
+		Write-Host "WiFi profiles saved to: $outputFullPath" -ForegroundColor Green
+		Write-Warning "This file contains WiFi passwords in plain text. Use -Password to encrypt it, and delete it after the migration."
+	}
+
+	$profiles | ForEach-Object { [PSCustomObject]$_ } |
+		Select-Object Name, Authentication, Encryption, Key |
+		Format-Table -AutoSize | Out-String | Write-Host
+	Write-Host "$($profiles.Count) WiFi profile(s) exported. Import them on the new computer with Import-WiFiProfiles." -ForegroundColor Cyan
+
+	Get-Item -LiteralPath $outputFullPath
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAkKMRN4KdmJ9ZW
-# PpX3G0ArAC8KjCXzfoYR7asXwvxLtKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAuf1+qUwiRz0Gc
+# iaMv5VVuBo941yia4av04xZKnu8PXqCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -504,44 +676,44 @@ Function Export-UsersOneDrive {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -585,33 +757,33 @@ Function Export-UsersOneDrive {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IKFBKwb0ywMODRuyK1cbTsQ8Rj4S/xGWDeY0DM0ALvcjMA0GCSqGSIb3DQEBAQUA
-# BIICAJ+LrA0pMbuT9vcwk/8J2g0XuiApB3SClNd84f0HauQof1o3FHJKcYXNPrTj
-# m1yQiIg/mmo1NywwZFyDpS459htRxDs4ZFq+2TQYih37qOzSDbGVHYu6QFiFbLc8
-# V5AI2427gYgyj4P1mGEQf+fS6nQam9RiNgc5GFBt1EzfrVku7yerSpRDbw5svEHF
-# R6cQ/JRwCIZB8eso+Nim/DV2JY+fsPWDrPE0X25YHfsLF3ae8IjiyAN5sKxx6/3j
-# PXxltTaXvhuJd2hibi3mDEkbZe3pi5Xqd3xExLtyJ+Az0bCoBPR0nQTcTZrXB2s3
-# 0tN8mP4TE8tHMhY6iCTdG1TTMvpGr6RjC0khH9Wl9HMqP7AA7vUhb/zKDjB+EsIs
-# 6AyNP9iK75JQqhFdpcbT3SEFBK22PAHrlYCtqjaKEWm7FgROAE+L+HoEdCGuRZ82
-# GVEWi2z3YF34ZUu5HWvHLj0XNPhb23mE3UimKYcrR1xLL7FHTnbG7TOdbiY0Ptbe
-# 76FjIGCi1aIs1rCqhWMnIVTbBVjmtTCy/cocx/l259MjXkF7JBnpZYrKVOVK4l9h
-# RJmPWTzSGeABUexSFclCkcdCXC6fDb/rHmih1HbZycOE50j2lN1CnsVVVPlW2OAq
-# 9/TDa+YQyPUXPcyH76qKOMovIwZA9ep7h31JEhq2YxBangRUoYIDJjCCAyIGCSqG
+# IPDkKLXVo/jZrnQxD1036qbiOfyqwNV+KjHsAA4iqGIlMA0GCSqGSIb3DQEBAQUA
+# BIICABQruThnncOwmbiMel7jPsSWjdDR31I5lo9bv31ShcL0w36cQJJS4jCuaNiX
+# TbJvhzdSwVQEsR6NH/WkNfR2DwLwSC4GN5sRYDBJD4F3KblCMl8fxmDlX8WhYv25
+# ud1z8+bpjGCau30bhTD0dtngBgrt5W1C2IftqNrDG0wISPM1x94J4FprHHiaDpCS
+# fBZry42445BzrzzUIpyhgzwnZZsj/DxPuUOG5VnvJKiqX5lKyaApcKZGuntudvrJ
+# 3W1ZY+iFosXgyVCO1iGqKf4yMafCxNV9y01WdE4eAQ8mCuqh6ZSQXwNgLo4/aa6i
+# Siarvty+irr12DNq2v/gR53YLZ97Bj602wNvXeZEm6NHRpDshtnosQJqwUyEMzyc
+# vvqZnK4gjiau5hsH8C0iwHdcc9ywLFeOtb74QbuZ/zt6KiwoU8fDF2BMaBbDqJZH
+# MsuMo2kyVcWtyhcznKYLDJDDCKR2FB02sy6bAJ5KjkP4w115xCRiLoA2xPsoh5aD
+# uwPdHKYiDeBsxKpHc/vE2to5wDJKe0NfNst7Xg5duaTclTPIKOh09gk2KVxyROSL
+# Nn9XVj1TSfQ2vyR3+xrRjrivCh1gb4SBSiynHBDr2I75+c5vMcxb4Mn14iLenXOV
+# 819mHS1kewo+ZkiTC5VqLHMzLsDrVi4PJ36GkneoiQBiYCXmoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0M1owLwYJKoZIhvcNAQkEMSIEIPa13XX/
-# luiSCdz8R/8VlQ58pFYj9qHqoxSj1y1dg7j8MA0GCSqGSIb3DQEBAQUABIICAHKf
-# XmgGgNIC8A8AA7wG8ZvLC1bOcEVWoQHf0POqq0dUbnBysBhbz0LSSp9lsQbyocc7
-# EdB5kLQlvjxWxlFnlS40WE5jpLoM9kYkD44U1JO3OjwmXbzkiIkXMb7iX0zx/Et1
-# 9y4uEww5rezwqxpxwk41sz1skoi2Bj/L0SQjqijUimyLRTq3vecFskz58kJVKjqT
-# JxwZTu4otK/PFxybxxpgA8zyLfGPcS/jB3/orkq5BPBPm7Gw0rnwdTzS9Lsmk7T/
-# JCMoHSP8cF+LnKs6MNmSCSg+ssswB49GCSvdM9Ok84atWJ7hefhb8QaxusoQVX3s
-# ObS39dyQY4ECjY2RwMD46lDhMPSyl1AX3Y5Tw6Rmk38KFHEQrO8KmTKoBPLpO7Fs
-# 3mOSl3VCL6Xq4FzA66RrbntplZfBgj6NgZma2xuAdv3H6OD76PjXlU8wJsRYyaZt
-# kyxQuUyLTtFyz5i9t1xsUKW70DMP2HfVdw28k/6ZkiMPT+eVBEn7etWyWfVWKr+i
-# o5YGjiw5fYBvwKFJYipLY5qFsMz6TBk6/2vuPzpSgle6LGLxLSjK9AnJPMoRGjjd
-# KUTjAlWJmVOhRhx4rDjnY4cQktDYOCjHFAdwQa6Ez4kKlay2nlvXS6AAEZsXnu1a
-# 68RMsRauTC+S5yZap/aNw8PobvCJEz9S49T5QoW7
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOFowLwYJKoZIhvcNAQkEMSIEIL8Jauy8
+# Eogdl/XgkjJph4/E4SWWi/60pQedTJcMK3C6MA0GCSqGSIb3DQEBAQUABIICAFTN
+# OWWJjjanvrBq+3U+qoQ2GlNOEfeYM3ey1GGRKW2V+NtjFAUhnlMoE9k4U+XtixQU
+# L1eewTOw1FWstZh3V8pIERuj9v+W3cf6mW7yw84nV2umo+sgwjx0Za3oACruZvmm
+# FbQcGhhHrDIZg//0jLapbV3Tl4/0rtHifeusdfnGnbSp5h83zyek8gG+jEcq1Yts
+# nWkgDiklGHSqME/mZw4eikR5MxUimzHJE30WWCSGaVutk/GULME0Iov80rvQ3K/A
+# Uw7qn6+go6+pzyiZ3JODcn3kN1HCVu4zSva4mfZnI8bXGsOTogSFQSmzwa9OEcUr
+# JGYYZpTEwqT2EdLZTQMSNGKfSacEm/nSexPAo6iwkCEk9WMiDmBX/FpS6i6Gdil/
+# f0/RO570+fl1YFgRMaTgK8nZznkJ1h629XIkGE6ZlQK8LhUHAs9DGvuIJQsX00Ui
+# BTA87mumZZdcFRe7V5eMlznKUc7D0DLbXEwrcyYhE17GkX5SH9zDek1JDjczzX+n
+# eSZEPBafkqZxFvw3uNwhujttBd3gP9J6bQsAkkhDqXzfer+LgsA+zst/6GdUr3ZY
+# UvR008mDCBeG2SvGr/VbuTA/iNXNGCbwpDStfH9wqHo4246ChfoBlMilDFcxYwZZ
+# DlCjUHMPCnV5ddIq0ssWpIxA9XIaQOra7kpu6a/q
 # SIG # End signature block

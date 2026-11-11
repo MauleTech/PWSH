@@ -1,12 +1,13 @@
 Function Protect-ConfigFile {
 	<#
 	.Synopsis
-	Encrypts a configuration file for secure storage
+	Encrypts a configuration file or string for secure storage
 	.Description
-	Takes a plaintext configuration file and encrypts it using AES-256-CBC with
-	HMAC-SHA256 integrity verification (Encrypt-then-MAC). The key is derived via
-	PBKDF2-SHA256 with 600000 iterations. The encrypted file can be safely
-	committed to a public or private repository.
+	Takes a plaintext configuration file (or a string passed with -Content) and
+	encrypts it using AES-256-CBC with HMAC-SHA256 integrity verification
+	(Encrypt-then-MAC). The key is derived via PBKDF2-SHA256 with 600000
+	iterations. The encrypted file can be safely committed to a public or
+	private repository.
 
 	File format: Base64( salt[16] + iv[16] + hmac[32] + ciphertext )
 	.Parameter Path
@@ -14,30 +15,58 @@ Function Protect-ConfigFile {
 	.Parameter Password
 	Password used for encryption. Must match the password used for decryption.
 	.Parameter OutputPath
-	Path for the encrypted output file. Defaults to the same directory with .enc extension
+	Path for the encrypted output file. Defaults to the same directory with .enc extension.
+	Required when using -Content.
+	.Parameter Content
+	Plaintext string to encrypt instead of reading a file. The string is encoded
+	as UTF-8 and is never written to disk unencrypted. Use this for secrets
+	generated in memory (e.g. Export-WiFiProfiles).
 	.Example
 	Protect-ConfigFile -Path .\Sophos.csv -Password "MySecurePassword"
 	.Example
 	Protect-ConfigFile -Path .\Action1.csv -Password "MySecurePassword" -OutputPath .\Action1.enc
+	.Example
+	Protect-ConfigFile -Content $Json -Password "MySecurePassword" -OutputPath .\Settings.enc
 	#>
-	[CmdletBinding()]
+	[CmdletBinding(DefaultParameterSetName = 'Path')]
 	param(
-		[Parameter(Mandatory = $true)]
+		# Explicit positions keep the original "Protect-ConfigFile <Path> <Password> [<OutputPath>]" form working
+		[Parameter(Mandatory = $true, ParameterSetName = 'Path', Position = 0)]
 		[string]$Path,
-		[Parameter(Mandatory = $true)]
+		[Parameter(Mandatory = $true, Position = 1)]
+		[ValidateNotNullOrEmpty()]
 		[string]$Password,
-		[string]$OutputPath
+		[Parameter(ParameterSetName = 'Path', Position = 2)]
+		[Parameter(Mandatory = $true, ParameterSetName = 'Content')]
+		[ValidateNotNullOrEmpty()]
+		[string]$OutputPath,
+		[Parameter(Mandatory = $true, ParameterSetName = 'Content')]
+		[ValidateNotNullOrEmpty()]
+		[string]$Content
 	)
 
-	if (-not (Test-Path $Path)) {
-		throw "File not found: $Path"
+	$inputFullPath = $null
+	if ($PSCmdlet.ParameterSetName -eq 'Path') {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+			throw "File not found: $Path"
+		}
+		$inputFullPath = (Resolve-Path -LiteralPath $Path).ProviderPath
+		if (-not $OutputPath) {
+			$OutputPath = [System.IO.Path]::ChangeExtension($inputFullPath, '.enc')
+		}
 	}
 
-	if (-not $OutputPath) {
-		$OutputPath = [System.IO.Path]::ChangeExtension($Path, '.enc')
+	# Resolves relative paths against the PowerShell location, not the .NET working directory
+	$outputFullPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputPath)
+	if ($inputFullPath -and ($outputFullPath -eq $inputFullPath)) {
+		throw "OutputPath is the same as the input file. Specify a different -OutputPath to avoid overwriting the plaintext source."
 	}
 
-	$plainBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $Path).ProviderPath)
+	if ($PSCmdlet.ParameterSetName -eq 'Path') {
+		$plainBytes = [System.IO.File]::ReadAllBytes($inputFullPath)
+	} else {
+		$plainBytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($Content)
+	}
 
 	# Generate random salt and IV
 	$salt = New-Object byte[] 16
@@ -89,15 +118,11 @@ Function Protect-ConfigFile {
 		[System.Buffer]::BlockCopy($ciphertext, 0, $combined, 64, $ciphertext.Length)
 
 		# Write as Base64
-		$outputFullPath = if ([System.IO.Path]::IsPathRooted($OutputPath)) {
-			$OutputPath
-		} else {
-			Join-Path (Get-Location) $OutputPath
-		}
 		[System.IO.File]::WriteAllText($outputFullPath, [System.Convert]::ToBase64String($combined))
 
 		Write-Host "Encrypted file saved to: $outputFullPath" -ForegroundColor Green
 	} finally {
+		if ($plainBytes) { [System.Array]::Clear($plainBytes, 0, $plainBytes.Length) }
 		if ($encKey) { [System.Array]::Clear($encKey, 0, $encKey.Length) }
 		if ($hmacKey) { [System.Array]::Clear($hmacKey, 0, $hmacKey.Length) }
 		if ($hmac) { $hmac.Dispose() }
@@ -111,8 +136,8 @@ Function Protect-ConfigFile {
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAQfeobncaOxCVJ
-# Cw85dYKGYzgiJBGyT7JIKhebQ50znKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAnviXDFmWYCB1P
+# X3rwooo/jjPt/PQ16fQUoJ+D9e3CwaCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -213,44 +238,44 @@ Function Protect-ConfigFile {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -294,33 +319,33 @@ Function Protect-ConfigFile {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IPak+M5Fib3CARDsSo9z27u5VWWADf/ixjlgj6xEtvN8MA0GCSqGSIb3DQEBAQUA
-# BIICABZ0QOIgd5SwJvRYEHeU8+KDTNwD0tzRBO6qnYO5jH76lIuOuaOolUoAOkQu
-# QNpPI9n5mo9XDxvn+AQcI+Tq26eywPSF7rbsQCZxEmqle14Zusu4XHh4Fh6LAHY6
-# MT2E2UhMGDTrUapsGLkpP6UTSsSIBN26M3mnXmMNkol03hSW1otA76KOMiBnPKwT
-# vjH+iAcYlRB/aZpcYJl8XaP5dX1TFNpF0bcP18P7RT+evCNKjqxWKP2ddnP38uMD
-# CuFGs89+HxQdY7arvcNG4ZtTS+0lRRewYcelw20KqUZD/+FGLIXfvIpJZodYXn+e
-# 4B3vpLHauTjbzBm5rzaWRaOkn5xzqE6tdiyoHKnop41muaanbfM+kCcOi9qYJrjk
-# iGnz1CuTRRuxQDO5BD45acKAcjAgNX+Cuf/kGEKcF9eNOC/dBX1fP1VmuZrG0UKU
-# AMhhXbLPErPDYqf67fAo3L8CsjHtpv729EkR8MG3pLR084oZLkQs1kBu1VWjruFE
-# NFM1Jb6RCxud3V9xSpXxtH9ZkkJuuH1aGa0B64eIUzO7AZP7rNtE0LZeHhQ4E7i0
-# 19fF4w47FIFINb5TKqj6VzUrZ3KsMqboRX5SvxKIIKFC+XIpvvzAUMDRvqDFO/Kc
-# sfm9i7lgDtgMPOWK49hx7Xm8Fgt71yzjuWK7G8VLdgfjm+INoYIDJjCCAyIGCSqG
+# IPhdnNABpW8NQLFbHX/sZfVbwHfjSMDs61NOgOWE+tHcMA0GCSqGSIb3DQEBAQUA
+# BIICAGy0ked3JGT2OdfCGl/mio8MMOcQryYX+8tTOxIoXptUIidCWzwoOyL2ErBW
+# /L5YdsztDh1dqz3vH1VgyG4rAhVvAHk64qD/5esL0r9L7r8VkAbMWmbKo3/fnZEt
+# 2GfK8y1tb8Y28cFxc0K+aPY/cuAvxVdnAUPLOVeHw8IVbeSWWvgWJoMLHLp5fevg
+# c2SdvO3XJncKLlF76jiBkIvXsWAe8PP/qeIfT/Cy9ZCs1qAtqMPHA1LpC41Bwceh
+# pOCFIgVoMpifyRi52SGkrZ7UTrBsO4HKb5OK+XHSN0uZz61tAXr6j0ctCr8Yle5Q
+# 3txtuXK8vlRVVNyfwoXwRHXh3CCGYOb+7tWpXIhSRCt5Ny9SAcPqhlEENea6C6T7
+# 8SPbD0NdMlWFlVjlU02Av6Z1mv4uawdF4lnEIMtKuhVMAxrDeBxwvu92JWZCSiAt
+# aIewEkQ6NBnsjUEs/0L8StNin4m7LCFAOQhOM7jaNSJTaf2/qgGqO9zjvEde15u9
+# 2AUlwKLx+h5imBtiDzThc4+WA5wCPLKhlARZRy+zAkyWzzUyuDHGEnnPDuj61qr5
+# qe82zh3UCx3Ss8YXqe3dKOj+L2805rkBvQvs0LHVS+aFQ83N9keRIOq1wTfDjhTS
+# gx8/Bzp3DIRY5TZliXQs3tGOArHBLlUAGfPH2DmpbVNaY+MyoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NFowLwYJKoZIhvcNAQkEMSIEIFICyJtr
-# PeTMB6qWwhX8CrQ7E6gaE6WgAMd7VMrYUlRHMA0GCSqGSIb3DQEBAQUABIICAFqE
-# G7k4FGl79GvDioUFJfQcLldm+FWrDCgTRYkASIU97ZhpU+W3yjEZ/hjcE9cSa7vy
-# ujqQcU+FwIMuDD6s8f8cJoaVzYP5U/flwnL5+PcYi6UfL0VVb7sbR+iH6b06iS/b
-# LzIu3ZirDewMyRznf6xdd5FvbX2Jfnfmr3UpRYaA2K00i71Et15XCUnpfqihZf8F
-# evl+zBCSMrAeWYsytNhNG/sxYP/jFLxgsHRfci6s4Qz1rbHxqBFLTnhrsz31Qac3
-# fP5LehN3DQCJsDgwON0hQW922IUB5rC0PKPbxepUM9fINRQNy7Mmqjyd7EA+gzd0
-# FMXR4S1XfTBQyUUJL+lWFkl+C0s/s+iUn8Y6XHSOryfj9UP9v9KfWrBoava4dFCC
-# bOc81fH07buZc+d5f9bsMQ5LnNfHiTnk6BGtzfsU+EO+QCoxzJsDeVd8TA26scmF
-# fHmHQOD6WlUVcq5gYeDi1Zl0diVtpwlyQChLiFoAs6Y/gaAF4HgONQbx/LaiPmtp
-# Fk70BppUItXHAS9B5bTUibS/d/oQr68tSMxavDg5dO58/wcmJHMOFbMCO5TQjTLl
-# iYqKQBtK/tNgo54+YeCpaIRzY/i29L2OSxd472YsUL3ChdBfakvaYesHoNqEdgAN
-# 1FBXDGVv9d9bxecwiNjCqbygVc2I20m55ih4ZGpg
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOVowLwYJKoZIhvcNAQkEMSIEIOEonCoE
+# 3SH/TktkKc7xCovBMhrkUiKvgn4/XNscvWe3MA0GCSqGSIb3DQEBAQUABIICAEQd
+# IkJiAKuYNDO/uw9G7xfTy0lG3myxVhGLOf25fls58kfHtFDjnSdLU6nNDDwPrVIg
+# d/UUxaBEDSndZf0uvXkaMkwIOLIkpNfnMZmnQZfsY2XmfJrFGOHxznAyvdQTe66E
+# DyehiHbRlpNu0tDGT1f17AZdWbtS4rMoAdvwexiicibz6LuPVrZ+qBwTmRlo4YM5
+# KQcBi3zLFW5EXHMo0dhz03bvBArW3/D03AULPvrF7ucnGW6HTlpfiSjCzCQeihu8
+# n4Gd+tycIJzqxf/0/ZY8GfA7nQgxhCVNda2qIfvKK5Ja7L5fKvrLrfG71wPsbKoe
+# D6CTN//eu4/HBvakMCuul9G+jx8FQLRF2sydpQPTSFOGP1m2+VzoeEMH89GgMMgT
+# mlVPisd/gB1X9RYQO2z0hd0IbrnE2xWlaCwz+CnFM6hzoVm1c980Br/8tX4kOPRm
+# YLY00+Oi54NLZF/5NxDwnx/42qBuYTZYgzkCtQKigdtX9W9EQepdhve8fDj4TUoG
+# XF/NMwfSaMWuepu2jscFMAMh652HSU9Jy+FsfWudMGRJyUpeQKKE0dtJJAVI+48Z
+# qXz4eVuirkXiIQUfNrqmy+Gpae00kHxdJJYW7uTJOGtuv92LmMSLc07rsSiuwWTE
+# HZBdncw5006dZ2IPbTcX4N54fgHtV8XiGUYqHlLZ
 # SIG # End signature block

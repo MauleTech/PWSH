@@ -765,11 +765,146 @@ Function Import-WindowsInstallerDrivers {
 	Copy-Item -Path $WIMBootWorkingFile -Destination $BootWimPath -Force
 }
 
+Function Import-WiFiProfiles {
+	<#
+	.SYNOPSIS
+		Imports WiFi networks from a config file created by Export-WiFiProfiles.
+	.DESCRIPTION
+		Reads a WiFi profile config file written by Export-WiFiProfiles and adds each profile to this
+		computer with Add-WiFiProfile. Encrypted (.enc) files are detected automatically and decrypted
+		with Unprotect-ConfigFile; if -Password is not given for an encrypted file, it is prompted for
+		without echoing.
+
+		Windows connects to imported networks automatically when they are in range (for profiles
+		saved with automatic connection). A profile with the same name as an existing one replaces it.
+	.PARAMETER Path
+		Path to the .json or .enc file created by Export-WiFiProfiles.
+	.PARAMETER Password
+		Password used when the file was exported with -Password. Prompted for if needed and not given.
+	.PARAMETER Name
+		Only import profiles whose name matches one of these wildcard patterns. Defaults to all profiles.
+	.PARAMETER User
+		All (default) makes the profiles available to every user on this computer (normally needs elevation).
+		Current makes them available to the current user only.
+	.EXAMPLE
+		Import-WiFiProfiles -Path "C:\IT\WiFiProfiles-OLDPC-20261026-091500.json"
+		Imports every profile from an unencrypted export.
+	.EXAMPLE
+		Import-WiFiProfiles -Path "E:\Migration\WiFi.enc"
+		Prompts for the password, decrypts the file, and imports every profile.
+	.EXAMPLE
+		Import-WiFiProfiles -Path "E:\Migration\WiFi.enc" -Password "MySecurePassword" -Name "Office*"
+		Imports only the profiles whose names start with Office.
+	.NOTES
+		Returns one object per profile with Name, Authentication, Status (Added or Failed) and Message.
+		Delete the config file once the migration is finished.
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		[string]$Path,
+
+		[ValidateNotNullOrEmpty()]
+		[string]$Password,
+
+		[ValidateNotNullOrEmpty()]
+		[string[]]$Name = '*',
+
+		[ValidateSet('All', 'Current')]
+		[string]$User = 'All'
+	)
+
+	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+		Write-Error "File not found: $Path"
+		return
+	}
+	$fileContent = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).ProviderPath).Trim()
+
+	# Plain exports are JSON objects; anything else is treated as Protect-ConfigFile output
+	if ($fileContent.StartsWith('{')) {
+		$json = $fileContent
+	} else {
+		if (-not $PSBoundParameters.ContainsKey('Password')) {
+			$securePassword = Read-Host -Prompt "Enter the password used to export $Path" -AsSecureString
+			$Password = (New-Object System.Net.NetworkCredential('', $securePassword)).Password
+			if ([string]::IsNullOrEmpty($Password)) {
+				Write-Error "A password is required to decrypt $Path."
+				return
+			}
+		}
+		Write-Host "Decrypting $Path..." -ForegroundColor Cyan
+		try {
+			$json = Unprotect-ConfigFile -EncryptedContent $fileContent -Password $Password
+		} catch {
+			Write-Error "Failed to decrypt ${Path}: $($_.Exception.Message)"
+			return
+		}
+	}
+
+	try {
+		$config = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+	} catch {
+		Write-Error "$Path is not a valid WiFi profile config file: $($_.Exception.Message)"
+		return
+	}
+	if ($config.Format -ne 'MauleTech.WiFiProfiles' -or -not $config.Profiles) {
+		Write-Error "$Path was not created by Export-WiFiProfiles."
+		return
+	}
+	if ([int]$config.Version -gt 1) {
+		Write-Error "$Path uses config version $($config.Version), which this version of Import-WiFiProfiles does not support. Run Update-ITFunctions and try again."
+		return
+	}
+
+	Write-Host "Found $(@($config.Profiles).Count) WiFi profile(s) exported from $($config.ComputerName) on $($config.ExportedAt)." -ForegroundColor Cyan
+
+	$results = foreach ($wifiProfile in $config.Profiles) {
+		$matchesFilter = $false
+		foreach ($pattern in $Name) {
+			if ($wifiProfile.Name -like $pattern) { $matchesFilter = $true; break }
+		}
+		if (-not $matchesFilter) { continue }
+
+		try {
+			Add-WiFiProfile -ProfileXml $wifiProfile.Xml -User $User -ErrorAction Stop
+			$status = 'Added'
+			$message = ''
+		} catch {
+			Write-Host "Failed to import '$($wifiProfile.Name)': $($_.Exception.Message)" -ForegroundColor Red
+			$status = 'Failed'
+			$message = $_.Exception.Message
+		}
+		[PSCustomObject]@{
+			Name           = $wifiProfile.Name
+			Authentication = $wifiProfile.Authentication
+			Status         = $status
+			Message        = $message
+		}
+	}
+	$results = @($results)
+
+	if ($results.Count -eq 0) {
+		Write-Warning "No WiFi profiles matched -Name. Nothing was imported."
+		return
+	}
+
+	$added = @($results | Where-Object Status -eq 'Added').Count
+	$failed = $results.Count - $added
+	if ($failed -eq 0) {
+		Write-Host "$added WiFi profile(s) imported." -ForegroundColor Green
+	} else {
+		Write-Host "$added WiFi profile(s) imported, $failed failed." -ForegroundColor Yellow
+	}
+
+	Write-Output $results
+}
+
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAmeXM1c/4pWgxA
-# n6NmayI/mwQZYyPGuk2SOgqg9mn1EaCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBQIhbtfr9Hp+5x
+# QrhA857Lm5382Sh63cokQ0zjU4YrEKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -870,44 +1005,44 @@ Function Import-WindowsInstallerDrivers {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -951,33 +1086,33 @@ Function Import-WindowsInstallerDrivers {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IAZriaSWXCWovrch1W0NsM1Dl3RKDIYj5XyaPqlGNyb1MA0GCSqGSIb3DQEBAQUA
-# BIICAIbPClZ+xEwofyZs50weC4nd6S8ZLHo0se0FbqHQspJ/wjL4TthsEYC92XYu
-# YTtJy54lEaeQiNjqszgq5sqhvR1Jnq0dLXetj+lCm+7eP5iLcyXCFWDKpvdO0nEK
-# X0/WFd24hxtd36gvoeADUqJz3qsHcJwtdQjdkLbI0Xd/CvkD9s7l84xV+gk14Xw3
-# IWm58Fwm72eAfpT6OUZfgVcEf+UFq1AhBIhsrprInjjpAfUsIeXPwZftq2oYcHQw
-# mcL+399nasf4tyDb4ymhQlpInn00fhYjDiaMhthjj/1dH7ATRTUQNpEcgR6bS7Fx
-# uEEB2wZ/Pk6dSPO08tSXDASjQJC10+rcqcsZZf+s04dbBhRFEW8F7AWqONSEzpks
-# 0MeekGFF0+jedB0dSRltJeYGNZqmtxY+YyqF5RXxpE6SKsoUkromRYXklEgfRHGy
-# s+K6DGvh4upnICRcMwg5WPH6Q6hX/syjqDc7eJJQBHqCjj1O9e5sVmnDjDO4Zw9o
-# N54IxAU/dlH3xsaf1ynNiuzj4emgeJEuPCts7vssj6fBnvtLhjZHkRiHsM8jK1Mb
-# avmRsopWlq7mboVxTpvpgukpCH0JBUCMJHEkjkli64PjOkk+m1RWe4HVSocn8wO6
-# GVlKYm/UXgF6hhc6qheyZKMjqKZYguqykj3+RTIJ1sahXpfvoYIDJjCCAyIGCSqG
+# IL0vE4PYj5h8dv19c0idaLV6K3JZOALwTcYbDNnCLDM4MA0GCSqGSIb3DQEBAQUA
+# BIICAHWB3ox+E5mWsqfR3L4MZrELrClY3047gGvbD9/Ms+re0fPDKveGEVXEfJhF
+# GF8nrEnpGHfenHvw+DErBoGDpBht5GQXyKMlk2+8MC4HHDZE67FWN7/dFRx6hjOS
+# O+sHC9uA4n3HZmyx8HCL81I8fy3Wtsvy0T9QhjB5dhOjVWQltfuLszkTgfD2aMyv
+# ISDKmlg2ijZVB/jgU0+4HBJMumaSCh/Xe+GAScEVLHkps05VDkPopLb4XmPeMQoG
+# oTlcSQsp4NMLvRo0X60NsUQSRbBzYJTiKphjGYS8fQ8/TI9ApmKAsMBj7nykFAP9
+# YJiXA5FfYJGc9qjGXMCc9Hy7Cedjq3aslTpv2dZi5KHUPjx7YthQxKzPcmZR1yHv
+# waiMRm9ZfMbPdPObtqPhXvrkFOwysN+UmyLBiC+PWeiG+2L2wj1qkIORy8gccqlk
+# JEB8szDxz4D9m0VJNNaJJ/WX19AlESceumRsOweyuZ/vsocGrOz3ZT8JDZPYywJz
+# T93fKa2YEQhPstOENOlyTOyxwfek3ZY/G4i+DKkLe2SaNoqpnT8Bxz7mwImfz469
+# +uc7eKiV4j+d4fCheS5iM8wDj09DSSYSycOQZOcuz1R3/JGnPCqAhTG+Vxdz+W6k
+# 93nrE/MLp9GJl/tAngtPCet8a2Lpra4zxqwtj4HPL6hlk+rKoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NFowLwYJKoZIhvcNAQkEMSIEIMrAWt/6
-# V1xbinc0a7sWmiU1IJNQihs4C7wDyZS32nd0MA0GCSqGSIb3DQEBAQUABIICAE+v
-# SvUszXvn8jeyRb8LjmOjvRPhFcTpGgFK8KzlRXRz4LWR1Tgo1F/GltE1mX4t6Lgk
-# FrxZGHNV0xhK/9OrHLa5bM0OKE/+Fz6D/Ks1lQmMqoN4zWP30EjHoFKIJXD5OAou
-# 2HMiy63bUI+9docRsYjpsZFKWgEl4aLE5akwgVzfLJ2sJlfMpMcooKfjgRPGQLxV
-# Nv7W5AM/jgefX0F1QVFmwWkzCVIxrP2NQ85YhNKMf7UXABtmw8R4yZoyx197570s
-# Qff2RL6Enf8xa6+q+nWPDX1vzOtpmBmjcjt36PBponew6I6OG1VscTA4u6aAS3Yr
-# u8+bpkUA5on3Ck7aDolxFsHSVSfw3dgY9gPWkvN6AfMMvi5pFiTDXh/KKXex/JEC
-# 1v86xzpbQh0hiKHvm/MZcf8/4TWOyAla5g+TtSzH7x/cG9kpuVyMKpVVQbUxcieE
-# jrtkLPoJK0VSMfzvjiuBRdPlSPBtqOjxQaWNTfZA1KRFpAX1jwVFVEytycVv4t+f
-# O/tiJdmu18ZEZ/I/MJDl2MnydTrEhpeDJy4+UBNdeeeSnU2oG1P+lwMmHttGL5ae
-# 5txykyIsC2QIBmbU1jMKTCnyHeFzJgXXbJITPhEyirJDQlrRRng6ccPd4obPXZme
-# IWzMeJ6w5ozIlTAK59dNcES2XaP6yM43CZOrPyNS
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOFowLwYJKoZIhvcNAQkEMSIEIHvYBzIO
+# 2Ynh0nLY7lPNPy/t7t4MqAzZDnf00pix1KMLMA0GCSqGSIb3DQEBAQUABIICADba
+# 5UkaRMQtbXKKmCxOs2XahuyheY824mNVHf2m/RQg/DEYkcnFoCDhmBOtEw1Xjpbe
+# yHIGQ5mC1oSkjeGLid8LLvNZ3XygcF5nq8IfKLv+UoBC0M9pBfr4BJJ80gNEUSTK
+# Oad6U5VHw4WwUBVIK9Lsy6hR89mabCr7jmzMrbkvJTUwKYpeaxXqgkcpIST3sHe4
+# zAF93K1PngCvHQbrIoRnWXLrxNur1qUgnKBKjVh2tRKxEK8kKdO7/0Mbnowezx+b
+# KU26ap3Nq32LWwAWwRtqryrIOv9m0QHHavwh37svmqLQa89aMq4NKRASmUsOWJWM
+# dIADv/Q+GgikqE2NKrpNB7JsxA49ENRcTeGPwWb6myuKSXoQ2CTkso6nnRj4o5eh
+# 98QRLmaAhEdNy8Ib/p+eNAT4+k0lk38gLQxIeBbGRGTE3usFrwU8uOkhFNZmCK9t
+# AeyxACRvcgXSuwFuEcMmm914EFSt6kqNJiG+j0Mp8xOID2bbLld/0PuotWJrVQ0F
+# H2pXnVfOYJ9kUzbctP66PMEk2lW0o/FGcuSnjDhjdngHIUt7eFvmuvfj6Yb0iX28
+# n0W/D9eOl7OLVAf4EsE3L13W8R6P39gW5IJ7lqfDK3WGPy2o4A0xvtD+qK00LSBR
+# fw+kJ3m+BCcw4+/vz4WqDwgSLo56oqS0xAofrW0p
 # SIG # End signature block

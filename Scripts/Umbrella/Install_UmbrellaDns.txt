@@ -14,7 +14,7 @@
 	#Requires -RunAsAdministrator
 [cmdletbinding()]
 param(
-	[string]$Code #Shortcode of the site you want to install, list available at https://github.com/MauleTech/PWSH/blob/master/Scripts/ITS247Agent/SiteAgentURLs.csv
+	[string]$Code #Shortcode of the site you want to install, list available at Scripts/Umbrella/UDNS-Client-Mapping.csv
 )
 
 Write-Host "Checking Status Indicator"
@@ -55,7 +55,7 @@ If ($IsInstalled) {
 	Write-Host "DNS Servers: $PreDNS"
 	#Dowload config file index
 	$SiteConfigs = @()
-	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
+	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
 	$UmbrellaManifestContent = Invoke-ValidatedDownload -Uri 'https://disthost.umbrella.com/roaming/upgrade/win/production/manifest.json'
 	$MSIDetails = $UmbrellaManifestContent | ConvertFrom-Json
 	$MSIUrl = "https://disthost.umbrella.com/roaming/upgrade/win/production/" + $MSIDetails.downloadFilename

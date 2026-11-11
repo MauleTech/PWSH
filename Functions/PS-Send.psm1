@@ -85,6 +85,9 @@ Function Send-Item {
         Path to the file or folder to send.
     .PARAMETER Text
         Text string to send instead of a file.
+    .PARAMETER Clipboard
+        Sends the current text contents of the clipboard. The clipboard is read first, so
+        the text is captured before the receive command replaces it on the clipboard.
     .PARAMETER Code
         Optional custom code phrase. If omitted, one is generated automatically.
     .EXAMPLE
@@ -93,6 +96,9 @@ Function Send-Item {
         Send-Item -Path C:\Projects\MyFolder -Code "secret-phrase"
     .EXAMPLE
         Send-Item -Text "Hello from the other side"
+    .EXAMPLE
+        Send-Item -Clipboard
+        Sends whatever text is currently on the clipboard.
     #>
     [CmdletBinding(DefaultParameterSetName = 'File')]
     param(
@@ -102,9 +108,22 @@ Function Send-Item {
         [Parameter(Mandatory, ParameterSetName = 'Text')]
         [string]$Text,
 
+        [Parameter(Mandatory, ParameterSetName = 'Clipboard')]
+        [switch]$Clipboard,
+
         [Parameter()]
         [string]$Code
     )
+
+    # Capture clipboard text before the receive command overwrites the clipboard below
+    if ($PSCmdlet.ParameterSetName -eq 'Clipboard') {
+        $Text = Get-Clipboard -Raw
+        if ([string]::IsNullOrWhiteSpace($Text)) {
+            Write-Host "Text not detected in the clipboard. Nothing to send." -ForegroundColor Red
+            Write-Host "To send a file or folder instead, use: Send-Item -Path <path>" -ForegroundColor Yellow
+            return
+        }
+    }
 
     $crocExe = Get-CrocPath
 
@@ -120,11 +139,23 @@ Function Send-Item {
     )
     Set-Clipboard -Value ($receiveLines -join "`r`n")
 
-    if ($PSCmdlet.ParameterSetName -eq 'Text') {
-        $displayLabel = "TEXT: $Text"
-    } else {
+    if ($PSCmdlet.ParameterSetName -eq 'File') {
         $resolvedPath = Resolve-Path -Path $Path -ErrorAction Stop
         $displayLabel = $resolvedPath.ProviderPath
+        # Send by leaf name from within the parent directory so croc transmits a
+        # relative path. Passing an absolute path (e.g. D:\Folder) makes the receiver
+        # try to recreate D:\Folder, which fails when the receiver has no writable
+        # D: drive. See croc issue #809.
+        # Use .NET path helpers rather than Split-Path: in Windows PowerShell 5.1,
+        # 'Split-Path -LiteralPath' cannot be combined with -Parent or -Leaf (they are
+        # in mutually exclusive parameter sets) and throws AmbiguousParameterSet.
+        $sendParent = [System.IO.Path]::GetDirectoryName($resolvedPath.ProviderPath)
+        $sendLeaf   = [System.IO.Path]::GetFileName($resolvedPath.ProviderPath)
+    } elseif ($PSCmdlet.ParameterSetName -eq 'Clipboard') {
+        $lineCount = ($Text -split "`r`n|`r|`n").Count
+        $displayLabel = "CLIPBOARD TEXT ($($Text.Length) chars, $lineCount lines)"
+    } else {
+        $displayLabel = "TEXT: $Text"
     }
 
     Write-Host ""
@@ -140,20 +171,33 @@ Function Send-Item {
     Write-Host "--------------------------------------------" -ForegroundColor Cyan
 
     # --disable-clipboard prevents croc from overwriting the receive command we put on the clipboard
-    if ($PSCmdlet.ParameterSetName -eq 'Text') {
-        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, '--text', $Text)
+    if ($PSCmdlet.ParameterSetName -eq 'File') {
+        # Run croc from the parent directory and pass only the leaf so the transmitted
+        # path is relative (no drive letter). Fall back to the full path for a drive
+        # root, which has no leaf to send under.
+        if ([string]::IsNullOrEmpty($sendLeaf) -or [string]::IsNullOrEmpty($sendParent)) {
+            $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.ProviderPath)
+            & $crocExe @crocArgs
+        } else {
+            Push-Location -LiteralPath $sendParent
+            try {
+                $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $sendLeaf)
+                & $crocExe @crocArgs
+            } finally {
+                Pop-Location
+            }
+        }
     } else {
-        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, $resolvedPath.ProviderPath)
+        $crocArgs = @('--disable-clipboard', 'send', '--code', $Code, '--text', $Text)
+        & $crocExe @crocArgs
     }
-
-    & $crocExe @crocArgs
 }
 
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDHXRdY8VfLl6DW
-# JQ1x1Ctx4R8MHcYxj/WMNXxvddsPn6CCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDydr+AMdoFIANQ
+# rZhHERhtSwvRUK7SDxLT2SkNws53VqCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -254,44 +298,44 @@ Function Send-Item {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -335,33 +379,33 @@ Function Send-Item {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# ILl3LPIgrNEc5e/Ao32xdo7Ez+06JoGHAeLMUNTjKp7vMA0GCSqGSIb3DQEBAQUA
-# BIICANccAOC7o6dtGzcwLvUIFCAFiVwa19/r+fIqlKPIcHc6npaFOR3q97YQYuan
-# zb3yEiKZLRucXxrllAwZdyzGOeHuIVgH2W6sii0EnwsjWIEYDoTpcldWImloeInm
-# kT+8fz0h1iCdCOzhWSgOTknZFBQpebkq65kjOVyVeuWhxHhKJP5wNMSc5DS5Mfy+
-# 4U1toKrHMm61tvcW3aBWz3YRBbd0HaRuWR/xSmw3fbx+4SlFKkMIG3r1QAYJk8/n
-# fBIzpWRUzCgtAfqHN7WNjOAGvMy2oTK3igfUHYOtV9HCE1XRbDOvY1ZG+EAD1GQg
-# 2FNVwHcD0mh15Hqg4oBJY6uqPTgnwsiTayxS78qOuywAfabgtIubMFPDO2PtqOQp
-# Vhbm4ZfKZASZrNx1K6ekfb6i7Eqkq4TfHyaO8yF+8E0EowT9hEC7ooBACjGLs8no
-# RBn4IB1rSjsSC+PDOp+cx0SgdP1xMyMFSiaOkvano+zpP9pGB6ELsudMCCjMR1xr
-# RdKhwPE3jcDj1gREgz2X1stFPPeZdUHODos2l1SMgl0HapRURmClLaHGMJ1Rib6L
-# YtmsywveN1RZ3NRQC5CLyCohss707uWFFnizEsy6HfdZ8CuLD8ulqHnPHtxbLag8
-# xd9qRFugDl1bdsN0TassUplHuAV9xgQykCWpsOCdf0CSr70poYIDJjCCAyIGCSqG
+# IMViSaHljjBzITgnOPnrmjzDApk1hsM365/iyGZE0k3gMA0GCSqGSIb3DQEBAQUA
+# BIICAGizNYVc8guV3aIEvJpY0GetodH9ibnqgpV7a6N6vB2hx+OPbCIUpM1X13Ct
+# Jo768gHrdtzhd980EIgAwg3M+nUaT4ydznnP4BF0zNGLyKXirOESzlpTHPhVep/D
+# IXj1f12cFNrQLxAEuFSLqbk9Rpbphmpnbu3apGgcjL9dLrnMah78hOU5cRlCV/XG
+# huSln2fPXVsza3q1t7Vz40+EaK8gL/jqi+aNzjwa6tEFbwsk6yUGjQhl2Usk6abM
+# yGEk2GMGZbO9MOo/4TMf0R5oDcFWMmLzp592nbTvdn3CblCAH60t1i1BhVZ5ogRE
+# 3w9SCTMcgJo3MiaYS9mVBZkIzEhbWTpM84zULjmONQmbsOjhT5fE1/8ZanWpQ0ql
+# XB3WgoybLUZJeZ/+dSyCPZbq7Xjb21KBz2HGzNxmN4+OpTl1fvf43rEXvqWWQin1
+# Gu09rSBgsUiVxDpTLW/XY/jKacC09v8K5ID/DINW4rSLl7wJLEsdBkKnChTaXNhl
+# BlcQw8CGiMcrka5RkcNRqUEv9fFbCwgM+Op5czFc3i+i87iPJuI7L0VrgUiL3f7s
+# yY1gW5l1lTr0gdgyRpvbloFfrNuW1YgCieoS2hHcZJ4JKmanczqn8PU8PwFoBOyC
+# K12wttwNC95r3zMctTIphhq3Dm3qhzKHt4aSt8lj6qwfKnqxoYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NVowLwYJKoZIhvcNAQkEMSIEIBtmRmNu
-# iIaFsmbNiWmdCdV8wmlBwNLCc+IORW8Fd/3hMA0GCSqGSIb3DQEBAQUABIICAMa/
-# +G+GzJf28T0Qq4HrhX8phuQupLqhaJ1xeP2LGbJ3KLt3MIJ7s+9WAdi2Alvhmumw
-# guXRMyve/P25ljT/uZtU43tT3ORJN/EdlnzNqhYPlz0oEGou3hzYGpI2WySEIoZh
-# Wz26GWKCfpVQDKHG20BQxPjwMylKI0J/KrpNP3V27VvhIKJdmCKjBHangFhEBBGs
-# kYug0VbniDJ3bdRqgu3Wcefw4nATpXP1V29o3oSEPkgHY2zjeTBTbpxpy2g9keoi
-# 75iimZrjhj5WQkvBQD3yvLK9U5jgXujnvFMG6uwK8uWJ21Q15BMsHjUZBveTM05l
-# KBSNc50CZTcuW+rl1MH+bv4ITciG0tVt45+tF9LmNJlsYazPDhD0vM4CYinFHFoR
-# L2K+2nzW8BuiFE/rTtPKGRuz1WOPZbQIpdrbZ0QpHbsdmijWXRY23jVrPAEPWSeQ
-# ++SQ/jnC6DXyBI/dR+WGi0LFkr5fHzVsGiaz11Mj2fKMsMw8TcAlwZefxEQZqBCf
-# EBTJxQ4HXiM7cjbf8GPwY/HLPfZMTsgwZLTAznSfQpeydhxX35AbBqoXGMzRO6rU
-# ftWsIwX1Z+m8F36BYNN3FhOTBV+JRFRf4EqdV7dFolYEg8aEHc6xQidgkYnh4FVe
-# blJLiS+itxrUul8BiabOt4uY5fzSQG2gnsSLkGcU
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgyMFowLwYJKoZIhvcNAQkEMSIEIFxJdz4f
+# I0myx1yFRL397FQ322P01GVPwP0GdJvaFH1jMA0GCSqGSIb3DQEBAQUABIICAEiM
+# dCGv734jB8zuKAssMjRJUvOUQoJH4ifWycSFav69c5C/SFRqhpIvQjnz7i7o6xCK
+# 8ISoRNKZB+faTjWUKgEKtUq0VnldWcRttdIPNLCZ3oaY6zvLhs4WcUvaSCuCx0q8
+# SWYWCHKONYr0xM0x7Sg7yRuS0dYdAPxHW5CdLIx68Ky0PL4URvI7PxT0JhCv4bKo
+# V4f+o79mvEnIvwg5QipEz88vwOCHN56Weesapy4JvtxhIZk20ApdZbbDUabVpcHV
+# k0VgnhN6XiHXC48dff7/vdFiLBCn+XbKiei3/Ls+3Vvxz6NagM5tH9ceohhDtdR1
+# dlzfXO78m/wyXdp4lCCU8bu3kxSWgNhLkN6p4naXCa+exGbSKftdgBLILfBXqkQ2
+# S4/zT4DBNQyPSGbcjno+AQujP8jlj7xQrxTsdSXtfhtPljCT0QrjcBgbaHvz5Lnq
+# QFWQkn8OjY7Z+gAIo7xsuHOnIs1gNwANTMXWO2elJJDaav2U0MpBA7JRE/cZPE9j
+# heRNw2tGoZk2O2CIV2KGpsb1Y4eHRa0cM1NI0nz8iCYjbDfu5ktlLe1e+Yrv4DwW
+# kB7wmnoIpyp7QZc8xFRANdej2Qdpb+w57kCk+M783KV0I2VHRggvB5L4c9BKT+vL
+# vWXID0bY4RyQUNCSQMBklXoNB4BMYLkHHZICketY
 # SIG # End signature block

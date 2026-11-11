@@ -108,20 +108,38 @@ function Update-ClaudeCode {
 	return $result
 }
 
-Function Update-DattoAgent {
-	Enable-SSL
-	$progressPreference = 'silentlyContinue'
-	Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Datto-Agent-Update/DattoAgentUpdate.txt -usebasicparsing | Invoke-Expression
-}
-
 Function Update-DellPackages {
 	<#
 	.SYNOPSIS
 		Uses the CLI version of Dell Command | Update to install any missing drivers/firmwares/Bios and update existing ones.
+	.DESCRIPTION
+		Installs or updates Dell Command | Update, then runs its CLI to apply every driver,
+		firmware and BIOS update Dell publishes for the model.
+
+		Dell Command | Update will not install unless its .NET Desktop Runtime prerequisite
+		is already present, and the major version it wants changes between DCU releases:
+		DCU 5.5.0 through 5.7.0 want .NET Desktop Runtime 8 (8.0.8 or newer), while
+		DCU 5.7.1 and newer want .NET Desktop Runtime 10 (10.0.8 or newer). When the runtime
+		is missing, the Dell installer exits with code 4 (DEP_HARD_ERROR), which Chocolatey
+		reports as "A fatal error occurred during installation process". That is the usual
+		failure on a freshly imaged machine, where no .NET Desktop Runtime is present yet.
+
+		Rather than hard coding one runtime, the prerequisite is chosen from the DCU version
+		that is about to be installed. If the install still fails, the prerequisite the
+		installer named in its own log is installed and the install is retried, then the
+		other package source is tried (winget when Chocolatey failed, and the reverse).
+		Runtimes that are already present are left alone, so a re-run does not pull down
+		another 100MB of installers or create an avoidable pending reboot.
+
+		dcu-cli exit codes are translated to readable output, so "no updates found" (500) and
+		"reboot required" (1) stop looking like failures.
 	.PARAMETER EnableAdvancedDriverRestore
-		Enables Advanced Driver Restore feature in Dell Command Update, allowing restoration to any previously installed driver version.
+		Enables Advanced Driver Restore in Dell Command | Update, allowing restoration to any
+		previously installed driver version.
 	.LINK
 		https://www.dell.com/support/kbdoc/en-us/000177325/dell-command-update
+	.LINK
+		https://www.dell.com/support/manuals/en-us/command-update/dcu_rg/command-line-interface-error-codes
 	.EXAMPLE
 		Update-DellPackages
 	.EXAMPLE
@@ -134,144 +152,463 @@ Function Update-DellPackages {
 	)
 
 	Write-Host "Dell Updates"
-		$Manufact = (Get-CimInstance -Class Win32_ComputerSystem).Manufacturer
-		If ( $Manufact -match "Dell" -or $Manufact -match "Alienware") {
-			#Install and update Chocolatey if Needed
-			If (Get-Command choco -errorAction SilentlyContinue) {
-				choco upgrade chocolatey -y
-			} Else { Install-Choco }
 
-			Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
-			$DCUx86 = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
-			$DCUx64 = Join-Path -Path $Env:ProgramFiles -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
+	$Manufact = (Get-CimInstance -Class Win32_ComputerSystem).Manufacturer
+	If ($Manufact -notmatch "Dell" -and $Manufact -notmatch "Alienware") {
+		Write-Host "This is not a Dell Computer"
+		Write-Host "`nEnd of Dell Updates"
+		Return
+	}
 
-			# Decide the install source ONCE and reuse for both the available-version check
-			# and the actual install. Mixing sources (e.g. check via choco, install via winget)
-			# causes upgrade loops when the two catalogs disagree on the latest version.
-			$IsSystem      = $(whoami) -eq "nt authority\system"
-			$InstallSource = If (Get-Command winget -ErrorAction SilentlyContinue) { 'winget' } Else { 'choco' }
-			Write-Host "DCU package source for this run: $InstallSource" -ForegroundColor Cyan
+	# ProgramW6432 always points at the 64 bit Program Files, even from a 32 bit
+	# powershell.exe under WOW64 where $env:ProgramFiles resolves to Program Files (x86).
+	# RMM tools regularly launch the 32 bit host, and without this the 64 bit DCU install
+	# is invisible and gets reinstalled on every run.
+	$ProgramFiles64 = If ($env:ProgramW6432) { $env:ProgramW6432 } Else { $env:ProgramFiles }
+	$DCUx86 = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
+	$DCUx64 = Join-Path -Path $ProgramFiles64 -ChildPath "Dell\CommandUpdate\dcu-cli.exe"
+	$ChocoLog = Join-Path -Path $env:ProgramData -ChildPath "chocolatey\logs\chocolatey.log"
 
-			Function Install-DCU {
-				#Starts the IPMI Service if needed
-				$IPMIService = (Get-Service -Name IPMIDRV -ErrorAction SilentlyContinue).Status
-				If ($IPMIService -and $IPMIService -ne "Running") {Start-Service -Name IPMIDRV}
-				Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
+	# Decide the install source ONCE and reuse for both the available-version check
+	# and the actual install. Mixing sources (e.g. check via choco, install via winget)
+	# causes upgrade loops when the two catalogs disagree on the latest version.
+	$IsSystem      = $(whoami) -eq "nt authority\system"
+	$InstallSource = If (Get-Command winget -ErrorAction SilentlyContinue) { 'winget' } Else { 'choco' }
+	Write-Host "DCU package source for this run: $InstallSource" -ForegroundColor Cyan
 
-				If ($InstallSource -eq 'winget') {
-					If (-not $IsSystem) {
-						Write-Host "Using winget to install Dell Command Update and dependencies." -ForegroundColor Cyan
-						winget source update
-						Invoke-WinGetInstall -Id Microsoft.DotNet.DesktopRuntime.8
-						Invoke-WinGetInstall -Id Dell.CommandUpdate
-					} Else {
-						Write-Host "Running as SYSTEM; invoking winget via Start-PSWinGet." -ForegroundColor Yellow
-						Try {
-							# Update-PowerShellModule must be included in the command so that the spawned pwsh Core
-							# session imports Microsoft.WinGet.Client before calling Install-WinGetPackage.
-							# When Start-PSWinGet runs in PS5 it spawns a new pwsh process; the module is installed
-							# in the caller's session but not auto-imported in the child process.
-							Start-PSWinGet -Command 'Update-PowerShellModule -ModuleName Microsoft.WinGet.Client ; Install-WinGetPackage "Microsoft.DotNet.DesktopRuntime.8" ; Install-WinGetPackage "Dell.CommandUpdate"'
-						} Catch {
-							Write-Warning "Start-PSWinGet failed: $_"
-						}
-					}
+	# A pending reboot does not stop the run, but it is the most common reason a Dell
+	# installer or dcu-cli refuses to do anything, so say so up front.
+	If (Get-Command Test-PendingReboot -ErrorAction SilentlyContinue) {
+		If (Test-PendingReboot -Quiet -SkipFileRenameCheck -SkipConfigMgrCheck) {
+			Write-Warning "This machine already has a pending reboot. Dell installers and dcu-cli may refuse to run until it is rebooted."
+		}
+	}
+
+	Function Sync-ProcessPath {
+		# An installer that just ran has updated the registry copy of PATH but not this
+		# process's copy. Refresh it so freshly installed tools are findable without
+		# restarting the session.
+		Try {
+			$MachinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+			$UserPath    = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+			$Combined    = @($MachinePath, $UserPath) | Where-Object { $_ }
+			If ($Combined) { $env:Path = $Combined -join ';' }
+		} Catch {
+			Write-Verbose "Could not refresh PATH: $_"
+		}
+	}
+
+	Function Get-DCUCliPath {
+		ForEach ($Candidate in @($DCUx64, $DCUx86)) {
+			If ($Candidate -and (Test-Path -LiteralPath $Candidate)) { Return $Candidate }
+		}
+		# Fall back to whatever the uninstall entry recorded, so a change to Dell's install
+		# location does not read as "not installed".
+		$UninstallKeys = @(
+			'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+			'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+		)
+		ForEach ($Key in $UninstallKeys) {
+			$Entries = Get-ChildItem -Path $Key -ErrorAction SilentlyContinue |
+				Get-ItemProperty -ErrorAction SilentlyContinue |
+				Where-Object { $_.DisplayName -like 'Dell Command*Update*' -and $_.InstallLocation }
+			ForEach ($Entry in $Entries) {
+				$Cli = Join-Path -Path $Entry.InstallLocation -ChildPath 'dcu-cli.exe'
+				If (Test-Path -LiteralPath $Cli) { Return $Cli }
+			}
+		}
+		Return $null
+	}
+
+	Function Wait-DCUCliPath {
+		# The package manager can return before the Dell installer has finished dropping
+		# files, so poll briefly instead of deciding on a single check.
+		Param([int]$TimeoutSeconds = 30)
+		$Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+		Do {
+			$Cli = Get-DCUCliPath
+			If ($Cli) { Return $Cli }
+			Start-Sleep -Seconds 2
+		} While ((Get-Date) -lt $Deadline)
+		Return $null
+	}
+
+	Function Get-DotNetDesktopRuntimeVersion {
+		# Dell needs the x64 desktop runtime. Reading the shared framework folder avoids
+		# depending on dotnet.exe being on PATH, which it often is not under SYSTEM.
+		$SharedPath = Join-Path -Path $ProgramFiles64 -ChildPath "dotnet\shared\Microsoft.WindowsDesktop.App"
+		If (-not (Test-Path -LiteralPath $SharedPath)) { Return @() }
+		Get-ChildItem -Path $SharedPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+			$Parsed = $null
+			If ([System.Version]::TryParse($_.Name, [ref]$Parsed)) { $Parsed }
+		}
+	}
+
+	Function Test-DotNetDesktopRuntime {
+		# .NET patch releases live in the build field: 10.0.8 is major 10, minor 0, build 8.
+		Param([int]$Major, [int]$MinimumBuild = 0)
+		$Match = @(Get-DotNetDesktopRuntimeVersion | Where-Object { $_.Major -eq $Major -and $_.Build -ge $MinimumBuild })
+		Return ($Match.Count -gt 0)
+	}
+
+	Function Install-DotNetDesktopRuntime {
+		Param([int]$Major, [int]$MinimumBuild = 0)
+
+		If (Test-DotNetDesktopRuntime -Major $Major -MinimumBuild $MinimumBuild) {
+			Write-Host -ForegroundColor Green ".NET Desktop Runtime $Major ($Major.0.$MinimumBuild or newer) is already installed."
+			Return $True
+		}
+
+		Write-Host "Installing .NET Desktop Runtime $Major, required by Dell Command | Update." -ForegroundColor Cyan
+
+		# winget first when it is usable, because it will not force a reinstall of a runtime
+		# that is already current. winget is not reachable under SYSTEM, so that case goes
+		# straight to Chocolatey rather than paying for a pwsh Core relaunch.
+		If (-not $IsSystem -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+			Try {
+				Invoke-WinGetInstall -Id "Microsoft.DotNet.DesktopRuntime.$Major" | Out-Host
+			} Catch {
+				Write-Warning "winget could not install .NET Desktop Runtime ${Major}: $_"
+			}
+			Sync-ProcessPath
+		}
+
+		If (-not (Test-DotNetDesktopRuntime -Major $Major -MinimumBuild $MinimumBuild)) {
+			If (-not (Get-Command choco -ErrorAction SilentlyContinue)) { Install-Choco | Out-Host }
+			Try {
+				choco upgrade "dotnet-$Major.0-desktopruntime" --exact -y | Out-Host
+			} Catch {
+				Write-Warning "Chocolatey could not install .NET Desktop Runtime ${Major}: $_"
+			}
+			Sync-ProcessPath
+		}
+
+		If (Test-DotNetDesktopRuntime -Major $Major -MinimumBuild $MinimumBuild) {
+			Write-Host -ForegroundColor Green ".NET Desktop Runtime $Major is installed."
+			Return $True
+		}
+
+		Write-Warning ".NET Desktop Runtime $Major ($Major.0.$MinimumBuild or newer) is still missing after the install attempt."
+		Return $False
+	}
+
+	Function Get-DCUPrerequisiteRuntime {
+		<#
+			Dell changes the required runtime between DCU releases and the installer hard
+			fails (exit 4, DEP_HARD_ERROR) instead of pulling it in:
+				5.5.0 through 5.7.0 : .NET Desktop Runtime 8, 8.0.8 or newer
+				5.7.1 and newer     : .NET Desktop Runtime 10, 10.0.8 or newer
+			Anything newer or unparseable is treated as the newest known requirement, and
+			whatever the installer actually names is picked up by Get-NamedPrerequisiteRuntime.
+		#>
+		Param([string]$DCUVersion)
+		$Parsed = $null
+		If ($DCUVersion -and [System.Version]::TryParse(($DCUVersion -replace '[^0-9\.]', ''), [ref]$Parsed)) {
+			If ($Parsed -lt [System.Version]'5.7.1') { Return @{ Major = 8; MinimumBuild = 8 } }
+		}
+		Return @{ Major = 10; MinimumBuild = 8 }
+	}
+
+	Function Get-NamedPrerequisiteRuntime {
+		<#
+			The Dell installer states the runtime it wants, for example:
+			"Microsoft .NET Desktop Runtime 10.0 with version greater than 10.0.7 (x64)
+			needs to be installed for this installation to continue."
+			Reading that back means the next time Dell moves the prerequisite, this function
+			follows it without another code change.
+		#>
+		Param([datetime]$Since)
+
+		$Logs = @($ChocoLog)
+		$Logs += @(Get-ChildItem -Path $env:TEMP -Filter 'dell*.log' -File -ErrorAction SilentlyContinue |
+			Sort-Object LastWriteTime -Descending | Select-Object -First 5 -ExpandProperty FullName)
+
+		ForEach ($Log in $Logs) {
+			If (-not ($Log -and (Test-Path -LiteralPath $Log))) { Continue }
+			# Skip a log left over from an earlier run, so a stale line does not send us
+			# installing the wrong runtime. The window is deliberately loose: NTFS updates
+			# last-write time lazily while a writer still holds the handle, and the value is
+			# rounded down, so an exact comparison against the moment the attempt started
+			# rejects logs that were in fact just written.
+			If ($Since -and (Get-Item -LiteralPath $Log).LastWriteTime -lt $Since.AddMinutes(-10)) { Continue }
+
+			$Tail = Get-Content -LiteralPath $Log -Tail 500 -ErrorAction SilentlyContinue
+			If (-not $Tail) { Continue }
+
+			$Hit = $Tail | Select-String -Pattern '\.NET Desktop Runtime (\d+)\.\d+.*?greater than (\d+)\.(\d+)\.(\d+)' | Select-Object -Last 1
+			If ($Hit) {
+				$Groups = $Hit.Matches[0].Groups
+				# "greater than 10.0.7" means 10.0.8 is the first acceptable build.
+				Return @{ Major = [int]$Groups[1].Value; MinimumBuild = ([int]$Groups[4].Value + 1) }
+			}
+
+			$Hit = $Tail | Select-String -Pattern '\.NET Desktop Runtime (\d+)\.\d+' | Select-Object -Last 1
+			If ($Hit) {
+				Return @{ Major = [int]$Hit.Matches[0].Groups[1].Value; MinimumBuild = 0 }
+			}
+		}
+		Return $null
+	}
+
+	Function Install-DCU {
+		Param([ValidateSet('choco', 'winget')][string]$Source)
+
+		#Starts the IPMI Service if needed
+		$IPMIService = (Get-Service -Name IPMIDRV -ErrorAction SilentlyContinue).Status
+		If ($IPMIService -and $IPMIService -ne "Running") { Start-Service -Name IPMIDRV -ErrorAction SilentlyContinue }
+		Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
+
+		Try {
+			If ($Source -eq 'winget') {
+				If (-not $IsSystem) {
+					Write-Host "Using winget to install Dell Command Update." -ForegroundColor Cyan
+					winget source update | Out-Host
+					Invoke-WinGetInstall -Id Dell.CommandUpdate | Out-Host
 				} Else {
-					Write-Host "Using Chocolatey to install Dell Command Update and dependencies." -ForegroundColor Cyan
-					choco upgrade dotnet-8.0-desktopruntime --exact -y --force --forcedependencies -i
-					choco upgrade DellCommandUpdate --exact -y --force --forcedependencies -i --ignorechecksums
+					Write-Host "Running as SYSTEM; invoking winget via Start-PSWinGet." -ForegroundColor Yellow
+					# Update-PowerShellModule must be included in the command so that the spawned pwsh Core
+					# session imports Microsoft.WinGet.Client before calling Install-WinGetPackage.
+					# When Start-PSWinGet runs in PS5 it spawns a new pwsh process; the module is installed
+					# in the caller's session but not auto-imported in the child process.
+					Start-PSWinGet -Command 'Update-PowerShellModule -ModuleName Microsoft.WinGet.Client ; Install-WinGetPackage "Dell.CommandUpdate"' | Out-Host
 				}
-			}
-
-			If ((!(Test-Path $DCUx86)) -and (!(Test-Path $DCUx64))) {
-				Write-Host "Checking if 'Dell Command | Update' is current."
-				#Remove any Windows 10 "Apps"
-				Get-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -like "*Dell*Update*"} | Remove-ProvisionedAppPackage -Online
-
-				# Scan once to gate the uninstall calls below. Uninstall-Application's
-				# internal WMI scan is the expensive part; skipping it when no match
-				# exists is the whole point.
-				Write-Host "Scanning installed applications for conflicts..." -ForegroundColor Cyan
-				$InstalledApps = Get-InstalledApplication
-
-				$Conflicts = @(
-					@{ Pattern = 'Dell.*Update';                           App = 'Dell*Update' },
-					@{ Pattern = 'Alienware Update for Windows Universal'; App = 'Alienware Update for Windows Universal' }
-				)
-				ForEach ($c in $Conflicts) {
-					If ($InstalledApps.Name -match $c.Pattern) {
-						Uninstall-Application -AppToUninstall $c.App
-					} Else {
-						Write-Host -ForegroundColor Green "No '$($c.App)' found; skipping."
-					}
-				}
-				Get-Package "Dell*Windows 10" -ErrorAction SilentlyContinue | Uninstall-Package -AllVersions -Force
-				If (Get-AppxPackage *Dell*Update*){
-					$apps = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall,HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall | Get-ItemProperty | Where-Object {$_.DisplayName -like "Dell*Update*" } | Select-Object -Property DisplayName, UninstallString
-					ForEach ($ver in $apps) {
-						If ($ver.UninstallString) {
-							$uninst = $ver.UninstallString
-							Write-Host Uninstalling: $ver.DisplayName
-							Start-Process cmd -ArgumentList "/c $uninst /quiet /norestart" -NoNewWindow -Wait -PassThru
-						}
-					}
-				}
-			}
-			#Compare version numbers of any remaining installed version.
-			$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
-			If (-not $DCUInstalledVersion -and (Test-Path $DCUx86 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx86).VersionInfo.ProductVersion}
-			If (-not $DCUInstalledVersion -and (Test-Path $DCUx64 -ErrorAction SilentlyContinue)) {$DCUInstalledVersion = (Get-Item $DCUx64).VersionInfo.ProductVersion}
-			# Query available version from the SAME source that will install it. If the
-			# query source and install source can disagree, the installed version will
-			# never match what the check reports and every run will trigger a needless
-			# uninstall + reinstall.
-			$DCUAvailableVersion = $null
-			Switch ($InstallSource) {
-				'winget' {
-					$wingetVersionLine = winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:" | Select-Object -First 1
-					If ($wingetVersionLine) {
-						$DCUAvailableVersion = $wingetVersionLine.Line.Replace("Version: ","").Trim()
-					} Else {
-						Write-Host "winget could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
-					}
-				}
-				'choco' {
-					$chocoVersionLine = choco search DellCommandUpdate --exact | Select-String -Pattern "DellCommandUpdate " -SimpleMatch | Select-Object -First 1
-					If ($chocoVersionLine) {
-						$DCUAvailableVersion = $chocoVersionLine.Line.split(" ",[System.StringSplitOptions]::RemoveEmptyEntries)[1]
-					} Else {
-						Write-Host "choco could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
-					}
-				}
-			}
-
-			If (-not $DCUInstalledVersion) {
-				Write-Host "'Dell Command | Update' is not installed, installing now."
-				Install-DCU
-
-			} ElseIf ($DCUAvailableVersion -and ([System.Version]$DCUInstalledVersion -lt [System.Version]$DCUAvailableVersion)) {
-				Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
-
-				#Remove any programs listed through "Add and remove programs"
-				Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
-				Install-DCU
-
 			} Else {
-				Write-Host -ForegroundColor Green "'Dell Command | Update' is current (version $DCUInstalledVersion)."
+				Write-Host "Using Chocolatey to install Dell Command Update." -ForegroundColor Cyan
+				If (-not (Get-Command choco -ErrorAction SilentlyContinue)) { Install-Choco | Out-Host }
+				# No --ignore-dependencies here. The old command passed -i, which told Chocolatey
+				# to skip the package's own .NET Desktop Runtime dependency, guaranteeing the
+				# DEP_HARD_ERROR this function now works to avoid.
+				choco upgrade DellCommandUpdate --exact -y --force --ignorechecksums | Out-Host
+			}
+		} Catch {
+			Write-Warning "The $Source install of Dell Command Update threw an error: $_"
+		}
+
+		Sync-ProcessPath
+		Return [bool](Wait-DCUCliPath -TimeoutSeconds 30)
+	}
+
+	Function Install-DCUWithFallback {
+		Param([string]$AvailableVersion)
+
+		# Prerequisite first. Without it the Dell installer exits 4 before doing anything.
+		If ($AvailableVersion) {
+			$Prereq = Get-DCUPrerequisiteRuntime -DCUVersion $AvailableVersion
+			$null = Install-DotNetDesktopRuntime -Major $Prereq.Major -MinimumBuild $Prereq.MinimumBuild
+		} Else {
+			Write-Host "DCU version could not be determined; covering both runtimes DCU 5.x has required." -ForegroundColor Yellow
+			$null = Install-DotNetDesktopRuntime -Major 10 -MinimumBuild 8
+			$null = Install-DotNetDesktopRuntime -Major 8 -MinimumBuild 8
+		}
+
+		# Preferred source first, then the other one. The two catalogs fail independently:
+		# a broken package on one still installs cleanly from the other.
+		$Sources = @($InstallSource) + @(@('choco', 'winget') | Where-Object { $_ -ne $InstallSource })
+
+		ForEach ($Source in $Sources) {
+			If ($Source -eq 'winget' -and -not $IsSystem -and -not (Get-Command winget -ErrorAction SilentlyContinue)) {
+				Write-Host "Skipping the winget fallback; winget is not available on this machine." -ForegroundColor Yellow
+				Continue
 			}
 
-			#Configure and run Dell Command Update
-			If (Test-Path $DCUx86) {
-				& $DCUx86 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
+			ForEach ($Attempt in 1..2) {
+				Write-Host "Installing 'Dell Command | Update' via $Source (attempt $Attempt of 2)." -ForegroundColor Cyan
+				$StartedAt = Get-Date
+				If (Install-DCU -Source $Source) {
+					Write-Host -ForegroundColor Green "'Dell Command | Update' installed successfully via $Source."
+					Return $True
+				}
+				Write-Warning "'Dell Command | Update' did not install via $Source on attempt $Attempt."
 
-				& $DCUx86 /applyUpdates -reboot=disable -forceupdate=enable
-			} ElseIf (Test-Path $DCUx64) {
-				& $DCUx64 /configure -autoSuspendBitLocker=enable -advancedDriverRestore=enable -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
+				# Honour whatever prerequisite the installer named before spending another attempt.
+				$Named = Get-NamedPrerequisiteRuntime -Since $StartedAt
+				If ($Named) {
+					Write-Host "The installer asked for .NET Desktop Runtime $($Named.Major) build $($Named.MinimumBuild) or newer." -ForegroundColor Yellow
+					If (-not (Install-DotNetDesktopRuntime -Major $Named.Major -MinimumBuild $Named.MinimumBuild)) {
+						# The runtime is still missing, so retrying the same source fails identically.
+						Break
+					}
+				} ElseIf ($Attempt -eq 1) {
+					Start-Sleep -Seconds 10
+				}
+			}
+		}
 
-				& $DCUx64 /applyUpdates -reboot=disable -forceupdate=enable
-			} Else { Write-Error "Dell Command Update CLI not found."}
+		Return $False
+	}
 
-		} Else { Write-Host "This is not a Dell Computer" }
+	Function Write-DCUResult {
+		# https://www.dell.com/support/manuals/en-us/command-update/dcu_rg/command-line-interface-error-codes
+		Param([string]$Operation, [int]$ExitCode)
+		$Codes = @{
+			0    = @{ Text = 'Completed successfully.';                                                   Color = 'Green' }
+			1    = @{ Text = 'Completed, but a reboot is required to finish.';                            Color = 'Yellow' }
+			2    = @{ Text = 'An unknown application error occurred.';                                    Color = 'Red' }
+			3    = @{ Text = 'The system manufacturer is not Dell.';                                      Color = 'Red' }
+			4    = @{ Text = 'dcu-cli was not launched with administrative privileges.';                  Color = 'Red' }
+			5    = @{ Text = 'A reboot was pending from a previous operation. Reboot and run again.';     Color = 'Yellow' }
+			6    = @{ Text = 'Another instance of Dell Command Update is already running.';               Color = 'Yellow' }
+			7    = @{ Text = 'Dell Command Update does not support this system model.';                   Color = 'Red' }
+			500  = @{ Text = 'No updates were found. The system is already current.';                     Color = 'Green' }
+			501  = @{ Text = 'An error occurred while determining the available updates.';                Color = 'Red' }
+			502  = @{ Text = 'The operation was cancelled.';                                              Color = 'Yellow' }
+			1000 = @{ Text = 'An error occurred retrieving the result of the operation. Retry the run.';  Color = 'Red' }
+		}
+		If ($Codes.ContainsKey($ExitCode)) {
+			Write-Host "dcu-cli $Operation : $($Codes[$ExitCode].Text) (exit code $ExitCode)" -ForegroundColor $Codes[$ExitCode].Color
+		} Else {
+			Write-Host "dcu-cli $Operation returned exit code $ExitCode." -ForegroundColor Yellow
+		}
+	}
+
+	#Install and update Chocolatey if Needed. A failure here is not fatal; winget may still
+	#be usable, and Install-DCU installs Chocolatey on demand if it turns out to be needed.
+	Try {
+		If (Get-Command choco -errorAction SilentlyContinue) {
+			choco upgrade chocolatey -y
+		} Else { Install-Choco }
+	} Catch {
+		Write-Warning "Chocolatey could not be installed or upgraded: $_"
+	}
+
+	Stop-Process -Name DellCommandUpdate -Force -ErrorAction SilentlyContinue
+
+	If (-not (Get-DCUCliPath)) {
+		Write-Host "Checking if 'Dell Command | Update' is current."
+		#Remove any Windows 10 "Apps"
+		Get-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue |
+			Where-Object { $_.DisplayName -like "*Dell*Update*" } |
+			Remove-ProvisionedAppPackage -Online -ErrorAction SilentlyContinue
+
+		# Scan once to gate the uninstall calls below. Uninstall-Application's
+		# internal WMI scan is the expensive part; skipping it when no match
+		# exists is the whole point.
+		Write-Host "Scanning installed applications for conflicts..." -ForegroundColor Cyan
+		$InstalledApps = Get-InstalledApplication
+
+		$Conflicts = @(
+			@{ Pattern = 'Dell.*Update';                           App = 'Dell*Update' },
+			@{ Pattern = 'Alienware Update for Windows Universal'; App = 'Alienware Update for Windows Universal' }
+		)
+		ForEach ($c in $Conflicts) {
+			If ($InstalledApps.Name -match $c.Pattern) {
+				Uninstall-Application -AppToUninstall $c.App
+			} Else {
+				Write-Host -ForegroundColor Green "No '$($c.App)' found; skipping."
+			}
+		}
+		Get-Package "Dell*Windows 10" -ErrorAction SilentlyContinue | Uninstall-Package -AllVersions -Force -ErrorAction SilentlyContinue
+		If (Get-AppxPackage *Dell*Update* -ErrorAction SilentlyContinue) {
+			$apps = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall, HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall -ErrorAction SilentlyContinue | Get-ItemProperty | Where-Object { $_.DisplayName -like "Dell*Update*" } | Select-Object -Property DisplayName, UninstallString
+			ForEach ($ver in $apps) {
+				If ($ver.UninstallString) {
+					$uninst = $ver.UninstallString
+					Write-Host Uninstalling: $ver.DisplayName
+					Start-Process cmd -ArgumentList "/c $uninst /quiet /norestart" -NoNewWindow -Wait -PassThru
+				}
+			}
+		}
+	}
+
+	#Compare version numbers of any remaining installed version.
+	$DCUInstalledVersion = (Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Dell Command | Update" -ErrorAction SilentlyContinue).Version
+	If (-not $DCUInstalledVersion) {
+		$InstalledCli = Get-DCUCliPath
+		If ($InstalledCli) { $DCUInstalledVersion = (Get-Item -LiteralPath $InstalledCli).VersionInfo.ProductVersion }
+	}
+
+	# Query available version from the SAME source that will install it. If the
+	# query source and install source can disagree, the installed version will
+	# never match what the check reports and every run will trigger a needless
+	# uninstall + reinstall.
+	$DCUAvailableVersion = $null
+	Try {
+		Switch ($InstallSource) {
+			'winget' {
+				$wingetVersionLine = winget show --id Dell.CommandUpdate --accept-source-agreements | Select-String -SimpleMatch "Version:" | Select-Object -First 1
+				If ($wingetVersionLine) {
+					$DCUAvailableVersion = $wingetVersionLine.Line.Replace("Version: ", "").Trim()
+				} Else {
+					Write-Host "winget could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
+				}
+			}
+			'choco' {
+				$chocoVersionLine = choco search DellCommandUpdate --exact | Select-String -Pattern "DellCommandUpdate " -SimpleMatch | Select-Object -First 1
+				If ($chocoVersionLine) {
+					$DCUAvailableVersion = $chocoVersionLine.Line.split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[1]
+				} Else {
+					Write-Host "choco could not determine available DCU version; will rely on installed version check only." -ForegroundColor Yellow
+				}
+			}
+		}
+	} Catch {
+		Write-Warning "Could not query the available DCU version from ${InstallSource}: $_"
+	}
+
+	# Version strings from either catalog can be shapes [System.Version] refuses, so a bad
+	# parse must not take the whole run down with it.
+	$DCUNeedsUpgrade = $False
+	If ($DCUInstalledVersion -and $DCUAvailableVersion) {
+		Try {
+			$DCUNeedsUpgrade = ([System.Version]$DCUInstalledVersion -lt [System.Version]$DCUAvailableVersion)
+		} Catch {
+			Write-Warning "Could not compare DCU versions '$DCUInstalledVersion' and '$DCUAvailableVersion'; leaving the installed version in place."
+		}
+	}
+
+	If (-not $DCUInstalledVersion) {
+		Write-Host "'Dell Command | Update' is not installed, installing now."
+		$null = Install-DCUWithFallback -AvailableVersion $DCUAvailableVersion
+
+	} ElseIf ($DCUNeedsUpgrade) {
+		Write-Host "'Dell Command | Update' is not current. Updating from version $DCUInstalledVersion to $DCUAvailableVersion."
+
+		#Remove any programs listed through "Add and remove programs"
+		Uninstall-Application -AppToUninstall "Dell Command | Update" -ErrorAction SilentlyContinue
+		If (-not (Install-DCUWithFallback -AvailableVersion $DCUAvailableVersion)) {
+			Write-Warning "The upgrade to $DCUAvailableVersion failed. If the previous version is still present, it will be used for this run."
+		}
+
+	} Else {
+		Write-Host -ForegroundColor Green "'Dell Command | Update' is current (version $DCUInstalledVersion)."
+	}
+
+	#Configure and run Dell Command Update. Install-DCU already polled for the CLI, so a
+	#plain lookup here is enough and does not add a pointless wait to the failure path.
+	$DCUCli = Get-DCUCliPath
+	If (-not $DCUCli) {
+		# Say what actually went wrong instead of just "not found". On a fresh image this is
+		# almost always the .NET Desktop Runtime prerequisite.
+		$Runtimes = @(Get-DotNetDesktopRuntimeVersion | ForEach-Object { $_.ToString() })
+		$RuntimeText = If ($Runtimes) { $Runtimes -join ', ' } Else { 'none' }
+		$Named = Get-NamedPrerequisiteRuntime
+		$Detail = "Dell Command Update CLI not found after install attempts from: $($InstallSource), then the fallback source."
+		$Detail += "`nInstalled .NET Desktop Runtimes (x64): $RuntimeText"
+		If ($DCUAvailableVersion) { $Detail += "`nDCU version offered by ${InstallSource}: $DCUAvailableVersion" }
+		If ($Named) { $Detail += "`nThe Dell installer asked for .NET Desktop Runtime $($Named.Major) build $($Named.MinimumBuild) or newer." }
+		If (Test-Path -LiteralPath $ChocoLog) { $Detail += "`nChocolatey log: $ChocoLog" }
+		$Detail += "`nIf a reboot is pending, reboot and run Update-DellPackages again."
+		Write-Error $Detail
+	} Else {
+		Write-Host "Using Dell Command Update CLI at $DCUCli" -ForegroundColor Cyan
+		$AdvancedDriverRestore = If ($EnableAdvancedDriverRestore) { 'enable' } Else { 'disable' }
+
+		# A dcu-cli that fails to launch at all must not take the calling script down with it.
+		Try {
+			& $DCUCli /configure -autoSuspendBitLocker=enable "-advancedDriverRestore=$AdvancedDriverRestore" -maxretry=3 -delayDays=14 -scheduleAuto -updatesNotification=disable -scheduleAction=DownloadInstallAndNotify -installationDeferral=disable
+			Write-DCUResult -Operation '/configure' -ExitCode $LASTEXITCODE
+		} Catch {
+			Write-Warning "dcu-cli /configure could not be run: $_"
+		}
+
+		Try {
+			& $DCUCli /applyUpdates -reboot=disable -forceupdate=enable
+			Write-DCUResult -Operation '/applyUpdates' -ExitCode $LASTEXITCODE
+		} Catch {
+			Write-Error "dcu-cli /applyUpdates could not be run: $_"
+		}
+	}
+
 	Write-Host "`nEnd of Dell Updates"
 }
 
@@ -288,8 +625,8 @@ Function Update-DellServer {
 	}
 	$delay = $null
 
-	$URL = "https://dl.dell.com/FOLDER12418375M/1/Systems-Management_Application_03GC8_WN64_2.1.1.0_A00.EXE"
-	$File = "$ITFolder\Dell System Update 2.1.1.0_A00.exe"
+	$URL = "https://dl.dell.com/FOLDER14217017M/1/Systems-Management_Application_RXKJ5_WN64_2.2.0.1_A00.EXE"
+	$File = "$ITFolder\Dell System Update 2.2.0.1_A00.exe"
 	Function Get-DSUInstall {
 		Write-Host "Dell System Update is not installed, attempting to install."
 		Write-Host "Download the installer to $File"
@@ -317,8 +654,8 @@ Function Update-DellServer {
 			Exit
 		} Else {
 			Write-Host "Checkin if DSU is installed"
-			If ((Get-WmiObject win32_product | Where-Object -Property Name -Like "*Dell System Update*").Version -NotLike "2.1.1.0*") {
-				Write-Host "Dell System Update is either not installed or not version 2.1.1.0"
+			If ((Get-WmiObject win32_product | Where-Object -Property Name -Like "*Dell System Update*").Version -NotLike "2.2.0.1*") {
+				Write-Host "Dell System Update is either not installed or not version 2.2.0.1"
 				Get-DSUInstall
 				Install-DSU
 			} Else {
@@ -497,31 +834,6 @@ Function Update-Everything {
 # Update-ITFunctions is defined in LoadFunctions.txt using Sync-PWSHRepository
 # (with Invoke-Git timeout protection, GIT_TERMINAL_PROMPT=0, and remote-branch fallback).
 # Do NOT redefine it here - this module loads after the bootstrap and would shadow the better version.
-
-Function Update-ITS247Agent {
-	$DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion
-	$TYPE = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).TYPE
-	$AvailableVersion = ((Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/ITS247Agent/DPMAVersion.txt -UseBasicParsing).Content).Trim()
-
-	If(($DisplayVersion -ne $AvailableVersion) -and ($TYPE -eq "DPMA")) {
-	 WRITE-HOST "Updating Agent from $DisplayVersion to $AvailableVersion"
-		 $SaveFolder = '$ITFolder'
-		 New-Item -ItemType Directory -Force -Path $SaveFolder
-		 $PatchPath = $SaveFolder + '\DPMAPatch' + $AvailableVersion + '.exe'
-		 Invoke-ValidatedDownload -Uri 'https://update.itsupport247.net/agtupdt/DPMAPatch.exe' -OutFile $PatchPath
-		 & $PatchPath | Wait-Process
-		 $DisplayVersion = (Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SAAZOD).DisplayVersion
-	 WRITE-HOST "Agent is now version $DisplayVersion"
-	}
-
-	If(($DisplayVersion -eq $AvailableVersion) -and ($TYPE -eq "DPMA")) {
-	 WRITE-HOST "Agent appears to be up to date at version $DisplayVersion"
-	}
-<#
-	.SYNOPSIS
-		Updates the Continuum ITS247 Desktop agent to the latest available. No parameters are needed.
-#>
-}
 
 Function Update-NiniteApps {
 	<#
@@ -1119,7 +1431,10 @@ Function Update-OEMDrivers {
 	# Dell/Alienware Detection
 	If ($Manufacturer -match "Dell" -or $Manufacturer -match "Alienware") {
 		Write-Host "`nUsing Dell Command Update via Update-DellPackages..." -ForegroundColor Green
-		Update-DellPackages
+		# -EnableAdvancedDriverRestore is passed explicitly now that the switch actually drives
+		# the dcu-cli -advancedDriverRestore setting; this keeps the behaviour this call site
+		# has always had, where advanced driver restore was enabled unconditionally.
+		Update-DellPackages -EnableAdvancedDriverRestore
 		Write-Host "`nDell updates completed." -ForegroundColor Green
 		return
 	}
@@ -1337,6 +1652,21 @@ Function Update-PowerShellModule {
 }
 
 Function Update-PowershellModules {
+	<#
+	.SYNOPSIS
+		Installs or updates PSReadLine, PowerShellGet and AdvancedHistory, then updates all installed modules.
+	.DESCRIPTION
+		Ensures the NuGet provider is present and PSGallery is trusted, reinstalls the core console
+		modules from PSGallery, and runs Update-Module.
+		Modules already loaded in this session are installed side by side and are NOT unloaded or
+		force-reimported: reloading PSReadLine while it is reading console input can break the prompt.
+		Open a new PowerShell window to use the updated versions of those modules.
+	.EXAMPLE
+		Update-PowershellModules
+	#>
+	[CmdletBinding()]
+	param()
+
 	Set-ExecutionPolicy RemoteSigned -Scope Process -Force
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 	$Providers = (Get-PackageProvider).Name
@@ -1345,22 +1675,20 @@ Function Update-PowershellModules {
 	}
 	Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
 	$ModulesToInstall = @("PSReadline","PowerShellGet","AdvancedHistory")
+	$LoadedModules = @()
 	$ModulesToInstall | ForEach-Object {
 		$Mod = $_
 		Write-Host "Processing $Mod"
-		If (Get-Module -Name $Mod -ListAvailable) {
-			Try {
-				Remove-Module $Mod -Force -ErrorAction Stop -WarningAction SilentlyContinue
-				Uninstall-Module $Mod -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-			} Catch {
-				Uninstall-Module $Mod -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-			}
+		If (Get-Module -Name $Mod) {
+			# Loaded modules cannot be uninstalled and must not be unloaded from the live session
+			Write-Verbose "$Mod is loaded in this session, installing the latest version side by side"
+			$LoadedModules += $Mod
+		} ElseIf (Get-Module -Name $Mod -ListAvailable) {
+			Uninstall-Module $Mod -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 		}
 		Install-Module -Name $Mod -Scope AllUsers -Force -AllowClobber -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-		Try {
-			Import-Module -Name $Mod -Scope AllUsers -Force -ErrorAction Stop -WarningAction SilentlyContinue
-		} Catch {
-			Import-Module -Name $Mod -Force -WarningAction SilentlyContinue
+		If ($LoadedModules -NotContains $Mod) {
+			Import-Module -Name $Mod -WarningAction SilentlyContinue
 		}
 		Clear-Variable -Name Mod -Force
 	}
@@ -1370,13 +1698,263 @@ Function Update-PowershellModules {
 	} Catch {
 		Update-Module -Force -WarningAction SilentlyContinue
 	}
-	Write-Host "Settings Prediction Source"
-	Try {
-		Set-PSReadLineOption -PredictionSource HistoryAndPlugin -ErrorAction Stop
-	} Catch {
-		Set-PSReadLineOption -PredictionSource History
+	# -PredictionSource does not exist in PSReadLine 2.0.x, the version that ships with Windows PowerShell 5.1
+	$SetOption = Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue
+	If ($SetOption -and $SetOption.Parameters.ContainsKey('PredictionSource')) {
+		Write-Host "Setting Prediction Source"
+		ForEach ($Source in 'HistoryAndPlugin', 'History', 'None') {
+			Try { Set-PSReadLineOption -PredictionSource $Source -ErrorAction Stop; Break } Catch {}
+		}
+	}
+	If ($LoadedModules) {
+		Write-Host "Updated modules already loaded in this session: $($LoadedModules -join ', ')." -ForegroundColor Yellow
+		Write-Host "Open a new PowerShell window to use the new versions." -ForegroundColor Yellow
 	}
 	Get-Module | Select-Object Name, Version, Description
+}
+
+Function Update-ProtectedConfigFile {
+	<#
+	.SYNOPSIS
+	Decrypts a protected config file, opens it for editing, then re-encrypts it.
+	.DESCRIPTION
+	Streamlines editing a file encrypted with Protect-ConfigFile. The encrypted
+	content is read from a local .enc file or downloaded from a URL, decrypted with
+	Unprotect-ConfigFile, and written to a temporary .txt file that is opened in the
+	default .txt editor (or the editor given by -Editor).
+
+	The function waits until the temp file is saved. If the saved content differs
+	from the original, it is re-encrypted with Protect-ConfigFile and the result is
+	verified by decrypting it again:
+	  * Local file source: the original .enc file is overwritten in place.
+	  * URL source: the encrypted string is written to the pipeline and can be
+	    copied to the clipboard. For raw.githubusercontent.com URLs, the GitHub
+	    edit page is shown so the new content can be pasted in.
+
+	Whatever happens (success, no changes, wrong password, timeout or Ctrl+C), any
+	editor window showing the temp file is closed (forcefully if it does not close
+	on its own) and the temp file is overwritten and deleted.
+
+	Note: tabbed editors (Windows 11 Notepad, Notepad++, VS Code) close the whole
+	window, not just the tab. Save any other work open in that editor first.
+	.PARAMETER Source
+	Path to a local encrypted file, or an http(s) URL of an encrypted file.
+	.PARAMETER Password
+	Password used to encrypt the file. If omitted, you are prompted for it securely.
+	The same password is used to re-encrypt.
+	.PARAMETER CopyToClipboard
+	URL source only. Copies the new encrypted string to the clipboard without
+	prompting. If omitted, you are asked whether to copy it.
+	.PARAMETER Editor
+	Optional path or name of the editor executable to use instead of the default
+	.txt file association (e.g. notepad++.exe).
+	.PARAMETER TimeoutMinutes
+	How long to wait for the temp file to be saved before giving up and cleaning up.
+	Defaults to 60. Use 0 to wait indefinitely.
+	.EXAMPLE
+	Update-ProtectedConfigFile -Source https://raw.githubusercontent.com/MauleTech/BinCache/refs/heads/main/Utilities/Sophos.enc
+	Downloads Sophos.enc, prompts for the password, opens it for editing, and outputs the re-encrypted string.
+	.EXAMPLE
+	Update-ProtectedConfigFile -Source .\Sophos.enc -Password "MySecurePassword"
+	Edits the local Sophos.enc and overwrites it with the re-encrypted content.
+	.EXAMPLE
+	Update-ProtectedConfigFile https://example.com/Action1.enc -CopyToClipboard -Editor notepad++.exe
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true, Position = 0)]
+		[Alias('Path', 'Url', 'Uri')]
+		[string]$Source,
+		[string]$Password,
+		[switch]$CopyToClipboard,
+		[string]$Editor,
+		[ValidateRange(0, 1440)]
+		[int]$TimeoutMinutes = 60
+	)
+
+	$isUrl = $Source -match '^https?://'
+
+	# Read the encrypted content
+	if ($isUrl) {
+		if ($Source -notmatch '^https://') {
+			Write-Host "Warning: $Source is not HTTPS. The content is still integrity-checked by the password." -ForegroundColor Yellow
+		}
+		try {
+			$encryptedContent = [string](Invoke-RestMethod -Uri $Source -UseBasicParsing -ErrorAction Stop)
+		} catch {
+			throw "Failed to download $Source : $($_.Exception.Message)"
+		}
+		$baseName = [System.IO.Path]::GetFileNameWithoutExtension(([System.Uri]$Source).AbsolutePath)
+	} else {
+		if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+			throw "File not found: $Source"
+		}
+		$sourceFullPath = (Resolve-Path -LiteralPath $Source).ProviderPath
+		$encryptedContent = [System.IO.File]::ReadAllText($sourceFullPath)
+		$baseName = [System.IO.Path]::GetFileNameWithoutExtension($sourceFullPath)
+	}
+	$encryptedContent = $encryptedContent.Trim()
+
+	# Prompt for the password securely if not supplied
+	if (-not $Password) {
+		$securePassword = Read-Host -Prompt "Password for $baseName" -AsSecureString
+		$bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
+		try {
+			$Password = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+		} finally {
+			[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+		}
+		if (-not $Password) { throw "A password is required." }
+	}
+
+	# Decrypt first so a wrong password fails before anything is written to disk
+	$plainText = Unprotect-ConfigFile -EncryptedContent $encryptedContent -Password $Password
+
+	# Temp file in the per-user temp folder with a unique, recognizable name
+	$baseName = ($baseName -replace '[^A-Za-z0-9_.-]', '_')
+	if (-not $baseName) { $baseName = 'ConfigFile' }
+	$uniqueId = [System.IO.Path]::GetFileNameWithoutExtension([System.IO.Path]::GetRandomFileName())
+	$tempName = "$baseName-$uniqueId"
+	$tempTxt = Join-Path ([System.IO.Path]::GetTempPath()) "$tempName.txt"
+	$tempEnc = Join-Path ([System.IO.Path]::GetTempPath()) "$tempName.enc"
+	$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+	try {
+		[System.IO.File]::WriteAllText($tempTxt, $plainText, $utf8NoBom)
+		$originalWriteTime = (Get-Item -LiteralPath $tempTxt).LastWriteTimeUtc
+
+		# Open in the requested editor, the default .txt editor, or Notepad as a fallback
+		try {
+			if ($Editor) {
+				Start-Process -FilePath $Editor -ArgumentList "`"$tempTxt`"" -ErrorAction Stop
+			} else {
+				Start-Process -FilePath $tempTxt -ErrorAction Stop
+			}
+		} catch {
+			Write-Host "Could not open the editor ($($_.Exception.Message)). Falling back to Notepad." -ForegroundColor Yellow
+			Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$tempTxt`""
+		}
+
+		Write-Host "Opened decrypted content: $tempTxt" -ForegroundColor Cyan
+		Write-Host "Edit and save the file to continue. Press Ctrl+C to cancel." -ForegroundColor Cyan
+
+		# Wait for the file to be saved
+		$deadline = if ($TimeoutMinutes -gt 0) { (Get-Date).AddMinutes($TimeoutMinutes) } else { [datetime]::MaxValue }
+		$saved = $false
+		while (-not $saved) {
+			if ((Get-Date) -gt $deadline) {
+				Write-Host "Timed out after $TimeoutMinutes minute(s) waiting for a save. No changes made." -ForegroundColor Yellow
+				return
+			}
+			Start-Sleep -Milliseconds 500
+			# Some editors save by delete-and-rename, so the file can briefly be missing
+			$item = Get-Item -LiteralPath $tempTxt -ErrorAction SilentlyContinue
+			if ($item -and $item.LastWriteTimeUtc -ne $originalWriteTime) { $saved = $true }
+		}
+
+		# Let the save settle: wait until the timestamp is stable and the file is readable
+		$newText = $null
+		for ($i = 0; $i -lt 20 -and $null -eq $newText; $i++) {
+			$before = (Get-Item -LiteralPath $tempTxt -ErrorAction SilentlyContinue).LastWriteTimeUtc
+			Start-Sleep -Milliseconds 750
+			$after = (Get-Item -LiteralPath $tempTxt -ErrorAction SilentlyContinue).LastWriteTimeUtc
+			if ($before -and $before -eq $after) {
+				try {
+					# ReadAllText honors any BOM the editor added and defaults to UTF-8
+					$newText = [System.IO.File]::ReadAllText($tempTxt)
+				} catch {
+					Write-Verbose "Temp file not readable yet: $($_.Exception.Message)"
+				}
+			}
+		}
+		if ($null -eq $newText) {
+			throw "Could not read the saved temp file. No changes made."
+		}
+		Write-Host "Save detected." -ForegroundColor Green
+
+		if ($newText -ceq $plainText) {
+			Write-Host "Content is unchanged. Nothing was re-encrypted." -ForegroundColor Yellow
+			return
+		}
+
+		# Normalize to UTF-8 without BOM so a BOM is not baked into the decrypted output
+		$newBytes = $utf8NoBom.GetBytes($newText)
+		$fileBytes = [System.IO.File]::ReadAllBytes($tempTxt)
+		if ([System.Convert]::ToBase64String($fileBytes) -ne [System.Convert]::ToBase64String($newBytes)) {
+			Write-Verbose "Rewriting temp file as UTF-8 without BOM before encrypting"
+			[System.IO.File]::WriteAllBytes($tempTxt, $newBytes)
+		}
+
+		# Encrypt to a temp .enc, then verify the round trip before replacing anything
+		Protect-ConfigFile -Path $tempTxt -Password $Password -OutputPath $tempEnc 6>$null
+		$newEncrypted = [System.IO.File]::ReadAllText($tempEnc)
+		$verifyText = Unprotect-ConfigFile -EncryptedContent $newEncrypted -Password $Password
+		if ($verifyText -cne $newText) {
+			throw "Verification failed: the re-encrypted content does not decrypt to the edited text. No changes made."
+		}
+		$verifyText = $null
+
+		if ($isUrl) {
+			Write-Host "Re-encrypted content verified." -ForegroundColor Green
+			if (-not $CopyToClipboard) {
+				$answer = Read-Host -Prompt "Copy the encrypted string to the clipboard? (Y/N)"
+				$CopyToClipboard = $answer -match '^\s*y'
+			}
+			if ($CopyToClipboard) {
+				Set-Clipboard -Value $newEncrypted
+				Write-Host "Encrypted string copied to the clipboard." -ForegroundColor Green
+			}
+			# Point at the GitHub web editor for raw.githubusercontent.com sources
+			if ($Source -match '^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)$') {
+				Write-Host "Paste it into: https://github.com/$($Matches[1])/$($Matches[2])/edit/$($Matches[3])/$($Matches[4])" -ForegroundColor Cyan
+				Write-Host "raw.githubusercontent.com may serve the old content for a few minutes after the commit." -ForegroundColor Cyan
+			}
+			Write-Output $newEncrypted
+		} else {
+			# Write in place so the original file keeps its permissions
+			[System.IO.File]::WriteAllText($sourceFullPath, $newEncrypted)
+			Write-Host "Updated encrypted file: $sourceFullPath" -ForegroundColor Green
+		}
+	} finally {
+		$plainText = $null
+		$newText = $null
+		$Password = $null
+
+		# Close any editor window showing the temp file, forcefully if it does not close in time
+		$editorProcs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like "*$tempName*" })
+		foreach ($proc in $editorProcs) {
+			Write-Verbose "Closing $($proc.ProcessName) (PID $($proc.Id)): $($proc.MainWindowTitle)"
+			try {
+				[void]$proc.CloseMainWindow()
+				if (-not $proc.WaitForExit(5000)) {
+					Write-Host "Forcefully closing $($proc.ProcessName) (PID $($proc.Id))." -ForegroundColor Yellow
+					Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+				}
+			} catch {
+				Write-Host "Could not close $($proc.ProcessName) (PID $($proc.Id)): $($_.Exception.Message)" -ForegroundColor Yellow
+			}
+		}
+
+		# Overwrite then delete the plaintext temp file, retrying while an editor lets go of it
+		$deleted = -not (Test-Path -LiteralPath $tempTxt)
+		for ($i = 0; $i -lt 10 -and -not $deleted; $i++) {
+			try {
+				$length = (Get-Item -LiteralPath $tempTxt -ErrorAction Stop).Length
+				[System.IO.File]::WriteAllBytes($tempTxt, (New-Object byte[] $length))
+				Remove-Item -LiteralPath $tempTxt -Force -ErrorAction Stop
+				$deleted = $true
+			} catch {
+				Write-Verbose "Temp file delete attempt $($i + 1) failed: $($_.Exception.Message)"
+				Start-Sleep -Milliseconds 500
+			}
+		}
+		if ($deleted) {
+			Write-Verbose "Deleted temp file $tempTxt"
+		} else {
+			Write-Host "Could not delete the plaintext temp file. Delete it manually: $tempTxt" -ForegroundColor Red
+		}
+		Remove-Item -LiteralPath $tempEnc -Force -ErrorAction SilentlyContinue
+	}
 }
 
 Function Update-PSWinGetPackages {
@@ -1394,7 +1972,29 @@ Function Update-PWSH {
 		Invoke-WinGetInstall -Id Microsoft.PowerShell
 	} Else {
 		If (!(Get-Command choco -ErrorAction SilentlyContinue)) {Install-Choco}
-		Choco upgrade pwsh -y -force
+
+		# Chocolatey v2.x refuses to install or upgrade ANY package while the lib folder
+		# has unresolved dependency constraints (for example dotnet-8.0-desktopruntime or
+		# dellcommandupdate declaring chocolatey-core.extension / vcredist140 without those
+		# dependencies being present). Capture the upgrade output so we can detect that
+		# state, heal it with Repair-ChocoDependency, and retry.
+		$MaxAttempts = 3
+		For ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+			$ChocoOutput = choco upgrade pwsh -y --force 2>&1
+			$ChocoText = $ChocoOutput | Out-String
+			Write-Host $ChocoText
+
+			$DependencyBlocked = ($ChocoText -match 'packages failed') -and `
+				($ChocoText -match 'Unable to (resolve|find a version)')
+			If (-not $DependencyBlocked) { Break }
+
+			If ($Attempt -lt $MaxAttempts) {
+				Write-Host "PWSH upgrade blocked by unresolved Chocolatey dependencies. Repairing and retrying..." -ForegroundColor Yellow
+				Repair-ChocoDependency -ChocoOutput $ChocoOutput | Out-Null
+			} Else {
+				Write-Host "PWSH upgrade still failing after dependency repair. See C:\ProgramData\chocolatey\logs\chocolatey.log." -ForegroundColor Red
+			}
+		}
 	}
 	# Update the system PATH env to correct previous install logic.
 	$folderToSearch = "C:\Program Files\PowerShell\"
@@ -1432,14 +2032,51 @@ Function Update-PWSH {
 }
 
 Function Update-Windows {
+	<#
+	.SYNOPSIS
+	Installs Windows software and driver updates using PSWindowsUpdate.
+	.DESCRIPTION
+	Installs Microsoft Update software and driver updates via PSWindowsUpdate, installing or
+	repairing the module first if needed. Updates listed in the $ExcludedKBs array near the top
+	of this function are never installed. Edit that list to permanently add or remove exclusions.
+	.PARAMETER NoSoftware
+	Skip software updates.
+	.PARAMETER NoDrivers
+	Skip driver updates.
+	.PARAMETER ExcludeKB
+	Additional KB article IDs (for example "KB1234567") to skip for this run only. These are
+	combined with the permanent $ExcludedKBs list.
+	.EXAMPLE
+	Update-Windows
+	Installs all available updates except those in the permanent exclusion list.
+	.EXAMPLE
+	Update-Windows -ExcludeKB "KB1234567"
+	Installs all available updates except the permanent exclusions and KB1234567.
+	#>
+	[CmdletBinding()]
 	param
 	(
 		[Parameter(Mandatory=$False)]
 		[switch]$NoSoftware,
-		
+
 		[Parameter(Mandatory=$False)]
-		[switch]$NoDrivers
+		[switch]$NoDrivers,
+
+		[Parameter(Mandatory=$False)]
+		[ValidatePattern('^KB\d{6,8}$')]
+		[string[]]$ExcludeKB
 	)
+
+	# Permanent exclusion list. Add or remove KB IDs here, one per line, in the form 'KB1234567'.
+	$ExcludedKBs = @(
+		'KB5002914'
+	)
+	$NotKB = @($ExcludedKBs + $ExcludeKB | Where-Object { $_ } | Select-Object -Unique)
+	If ($NotKB.Count -gt 0) {
+		Write-Host "Excluding updates: $($NotKB -join ', ')" -ForegroundColor Cyan
+	}
+	$WUExclude = @{}
+	If ($NotKB.Count -gt 0) { $WUExclude['NotKBArticleID'] = $NotKB }
 
 	Function RegMU {
 		Write-Host "Checking Microsoft Update Service"
@@ -1492,26 +2129,26 @@ Function Update-Windows {
 			If ($NoDrivers -ne $True) {
 				Write-Host "Checking for DRIVER Updates..."
 				try {
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 				catch {
 					Write-Warning "Driver update check failed. Running Reset-WUComponents..."
 					Reset-WUComponents
 					Write-Host "Retrying DRIVER Updates..."
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Driver -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 			}
 
 			If ($NoSoftware -ne $True) {
 				Write-Host "Checking for SOFTWARE Updates..."
 				try {
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 				catch {
 					Write-Warning "Software update check failed. Running Reset-WUComponents..."
 					Reset-WUComponents
 					Write-Host "Retrying SOFTWARE Updates..."
-					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot -ErrorAction Stop -Verbose
+					Get-WUInstall -MicrosoftUpdate -AcceptAll -Install -UpdateType Software -IgnoreReboot @WUExclude -ErrorAction Stop -Verbose
 				}
 			}
 		} Else {
@@ -2145,7 +2782,10 @@ Function Update-WindowsTo11 {
 		}
 		$ParamString = $ForwardedParams -join ' '
 
-		$TaskCommand = "irm ps.mauletech.com | iex; Update-WindowsTo11 $ParamString"
+		# Self-clean by unregistering first so the task does not linger in Task Scheduler.
+		# Deleting a scheduled task does not interrupt the running process, so the loader
+		# and Update-WindowsTo11 call still execute as normal.
+		$TaskCommand = "Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; irm ps.mauletech.com | iex; Update-WindowsTo11 $ParamString"
 
 		# Check for existing task with the same name
 		$existingTask = Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue
@@ -2633,8 +3273,8 @@ Function Update-WindowTitle ([String] $PassNumber) {
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDueDDAdQfLhpvz
-# G1ank/qp8UTr9SNV1bCc/iXl30M8yqCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC7GSiQJ9P8YO9O
+# KLX7dAtfgJ+jUOgmsQoqI5B+ymNIy6CCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -2735,44 +3375,44 @@ Function Update-WindowTitle ([String] $PassNumber) {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -2816,33 +3456,33 @@ Function Update-WindowTitle ([String] $PassNumber) {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IHlPohuhV51JH5/T2FR+pLryyQ0DdjszywhGY+aqlOEaMA0GCSqGSIb3DQEBAQUA
-# BIICAGagIDCoQF6bXBjqRYnYmDeocytm94swYFtQuZF2Pro6W2v7N6xbSOlHXapV
-# pwUPoRd15Q6Hw7sVGFnFfuKYIKT+xwvc4MK0BDDd/zCCfaeu1NXpxDvd2iYYxW0a
-# 2ewagmmPGj9md610UjWuYyPaGyFRcn41qSetzpNXozICTHfjjGmv7DM/5UNWwx61
-# 5BatjUYE2jL9Ja2OyWLwPCvJ3YG5yoAS5WAgS3rChnFyVKCmAHg5ePgDMfNxl/9F
-# Q9J4ijGHDvG0ghV9x6lLdGyDiAGfYVm3d7uU2k6i2wWYflJCVWgJGqug228exoJa
-# bWXrwuDUgbfd3Umw3AOEsDk67Xx6ThZ1LmGkBJGy9AoVJSjzmw+zdH+z2G/PaBPB
-# hcWLLxzDxiXHwH8zUvoDok+qri6EAeHiehIbAzy5p5PfNTnzGYBw1GPxAIj4QA9G
-# ZlRLedeizEY4Msgwhywcd/e7J+fshb9+XTvc+x7V9ytoWO05FL5decnCGhg/zeel
-# lL+aCFR/dbwRDNw3QcIuqWqr1esqe+ogsMm+idL4XoBKH9GJsnqoztD89TtSK4tq
-# ykluKwztRaZzSUnxXLe8BhgRprF4uoqkq4w4NP/Ahub8FzT8i1maUDIMrQSm+SYS
-# xh8Nm40aMDstwvJflNCfF/VEI9qTEEykoTMDCLDGN/1PU10GoYIDJjCCAyIGCSqG
+# IEQ9jA3+BTcKfAe657sVOlqCOZ0Fu6rpyCPBnW38EQPDMA0GCSqGSIb3DQEBAQUA
+# BIICAC9xe4Hunnft6q+B+scGV+o7YA7hLa6dg+4hnGWx8l/97QxYeisOZ4iHPw7C
+# ybOWZM6+yKyf8BqR0tSNqzurXjYWseeAUrVBo0r0uPqdURpx4/Adu5RusioZZmuX
+# KEc/QmT2S4edgDtzCQSduVkxePw1+QKFPYNQULufWKzGXribovKWCYmMZCn/3PLW
+# y9Xu3LZBITSz0Fa9u9A0GWBLFKrZz0ze/ViSHrK8WDo7lj810GHbGpNPHARc7X//
+# RBee3ACQwsJS+J10dFCxxEtUM+BfqTQb7mKc61ANkpvTl8h/s9h3gaDJvqOOG4wQ
+# c9lOB9MTA+WahBbP8+8zjtn8gkTCuF7ykryTrrADhQNf+NJ40xlrO7qeoTbj53AI
+# qinqFkXocIk7W3p9lV62NWn1VHiRonvBzSDnIF5F9oOm/IuDngmaDbMfFiwreVHR
+# ojnrqdYqb16AJOtk+AjdbZsIGWE9r+QVhlTxtBHyAdGmDNsZPNm6xAORjvG5QouW
+# tCsr0VahkmAsTPZtZjAJAVNVtTvnQM4uIisFHtaknYeBXze628vpUH2FfYj3BpJ6
+# kN+VzUcEwsjbN9G82pNo53LPH5sh3IxgcfIs0F+n0tzemXbl/WWNB61QPwWTuugV
+# f9yR2LcRRmYiiH9eVxgTLe+UfoFAECPsUJYJX7Rh3dsboW5soYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NlowLwYJKoZIhvcNAQkEMSIEIGhCvpPA
-# n2w3mgZW6GD11g2B6reBNEY6ZyZNkR/6wznvMA0GCSqGSIb3DQEBAQUABIICAD/a
-# SvxUXHQE9O/Vy7zYzmIHNmcXVrIOdPzN8v6Jb2AOOweksFgWb3BqtYIyGHZErxId
-# JcMt0u0UgdWz92NVEpvDf9U3o+u/MiVQMz7oXaxcWxZi7C9SgXI9Mc6IRz6Z3Ji5
-# HKD5EQJqyCpeSElQDL7Aw7IyVYwSKjozJOpoTO3JwuPXKn8SC3sUih7O/BFMgzmH
-# YpSix24jxZFbVu7yvgQ5u7KYHYRVA1Lans1URWbdzFa+G3qfnTr5UrtL/xePqzP0
-# gxjYyBDn1Gqi2lWgtVOPwWELOJuk5Fws8nys4QTvpgjr7tDFDXmJhjPXHn1uPWX9
-# zLbGcxHNUeK3p++a8bEz9t/ndSp6g/ppV+CAGHN+vvlCLzEz08I6mLDLTeQtkLxn
-# IY/4B/4D+3dzq1FfzHQYzZiMVF6AdmMqgN76a+/jhm4bvIWJAry5Z84f1mSX8VKZ
-# HI++b7ocjEq/scW9vWZco+t49Bnejqr9pCXk5XwKHAC99EUXmZYNpmh5bpi7d6gX
-# IxzsfY9emij3hrv17/uRoiloasVMZOWjEPOq6pxnl+XyaBlQ5jb6oH+yXnmJ8otL
-# sk3fUHbQjJg62xI3d5v7UM9QBg0lBgSDFgIYf9MtDiuvgHWJPtc00QurbTXeKq/O
-# XY2nmCr+SjNr6tMBJSn9xuwd+ng6sD9Qvy/mTiob
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgyMFowLwYJKoZIhvcNAQkEMSIEIJwxgps+
+# gldUs6EtqaeDJ0fdu0hsQT2bOS1xyW57o4aAMA0GCSqGSIb3DQEBAQUABIICAFwm
+# 4hOOAdllbonaGykCLvxzPW7O1CgpnAh/nGGDFuF81SF8V1svKyOrka/emm1LPneE
+# OG2z93LKJ94JJYYjV5SH2RIgraOjHxLzmOPT0TTj/pzC1poFpmmpbAFTMMVMEwCC
+# BzU0LxVeieg6LDHy4kcPedkQRUxqfhtFFWl4NHPepBzrCzPkZA/XuNfeikTJpkYP
+# DH9eBjTXIYx1/uohvNumcsfrVPCignpNy/XQMO34j0vVPNGSy4pDXlm11r99CCHh
+# ZtCt3TyA/7BQIjBEkwouBu+whqu1nGgBfW5gD9j02gYA1EqHlAWBPXCypmi15i6L
+# KpRSZ53DalZ8xxBdFHCGtbhYuy9Doq+lFMpuONq8GD/eqmWtkpfwmXKWKznvtlPe
+# kYUxXqdDpnAd4TK+kulUeBoMyMAGIEwng5zR6STFGYinIJR4FerlLx1CrgvVOS3+
+# ULMnKSGos55GG8Ekhtz+IO38w3dWpxDmInICBCnDB3ogoJj4mTmjUTro+zgsbhuP
+# dbq6Bd8udNJ1Askir9ESxH68CQHQvd6eH/WdMtGgnWGxf5si66Bv5MkId+8nvFLS
+# YkNUyWQiXoVpOe/uXCdZpzp7RjO4ULyyTOJFEZxyXv7SzF1mk3C49iX9Yf9iA1UJ
+# 4QuDdkfnygP/K9VXEz68I7LgJyJf9riPY4T6Gjyb
 # SIG # End signature block

@@ -1,4 +1,4 @@
-#[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192 ; Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/master/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
+#[System.Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192 ; Invoke-RestMethod 'https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/OneOffs/Clean%20up%20Drive%20Space.ps1' | Invoke-Expression
 #Clean up Drive Space
 #Enable SSL/TLS
 Try {
@@ -26,7 +26,9 @@ $Script:LastFreeSpace = $null
 Function Write-StepStatus {
 	param(
 		[string]$StepName,
-		[switch]$Start
+		[switch]$Start,
+		[string]$Decision,
+		[string]$Reason
 	)
 	$currentFree = Get-FreeSpaceGB
 	if ($Start) {
@@ -36,9 +38,12 @@ Function Write-StepStatus {
 	}
 	$freed = [math]::Round($currentFree - $Script:LastFreeSpace, 2)
 	$totalFreed = [math]::Round($currentFree - $Script:InitialFreeSpace, 2)
+	# Steps that make a go/no-go decision pass it in so the end-of-run summary shows why.
 	[void]$Script:StepLog.Add([PSCustomObject]@{
-		Step    = $StepName
-		FreedGB = $freed
+		Step     = $StepName
+		FreedGB  = $freed
+		Decision = $Decision
+		Reason   = $Reason
 	})
 	if ($freed -gt 0) {
 		Write-Host "--- $StepName freed ${freed} GB (total so far: ${totalFreed} GB free) ---" -ForegroundColor Green
@@ -131,6 +136,828 @@ Function Reset-WindowsSearchIndex {
 	Start-Service -Name WSearch -ErrorAction SilentlyContinue
 	Write-Host "  Windows Search service restarted; index will rebuild."
 }
+
+#region Dell SupportAssist Removal
+
+<#
+	Standing order: Dell SupportAssist is uninstalled wherever it is found, because of its history of
+	vulnerabilities and instability. Dell Command Update is the supported replacement and is
+	deliberately left alone here.
+
+	This runs immediately before the C:\Recovery assessment on purpose. A present SupportAssist
+	install blocks that cleanup (it ships OS Recovery components), so removing it first lets the same
+	run go on to reclaim the folder instead of needing a second pass.
+#>
+Function Invoke-DellSupportAssistRemoval {
+	param(
+		[string]$Pattern = 'SupportAssist'
+	)
+	$outcome = [PSCustomObject]@{
+		Pattern           = $Pattern
+		Found             = @()
+		Removed           = @()
+		Remaining         = @()
+		RemainingServices = @()
+		Decision          = "Skipped"
+		Reason            = $null
+	}
+	if (-not (Get-Command -Name Get-InstalledApplication -ErrorAction SilentlyContinue) -or
+		-not (Get-Command -Name Uninstall-Application -ErrorAction SilentlyContinue)) {
+		$outcome.Reason = "Get-InstalledApplication/Uninstall-Application not loaded. Load the toolbox first: irm ps.mauletech.com | iex"
+		Write-Host "  $($outcome.Reason)" -ForegroundColor Yellow
+		return $outcome
+	}
+
+	# Get-InstalledApplication returns a boolean when given -Name, so call it bare and filter here
+	# to get the actual display names for per-product uninstall calls and for the log.
+	$outcome.Found = @(Get-InstalledApplication | Where-Object { $_.Name -match $Pattern } | Select-Object -ExpandProperty Name -Unique)
+	if ($outcome.Found.Count -eq 0) {
+		$outcome.Decision = "NotPresent"
+		$outcome.Reason = "no installed application matches '$Pattern'"
+		Write-Host "  Dell SupportAssist is not installed; nothing to remove." -ForegroundColor Green
+		return $outcome
+	}
+
+	Write-Host "  Found $($outcome.Found.Count) SupportAssist component(s): $(@($outcome.Found) -join ', ')" -ForegroundColor Cyan
+	# One exact name at a time: Uninstall-Application regex-matches its argument, so the name is
+	# escaped, and its WMI path cannot handle a pattern that matches several products at once.
+	ForEach ($app in $outcome.Found) {
+		Write-Host "  Uninstalling: $app" -ForegroundColor Cyan
+		Try {
+			Uninstall-Application -AppToUninstall ([regex]::Escape($app))
+		} Catch {
+			Write-Host "  Uninstall-Application failed on '$app': $($_.Exception.Message)" -ForegroundColor Yellow
+		}
+	}
+
+	# Uninstall-Application clears its own result variable before returning, so re-query to confirm.
+	$outcome.Remaining = @(Get-InstalledApplication | Where-Object { $_.Name -match $Pattern } | Select-Object -ExpandProperty Name -Unique)
+	$outcome.Removed = @($outcome.Found | Where-Object { $outcome.Remaining -notcontains $_ })
+	$outcome.RemainingServices = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
+		Where-Object { $_.Name -like "*$Pattern*" -or $_.DisplayName -like "*$Pattern*" } |
+		Select-Object -ExpandProperty Name)
+
+	if ($outcome.Remaining.Count -eq 0) {
+		$outcome.Decision = "Removed"
+		$outcome.Reason = "uninstalled $($outcome.Removed.Count) component(s): $(@($outcome.Removed) -join ', ')"
+		Write-Host "  Dell SupportAssist removed." -ForegroundColor Green
+	} elseif ($outcome.Removed.Count -gt 0) {
+		$outcome.Decision = "Partial"
+		$outcome.Reason = "removed $(@($outcome.Removed) -join ', '); still present: $(@($outcome.Remaining) -join ', ')"
+		Write-Host "  Partially removed. Still present: $(@($outcome.Remaining) -join ', ')" -ForegroundColor Yellow
+	} else {
+		$outcome.Decision = "Failed"
+		$outcome.Reason = "could not uninstall: $(@($outcome.Remaining) -join ', ')"
+		Write-Host "  Could not uninstall: $(@($outcome.Remaining) -join ', ')" -ForegroundColor Red
+	}
+	if ($outcome.RemainingServices.Count -gt 0) {
+		# A lingering service will block the C:\Recovery step below. Say so plainly.
+		Write-Host "  SupportAssist service(s) still registered: $(@($outcome.RemainingServices) -join ', ')." -ForegroundColor Yellow
+		Write-Host "  A reboot is likely needed to finish removal; re-run this script afterwards to reclaim C:\Recovery." -ForegroundColor Yellow
+		$outcome.Reason = "$($outcome.Reason); service(s) still registered: $(@($outcome.RemainingServices) -join ', ')"
+	}
+	return $outcome
+}
+
+#endregion Dell SupportAssist Removal
+
+#region OEM Recovery Folder (C:\Recovery) Helpers
+
+<#
+	C:\Recovery on the OS volume is the OEM push-button-reset extensibility folder. Per Microsoft's
+	push-button reset documentation it holds ResetConfig.xml plus extensibility scripts (\OEM),
+	provisioning packages (\Customizations), and auto-apply customizations (\AutoApply). None of that
+	is required for WinRE, Reset this PC, or BitLocker recovery to work: the live WinRE payload
+	normally lives on its own hidden partition.
+
+	The machines that must be left alone are the ones where WinRE itself was configured onto the OS
+	volume, or where a BCD entry still points into C:\Recovery. Every check below is read-only and
+	fails closed: anything we cannot positively confirm as safe results in the folder being skipped.
+#>
+
+# Resolves a drive letter to its physical disk number and 1-based partition number.
+Function Get-VolumePartitionId {
+	param(
+		[string]$DriveLetter
+	)
+	$DriveLetter = $DriveLetter.ToUpper().TrimEnd(':')
+	Try {
+		if (Get-Command -Name Get-Partition -ErrorAction SilentlyContinue) {
+			$part = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop | Select-Object -First 1
+			if ($part) {
+				return [PSCustomObject]@{
+					DiskNumber      = [int]$part.DiskNumber
+					PartitionNumber = [int]$part.PartitionNumber
+					Source          = 'Get-Partition'
+				}
+			}
+		}
+	} Catch {
+		Write-Verbose "Get-Partition failed for ${DriveLetter}: $($_.Exception.Message)"
+	}
+	# Fallback for hosts without the Storage module. Win32_DiskPartition.Index is 0-based.
+	Try {
+		$assocQuery = "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='${DriveLetter}:'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+		$cimPart = @(Get-CimInstance -Query $assocQuery -ErrorAction Stop) | Select-Object -First 1
+		if ($cimPart) {
+			return [PSCustomObject]@{
+				DiskNumber      = [int]$cimPart.DiskIndex
+				PartitionNumber = [int]$cimPart.Index + 1
+				Source          = 'Win32_DiskPartition'
+			}
+		}
+	} Catch {
+		Write-Verbose "Win32_DiskPartition lookup failed for ${DriveLetter}: $($_.Exception.Message)"
+	}
+	return $null
+}
+
+# Resolves a DOS drive such as "C:" to its NT device name, e.g. \Device\HarddiskVolume3.
+# BCD stores volumes as HarddiskVolume names, so this is needed to tell the OS volume apart
+# from the recovery partition when reading bcdedit output.
+Function Get-NtDeviceNameForDrive {
+	param(
+		[string]$DosDrive
+	)
+	Try {
+		if (-not ('MtDosDevice' -as [type])) {
+			Add-Type -ErrorAction Stop @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class MtDosDevice
+{
+	[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+	private static extern uint QueryDosDeviceW(string lpDeviceName, StringBuilder lpTargetPath, uint ucchMax);
+
+	public static string Resolve(string dosDrive)
+	{
+		StringBuilder sb = new StringBuilder(1024);
+		uint len = QueryDosDeviceW(dosDrive, sb, 1024);
+		if (len == 0) { return null; }
+		return sb.ToString();
+	}
+}
+'@
+		}
+		$resolved = [MtDosDevice]::Resolve($DosDrive.TrimEnd('\'))
+		Write-Verbose "NT device name for $DosDrive is $resolved"
+		return $resolved
+	} Catch {
+		Write-Verbose "Unable to resolve NT device name for ${DosDrive}: $($_.Exception.Message)"
+		return $null
+	}
+}
+
+# Runs reagentc /info and parses the fields that decide whether C:\Recovery is in use.
+# Parsing is label-based, so a localized Windows will report Parsed = $false and the caller skips.
+Function Get-ReAgentInfo {
+	$result = [PSCustomObject]@{
+		Parsed               = $false
+		Status               = $null
+		WinReLocation        = $null
+		WinReDiskNumber      = $null
+		WinRePartitionNumber = $null
+		WinReDriveLetter     = $null
+		CustomImageLocation  = $null
+		RecoveryImageLocation = $null
+		Note                 = $null
+		Raw                  = $null
+	}
+	$reagentc = Join-Path -Path $Env:SystemRoot -ChildPath "System32\ReAgentc.exe"
+	if (-not (Test-Path -LiteralPath $reagentc)) {
+		$result.Note = "ReAgentc.exe not found at $reagentc"
+		return $result
+	}
+	$raw = (& $reagentc /info 2>&1 | Out-String)
+	$result.Raw = $raw
+	if ([string]::IsNullOrWhiteSpace($raw)) {
+		$result.Note = "reagentc /info produced no output"
+		return $result
+	}
+	$sawLocationLabel = $false
+	$sawCustomLabel = $false
+	ForEach ($line in ($raw -split "`r?`n")) {
+		if ($line -match '^\s*Windows RE status\s*:\s*(.*)$') { $result.Status = $Matches[1].Trim() ; continue }
+		if ($line -match '^\s*Windows RE location\s*:\s*(.*)$') { $result.WinReLocation = $Matches[1].Trim() ; $sawLocationLabel = $true ; continue }
+		if ($line -match '^\s*Custom image location\s*:\s*(.*)$') { $result.CustomImageLocation = $Matches[1].Trim() ; $sawCustomLabel = $true ; continue }
+		if ($line -match '^\s*Recovery image location\s*:\s*(.*)$') { $result.RecoveryImageLocation = $Matches[1].Trim() ; continue }
+	}
+	if (-not ($sawLocationLabel -and $sawCustomLabel)) {
+		$result.Note = "Could not parse the expected reagentc /info labels (non-English Windows?)"
+		return $result
+	}
+	$result.Parsed = $true
+
+	# The location is normally a GLOBALROOT device path, e.g.
+	# \\?\GLOBALROOT\device\harddisk0\partition4\Recovery\WindowsRE
+	if ($result.WinReLocation -match 'harddisk(\d+)\\partition(\d+)') {
+		$result.WinReDiskNumber = [int]$Matches[1]
+		$result.WinRePartitionNumber = [int]$Matches[2]
+	} elseif ($result.WinReLocation -match '^([A-Za-z]):\\') {
+		$result.WinReDriveLetter = $Matches[1].ToUpper()
+	}
+	return $result
+}
+
+# Enumerates BCD entries and reports any element whose value references the target folder on the
+# OS volume. Values are matched rather than element names, so bcdedit localization does not matter.
+Function Get-BcdRecoveryReferences {
+	param(
+		[string]$TargetPath,
+		[string]$OsDrive,
+		[string]$OsNtDeviceName
+	)
+	$result = [PSCustomObject]@{
+		Parsed       = $false
+		References   = @()
+		Unresolved   = @()
+		Note         = $null
+	}
+	$bcdedit = Join-Path -Path $Env:SystemRoot -ChildPath "System32\bcdedit.exe"
+	if (-not (Test-Path -LiteralPath $bcdedit)) {
+		$result.Note = "bcdedit.exe not found at $bcdedit"
+		return $result
+	}
+	$raw = (& $bcdedit /enum all 2>&1 | Out-String)
+	if ([string]::IsNullOrWhiteSpace($raw) -or $raw -match 'Access is denied') {
+		$result.Note = "bcdedit /enum all returned no usable output (administrator rights required)"
+		return $result
+	}
+	$result.Parsed = $true
+	$leaf = (Split-Path -Path $TargetPath -Leaf)          # normally "Recovery"
+	$osDriveToken = $OsDrive.TrimEnd('\').ToUpper()       # normally "C:"
+
+	# Returns the volume token (drive letter or \Device\HarddiskVolumeN) named on a line, if any.
+	Function Get-BcdVolumeToken {
+		param([string]$Line)
+		if ($Line -match '\[([^\]]+)\]') { return $Matches[1].Trim() }
+		if ($Line -match 'partition=([^,\s]+)') { return $Matches[1].Trim() }
+		return $null
+	}
+
+	# Blank lines separate entries, so each block is one BCD object.
+	# The group must be non-capturing: -split adds captured groups to its output.
+	ForEach ($block in ($raw -split "(?:`r?`n){2,}")) {
+		if ([string]::IsNullOrWhiteSpace($block)) { continue }
+		$lines = @($block -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+		# The volume a bare "path" line applies to comes from the entry's device line.
+		$blockVolume = $null
+		ForEach ($line in $lines) {
+			if ($line -match '^\s*\S*device\S*\s') {
+				$candidate = Get-BcdVolumeToken -Line $line
+				if ($candidate) { $blockVolume = $candidate ; break }
+			}
+		}
+		ForEach ($line in $lines) {
+			if ($line -notmatch [regex]::Escape("\$leaf\") -and $line -notmatch ([regex]::Escape("\$leaf") + '\s*$')) { continue }
+			$volume = Get-BcdVolumeToken -Line $line
+			if (-not $volume) { $volume = $blockVolume }
+			$trimmed = $line.Trim()
+			if (-not $volume) {
+				$result.Unresolved += $trimmed
+				continue
+			}
+			$isOsVolume = $false
+			if ($volume -match '^[A-Za-z]:$') {
+				$isOsVolume = ($volume.ToUpper() -eq $osDriveToken)
+			} elseif ($volume -match '^\\Device\\HarddiskVolume\d+$') {
+				if ($OsNtDeviceName) {
+					$isOsVolume = ($volume -eq $OsNtDeviceName)
+				} else {
+					$result.Unresolved += $trimmed
+					continue
+				}
+			} else {
+				$result.Unresolved += $trimmed
+				continue
+			}
+			if ($isOsVolume) { $result.References += "$trimmed  (volume $volume)" }
+		}
+	}
+	return $result
+}
+
+# Sums the folder recursively and breaks the total down by top-level child.
+Function Measure-FolderSizeBreakdown {
+	param(
+		[string]$Path
+	)
+	$result = [PSCustomObject]@{
+		Path       = $Path
+		TotalBytes = 0
+		TotalGB    = 0
+		FileCount  = 0
+		Breakdown  = @()
+	}
+	$children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+	ForEach ($child in $children) {
+		$bytes = 0
+		$count = 0
+		if ($child.PSIsContainer) {
+			$measured = Get-ChildItem -LiteralPath $child.FullName -Force -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+			if ($measured) { $bytes = [long]$measured.Sum ; $count = [int]$measured.Count }
+		} else {
+			$bytes = [long]$child.Length
+			$count = 1
+		}
+		$result.TotalBytes += $bytes
+		$result.FileCount += $count
+		$result.Breakdown += [PSCustomObject]@{
+			Name      = $child.Name
+			IsFolder  = [bool]$child.PSIsContainer
+			SizeBytes = $bytes
+			SizeGB    = [math]::Round($bytes / 1GB, 3)
+			FileCount = $count
+		}
+	}
+	$result.TotalGB = [math]::Round($result.TotalBytes / 1GB, 3)
+	$result.Breakdown = @($result.Breakdown | Sort-Object -Property SizeBytes -Descending)
+	return $result
+}
+
+# Classifies the folder contents. Only file names, extensions and sizes are inspected; no .wim or
+# .ppkg is opened, hashed, mounted or validated.
+Function Get-RecoveryFolderFingerprint {
+	param(
+		[string]$Path
+	)
+	$result = [PSCustomObject]@{
+		Path            = $Path
+		Classification  = 'Unknown'
+		Detail          = $null
+		FileCount       = 0
+		WimCount        = 0
+		PpkgCount       = 0
+		HasResetConfig  = $false
+		HasWinRePayload = $false
+		TopLevelItems   = @()
+		UnexpectedItems = @()
+	}
+	# Folders Microsoft documents for push-button reset content on the OS volume.
+	$KnownPbrFolders = @('OEM', 'Customizations', 'AutoApply', 'RecoveryImage')
+	# Files left behind at the root once WinRE has been reconfigured or moved.
+	$KnownLeftoverRootFiles = @('ReAgentOld.xml', 'ReAgent.xml')
+
+	$result.TopLevelItems = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+	$files = @(Get-ChildItem -LiteralPath $Path -Force -Recurse -File -ErrorAction SilentlyContinue)
+	$result.FileCount = $files.Count
+	$result.WimCount = @($files | Where-Object { $_.Extension -eq '.wim' }).Count
+	$result.PpkgCount = @($files | Where-Object { $_.Extension -eq '.ppkg' }).Count
+	$result.HasResetConfig = (@($files | Where-Object { $_.Name -eq 'ResetConfig.xml' }).Count -gt 0)
+	$result.HasWinRePayload = (@($files | Where-Object { $_.Name -like 'winre*.wim' }).Count -gt 0) -or
+		(@($files | Where-Object { $_.FullName -match '\\WindowsRE(\\|$)' }).Count -gt 0) -or
+		(@($result.TopLevelItems | Where-Object { $_ -eq 'WindowsRE' }).Count -gt 0)
+
+	# A live WinRE payload on the OS volume outranks every other signal.
+	if ($result.HasWinRePayload) {
+		$result.Detail = "Contains a WinRE payload (WindowsRE folder or winre*.wim); this is not OEM push-button-reset content"
+		return $result
+	}
+	if ($files.Count -eq 0) {
+		$result.Classification = 'Empty'
+		$result.Detail = "No files present"
+		return $result
+	}
+
+	$prefix = $Path.TrimEnd('\') + '\'
+	$rootLeftoverOnly = $true
+	ForEach ($file in $files) {
+		$relative = $file.FullName
+		if ($relative.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { $relative = $relative.Substring($prefix.Length) }
+		$segments = $relative.Split('\')
+		if ($segments.Count -eq 1) {
+			if ($KnownLeftoverRootFiles -notcontains $segments[0]) {
+				$rootLeftoverOnly = $false
+				$result.UnexpectedItems += $relative
+			}
+			continue
+		}
+		# Anything nested is only expected inside a documented push-button-reset folder.
+		$rootLeftoverOnly = $false
+		if ($KnownPbrFolders -notcontains $segments[0]) { $result.UnexpectedItems += $relative }
+	}
+
+	if ($result.UnexpectedItems.Count -gt 0) {
+		$result.UnexpectedItems = @($result.UnexpectedItems | Select-Object -Unique)
+		$result.Detail = "$($result.UnexpectedItems.Count) item(s) outside the documented push-button-reset layout, e.g. $(@($result.UnexpectedItems | Select-Object -First 3) -join ', ')"
+		return $result
+	}
+	if ($rootLeftoverOnly) {
+		$result.Classification = 'LeftoverOnly'
+		$result.Detail = "Only WinRE configuration leftovers at the root: $(@($result.TopLevelItems) -join ', ')"
+		return $result
+	}
+	$result.Classification = 'OEM-PBR-Content'
+	$markers = @()
+	if ($result.HasResetConfig) { $markers += "ResetConfig.xml" }
+	if ($result.WimCount -gt 0) { $markers += "$($result.WimCount) .wim file(s)" }
+	if ($result.PpkgCount -gt 0) { $markers += "$($result.PpkgCount) .ppkg file(s)" }
+	if ($markers.Count -eq 0) { $markers += "vendor files only" }
+	$result.Detail = "Push-button-reset folders ($(@($result.TopLevelItems) -join ', ')) containing $(@($markers) -join ', ')"
+	return $result
+}
+
+# Looks for OEM recovery/support services and scheduled tasks that could depend on the folder.
+Function Get-OemRecoveryVendorFootprint {
+	param(
+		[string]$Path
+	)
+	$result = [PSCustomObject]@{
+		TasksChecked    = $false
+		Services        = @()
+		Tasks           = @()
+		PathReferences  = @()
+		Note            = $null
+	}
+	# Dell SupportAssist, HP Support Assistant and Lenovo Vantage families.
+	# Scoped to vendor software that plausibly touches the recovery folder. Deliberately absent:
+	# Dell Command Update (DellClientManagementService, \Dell\Command Update\ tasks), which is the
+	# supported SupportAssist replacement, and Dell Data Vault (DDV*), which is telemetry writing to
+	# ProgramData. Neither touches C:\Recovery, and blocking on them would exclude every Dell machine
+	# permanently. Anything that does reference the folder is still caught by the path check below.
+	$ServicePatterns = @(
+		'*SupportAssist*', 'Dell*Recovery*',
+		'HPSupportSolutionsFrameworkService', 'HP Support Assistant*', 'HP*Recovery*', 'HPSysInfoCap',
+		'LenovoVantageService', 'ImControllerService', 'Lenovo*Recovery*'
+	)
+	$TaskPathPatterns = @(
+		'\Dell\SupportAssist*', '\Dell\*Recovery*',
+		'\HP\HP Support Assistant*', '\HP\*Recovery*',
+		'\Lenovo\Vantage*', '\Lenovo\*Recovery*',
+		'\OEM\*'
+	)
+	$pathToken = $Path.TrimEnd('\')
+
+	Try {
+		ForEach ($service in @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)) {
+			$matched = $false
+			ForEach ($pattern in $ServicePatterns) {
+				if ($service.Name -like $pattern -or $service.DisplayName -like $pattern) { $matched = $true ; break }
+			}
+			$referencesPath = ($service.PathName -and $service.PathName -like "*$pathToken*")
+			if ($matched -or $referencesPath) {
+				$result.Services += [PSCustomObject]@{
+					Name           = $service.Name
+					DisplayName    = $service.DisplayName
+					State          = $service.State
+					ReferencesPath = [bool]$referencesPath
+				}
+				if ($referencesPath) { $result.PathReferences += "service $($service.Name): $($service.PathName)" }
+			}
+		}
+	} Catch {
+		$result.Note = "Unable to enumerate services: $($_.Exception.Message)"
+	}
+
+	if (Get-Command -Name Get-ScheduledTask -ErrorAction SilentlyContinue) {
+		Try {
+			ForEach ($task in @(Get-ScheduledTask -ErrorAction Stop)) {
+				$matched = $false
+				ForEach ($pattern in $TaskPathPatterns) {
+					if ($task.TaskPath -like $pattern) { $matched = $true ; break }
+				}
+				$actionText = (@($task.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' ')
+				$referencesPath = ($actionText -and $actionText -like "*$pathToken*")
+				if ($matched -or $referencesPath) {
+					$result.Tasks += [PSCustomObject]@{
+						TaskName       = $task.TaskName
+						TaskPath       = $task.TaskPath
+						State          = $task.State
+						ReferencesPath = [bool]$referencesPath
+					}
+					if ($referencesPath) { $result.PathReferences += "task $($task.TaskPath)$($task.TaskName): $($actionText.Trim())" }
+				}
+			}
+			$result.TasksChecked = $true
+		} Catch {
+			$result.Note = "Unable to enumerate scheduled tasks: $($_.Exception.Message)"
+		}
+	} else {
+		$result.Note = "Get-ScheduledTask is not available on this host"
+	}
+	return $result
+}
+
+# Compact OS can single-instance installed applications as file pointers into a .ppkg or .wim held
+# in C:\Recovery\Customizations. Deleting the folder on such a machine breaks those applications, so
+# this looks for evidence of WIM-backed files. Microsoft documents "fsutil wim enumwims <drive>" as
+# the way to query this. Only positive evidence blocks the cleanup; an unreadable or unrecognised
+# result is logged as inconclusive rather than treated as a blocker.
+Function Get-WimBackedFileState {
+	param(
+		[string]$DriveLetter
+	)
+	$result = [PSCustomObject]@{
+		Checked   = $false
+		WimBacked = $false
+		Detail    = $null
+	}
+	$fsutil = Join-Path -Path $Env:SystemRoot -ChildPath "System32\fsutil.exe"
+	if (-not (Test-Path -LiteralPath $fsutil)) {
+		$result.Detail = "fsutil.exe not found; single-instancing state unknown"
+		return $result
+	}
+	$DriveLetter = $DriveLetter.ToUpper().TrimEnd(':')
+	$raw = (& $fsutil wim enumwims "${DriveLetter}:" 2>&1 | Out-String)
+	$result.Checked = $true
+	if ([string]::IsNullOrWhiteSpace($raw)) {
+		$result.Detail = "No WIM-backed files reported on ${DriveLetter}:"
+		return $result
+	}
+	if ($raw -match '(?im)^\s*(Wim\s+(path|guid|index|type)|wim\s*:)') {
+		$result.WimBacked = $true
+		$result.Detail = "fsutil reports WIM-backed files on ${DriveLetter}: (Compact OS single-instancing)"
+		return $result
+	}
+	$result.Detail = "fsutil wim enumwims returned an unrecognised result; treated as inconclusive: $(($raw -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1))"
+	return $result
+}
+
+# Runs every read-only check and returns the decision plus the evidence behind it.
+Function Get-OemRecoveryFolderSafety {
+	param(
+		[string]$Path
+	)
+	$osDrive = (Split-Path -Path $Path -Qualifier -ErrorAction SilentlyContinue)
+	if ([string]::IsNullOrWhiteSpace($osDrive)) { $osDrive = $Env:SystemDrive }
+	$osDriveLetter = $osDrive.TrimEnd(':')
+	$safety = [PSCustomObject]@{
+		Path        = $Path
+		Present     = (Test-Path -LiteralPath $Path)
+		IsSafe      = $false
+		Blockers    = @()
+		Checks      = @()
+		Size        = $null
+		Fingerprint = $null
+	}
+	if (-not $safety.Present) { return $safety }
+
+	$blockers = @()
+	$checks = [System.Collections.ArrayList]::new()
+	Function Add-SafetyCheck {
+		param([string]$Name, [string]$Result, [string]$Detail)
+		[void]$checks.Add([PSCustomObject]@{ Check = $Name ; Result = $Result ; Detail = $Detail })
+	}
+
+	# Check 1: where does WinRE actually live?
+	$osPartition = Get-VolumePartitionId -DriveLetter $osDriveLetter
+	$reagent = Get-ReAgentInfo
+	if (-not $reagent.Parsed) {
+		$blockers += "reagentc /info could not be parsed ($($reagent.Note))"
+		Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Unknown" -Detail $reagent.Note
+	} elseif (-not $osPartition) {
+		$blockers += "could not resolve which partition hosts $Path"
+		Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Unknown" -Detail "OS partition for ${osDrive} could not be resolved"
+	} elseif ([string]::IsNullOrWhiteSpace($reagent.WinReLocation)) {
+		Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Pass" -Detail "No WinRE location registered (status: $($reagent.Status)); nothing points at $Path"
+	} elseif ($null -ne $reagent.WinReDiskNumber) {
+		$winReId = "harddisk$($reagent.WinReDiskNumber)\partition$($reagent.WinRePartitionNumber)"
+		$osId = "harddisk$($osPartition.DiskNumber)\partition$($osPartition.PartitionNumber)"
+		if ($reagent.WinReDiskNumber -eq $osPartition.DiskNumber -and $reagent.WinRePartitionNumber -eq $osPartition.PartitionNumber) {
+			$blockers += "WinRE is hosted on the OS partition ($winReId), the same partition as $Path"
+			Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Fail" -Detail "WinRE at $winReId matches the OS partition $osId"
+		} else {
+			Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Pass" -Detail "WinRE at $winReId is a different partition to the OS partition $osId"
+		}
+	} elseif ($reagent.WinReDriveLetter) {
+		$winRePartition = Get-VolumePartitionId -DriveLetter $reagent.WinReDriveLetter
+		if ($reagent.WinReLocation -like "$($Path.TrimEnd('\'))*") {
+			$blockers += "WinRE is registered inside $Path ($($reagent.WinReLocation))"
+			Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Fail" -Detail "WinRE location $($reagent.WinReLocation) is inside the target folder"
+		} elseif (-not $winRePartition) {
+			$blockers += "WinRE location $($reagent.WinReLocation) could not be resolved to a partition"
+			Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Unknown" -Detail "Drive $($reagent.WinReDriveLetter): could not be resolved to a partition"
+		} elseif ($winRePartition.DiskNumber -eq $osPartition.DiskNumber -and $winRePartition.PartitionNumber -eq $osPartition.PartitionNumber) {
+			$blockers += "WinRE is hosted on the OS partition ($($reagent.WinReLocation))"
+			Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Fail" -Detail "WinRE location $($reagent.WinReLocation) resolves to the OS partition"
+		} else {
+			Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Pass" -Detail "WinRE location $($reagent.WinReLocation) is on a different partition"
+		}
+	} else {
+		$blockers += "WinRE location '$($reagent.WinReLocation)' is in an unrecognised format"
+		Add-SafetyCheck -Name "WinRE location (reagentc /info)" -Result "Unknown" -Detail "Unrecognised location format: $($reagent.WinReLocation)"
+	}
+
+	# Check 2: a registered custom image is rare and deprecated on Windows 10+, but never ignored.
+	if (-not $reagent.Parsed) {
+		Add-SafetyCheck -Name "Custom image location" -Result "Unknown" -Detail "reagentc /info could not be parsed"
+	} elseif (-not [string]::IsNullOrWhiteSpace($reagent.CustomImageLocation)) {
+		$blockers += "a custom recovery image is registered ($($reagent.CustomImageLocation))"
+		Add-SafetyCheck -Name "Custom image location" -Result "Fail" -Detail $reagent.CustomImageLocation
+	} else {
+		Add-SafetyCheck -Name "Custom image location" -Result "Pass" -Detail "Not populated"
+	}
+	# Related to the above: a recovery image registered inside the folder is also disqualifying.
+	if ($reagent.Parsed -and $reagent.RecoveryImageLocation -and $reagent.RecoveryImageLocation -like "*$($Path.TrimEnd('\'))*") {
+		$blockers += "a recovery image is registered inside $Path ($($reagent.RecoveryImageLocation))"
+		Add-SafetyCheck -Name "Recovery image location" -Result "Fail" -Detail $reagent.RecoveryImageLocation
+	} elseif ($reagent.Parsed) {
+		$detail = "Not populated"
+		if ($reagent.RecoveryImageLocation) { $detail = "$($reagent.RecoveryImageLocation) (outside the target folder)" }
+		Add-SafetyCheck -Name "Recovery image location" -Result "Pass" -Detail $detail
+	}
+
+	# Check 3: does any BCD entry still point into the folder?
+	$osNtDevice = Get-NtDeviceNameForDrive -DosDrive $osDrive
+	$bcd = Get-BcdRecoveryReferences -TargetPath $Path -OsDrive $osDrive -OsNtDeviceName $osNtDevice
+	if (-not $bcd.Parsed) {
+		$blockers += "BCD entries could not be enumerated ($($bcd.Note))"
+		Add-SafetyCheck -Name "BCD entries" -Result "Unknown" -Detail $bcd.Note
+	} elseif ($bcd.References.Count -gt 0) {
+		$blockers += "$($bcd.References.Count) BCD entr(y/ies) reference $Path"
+		Add-SafetyCheck -Name "BCD entries" -Result "Fail" -Detail (@($bcd.References) -join ' | ')
+	} elseif ($bcd.Unresolved.Count -gt 0) {
+		$blockers += "$($bcd.Unresolved.Count) BCD reference(s) to a Recovery path could not be tied to a volume"
+		Add-SafetyCheck -Name "BCD entries" -Result "Unknown" -Detail (@($bcd.Unresolved) -join ' | ')
+	} else {
+		Add-SafetyCheck -Name "BCD entries" -Result "Pass" -Detail "No entry references $Path on the OS volume"
+	}
+
+	# Check 4: content fingerprint.
+	$fingerprint = Get-RecoveryFolderFingerprint -Path $Path
+	$safety.Fingerprint = $fingerprint
+	if ($fingerprint.Classification -eq 'Unknown') {
+		$blockers += "contents did not match a known-safe layout ($($fingerprint.Detail))"
+		Add-SafetyCheck -Name "Content fingerprint" -Result "Fail" -Detail "Unknown: $($fingerprint.Detail)"
+	} else {
+		Add-SafetyCheck -Name "Content fingerprint" -Result "Pass" -Detail "$($fingerprint.Classification): $($fingerprint.Detail)"
+	}
+
+	# Check 5: size, recorded before anything is touched.
+	$size = Measure-FolderSizeBreakdown -Path $Path
+	$safety.Size = $size
+	$breakdownText = "empty"
+	if ($size.Breakdown.Count -gt 0) {
+		$breakdownText = (@($size.Breakdown | ForEach-Object { "$($_.Name) $('{0:N3}' -f $_.SizeGB) GB" }) -join ', ')
+	}
+	Add-SafetyCheck -Name "Size measurement" -Result "Info" -Detail "$('{0:N3}' -f $size.TotalGB) GB across $($size.FileCount) file(s): $breakdownText"
+
+	# Check 6: OEM recovery services and scheduled tasks.
+	$vendor = Get-OemRecoveryVendorFootprint -Path $Path
+	if (-not $vendor.TasksChecked) {
+		$blockers += "scheduled tasks could not be checked ($($vendor.Note))"
+		Add-SafetyCheck -Name "OEM services and tasks" -Result "Unknown" -Detail $vendor.Note
+	} elseif ($vendor.PathReferences.Count -gt 0) {
+		$blockers += "$($vendor.PathReferences.Count) service(s)/task(s) reference paths inside $Path"
+		Add-SafetyCheck -Name "OEM services and tasks" -Result "Fail" -Detail (@($vendor.PathReferences) -join ' | ')
+	} elseif ($vendor.Services.Count -gt 0 -or $vendor.Tasks.Count -gt 0) {
+		$found = @()
+		if ($vendor.Services.Count -gt 0) { $found += "services: $(@($vendor.Services | Select-Object -ExpandProperty Name) -join ', ')" }
+		if ($vendor.Tasks.Count -gt 0) { $found += "tasks: $(@($vendor.Tasks | ForEach-Object { "$($_.TaskPath)$($_.TaskName)" } | Select-Object -First 8) -join ', ')" }
+		$blockers += "OEM recovery software is present ($(@($found) -join '; '))"
+		Add-SafetyCheck -Name "OEM services and tasks" -Result "Fail" -Detail (@($found) -join '; ')
+	} else {
+		Add-SafetyCheck -Name "OEM services and tasks" -Result "Pass" -Detail "No Dell/HP/Lenovo recovery services or tasks found"
+	}
+
+	# Additional check: Compact OS single-instancing backed by a package in this folder.
+	$wimState = Get-WimBackedFileState -DriveLetter $osDriveLetter
+	if ($wimState.WimBacked) {
+		$blockers += "Compact OS single-instancing is in use, so applications may be file pointers into this folder"
+		Add-SafetyCheck -Name "Compact OS single-instancing" -Result "Fail" -Detail $wimState.Detail
+	} else {
+		Add-SafetyCheck -Name "Compact OS single-instancing" -Result "Pass" -Detail $wimState.Detail
+	}
+
+	$safety.Checks = @($checks)
+	$safety.Blockers = @($blockers)
+	$safety.IsSafe = ($blockers.Count -eq 0)
+	return $safety
+}
+
+# Deletes the folder item by item so one locked file does not abort the rest of the removal.
+Function Remove-OemRecoveryFolder {
+	param(
+		[string]$Path
+	)
+	$result = [PSCustomObject]@{
+		Path         = $Path
+		ItemsDeleted = 0
+		ItemsFailed  = 0
+		FailedItems  = @()
+		Verified     = $false
+		Error        = $null
+	}
+	# The folder ships with inheritance removed and SYSTEM as owner, so take ownership first.
+	Write-Host "Taking ownership of $Path so its contents can be removed"
+	Try {
+		$null = & (Join-Path -Path $Env:SystemRoot -ChildPath "System32\takeown.exe") /F "$Path" /R /A /D Y 2>&1
+		$null = & (Join-Path -Path $Env:SystemRoot -ChildPath "System32\icacls.exe") "$Path" /grant "*S-1-5-32-544:(OI)(CI)F" /T /C /Q 2>&1
+	} Catch {
+		Write-Verbose "Ownership/ACL adjustment on $Path reported an error: $($_.Exception.Message)"
+	}
+
+	ForEach ($file in @(Get-ChildItem -LiteralPath $Path -Force -Recurse -File -ErrorAction SilentlyContinue)) {
+		Try {
+			Try {
+				$file.Attributes = [System.IO.FileAttributes]::Normal
+			} Catch {
+				Write-Verbose "Could not clear attributes on $($file.FullName): $($_.Exception.Message)"
+			}
+			Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+			$result.ItemsDeleted++
+		} Catch {
+			Write-Verbose "Standard delete failed for $($file.FullName): $($_.Exception.Message)"
+			Try {
+				if (-not (Get-Command -Name Remove-PathForcefully -ErrorAction SilentlyContinue)) { throw "Remove-PathForcefully is not loaded" }
+				Remove-PathForcefully -Path $file.FullName
+				if (Test-Path -LiteralPath $file.FullName) { throw "still present after forceful delete" }
+				$result.ItemsDeleted++
+			} Catch {
+				$result.ItemsFailed++
+				$result.FailedItems += $file.FullName
+				Write-Host "  Could not delete: $($file.FullName)" -ForegroundColor Yellow
+			}
+		}
+	}
+
+	# Deepest-first so children are gone before their parents.
+	ForEach ($dir in @(Get-ChildItem -LiteralPath $Path -Force -Recurse -Directory -ErrorAction SilentlyContinue | Sort-Object -Property { $_.FullName.Length } -Descending)) {
+		Try {
+			Remove-Item -LiteralPath $dir.FullName -Force -Recurse -ErrorAction Stop
+		} Catch {
+			Write-Verbose "Could not remove directory $($dir.FullName): $($_.Exception.Message)"
+		}
+	}
+	Try {
+		Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
+	} Catch {
+		$result.Error = $_.Exception.Message
+		Write-Verbose "Could not remove $Path : $($_.Exception.Message)"
+	}
+	$result.Verified = -not (Test-Path -LiteralPath $Path)
+	return $result
+}
+
+# Orchestrates the detection, reports each check, and deletes only when every check passed.
+Function Invoke-OemRecoveryFolderCleanup {
+	param(
+		[string]$Path = (Join-Path -Path $Env:SystemDrive -ChildPath "Recovery")
+	)
+	$outcome = [PSCustomObject]@{
+		Path        = $Path
+		Decision    = "Skipped"
+		Reason      = $null
+		MeasuredGB  = 0
+		ReclaimedGB = 0
+		Safety      = $null
+		Removal     = $null
+	}
+	Write-Host "Evaluating $Path (OEM push-button-reset folder) for cleanup"
+	if (-not (Test-Path -LiteralPath $Path)) {
+		$outcome.Reason = "folder not present"
+		Write-Host "  $Path does not exist; nothing to do." -ForegroundColor Yellow
+		return $outcome
+	}
+
+	$safety = Get-OemRecoveryFolderSafety -Path $Path
+	$outcome.Safety = $safety
+	$outcome.MeasuredGB = if ($safety.Size) { $safety.Size.TotalGB } else { 0 }
+
+	ForEach ($check in $safety.Checks) {
+		$color = switch ($check.Result) {
+			"Pass"    { "Green" }
+			"Fail"    { "Red" }
+			"Unknown" { "Yellow" }
+			default   { "Cyan" }
+		}
+		Write-Host "  [$($check.Result)] $($check.Check): $($check.Detail)" -ForegroundColor $color
+		Write-Verbose "$($check.Check) = $($check.Result) :: $($check.Detail)"
+	}
+	if ($safety.Size) {
+		ForEach ($item in $safety.Size.Breakdown) {
+			Write-Verbose "  $($Path)\$($item.Name) = $('{0:N3}' -f $item.SizeGB) GB in $($item.FileCount) file(s)"
+		}
+	}
+
+	if (-not $safety.IsSafe) {
+		$outcome.Reason = (@($safety.Blockers) -join '; ')
+		Write-Host "  Decision: SKIP $Path -- $($outcome.Reason)" -ForegroundColor Yellow
+		Write-Host "  Left in place: $('{0:N2}' -f $outcome.MeasuredGB) GB" -ForegroundColor Yellow
+		return $outcome
+	}
+
+	Write-Host "  Decision: DELETE $Path -- all safety checks passed ($('{0:N2}' -f $outcome.MeasuredGB) GB measured)" -ForegroundColor Cyan
+	$freeBefore = Get-FreeSpaceGB
+	$removal = Remove-OemRecoveryFolder -Path $Path
+	$outcome.Removal = $removal
+	$outcome.ReclaimedGB = [math]::Round((Get-FreeSpaceGB) - $freeBefore, 2)
+
+	if ($removal.Verified) {
+		$outcome.Decision = "Deleted"
+		$outcome.Reason = "all safety checks passed; $('{0:N2}' -f $outcome.MeasuredGB) GB measured, $('{0:N2}' -f $outcome.ReclaimedGB) GB reclaimed"
+		Write-Host "  $Path removed. Measured $('{0:N2}' -f $outcome.MeasuredGB) GB, reclaimed $('{0:N2}' -f $outcome.ReclaimedGB) GB from $($removal.ItemsDeleted) file(s)." -ForegroundColor Green
+	} else {
+		$outcome.Decision = "Partial"
+		$outcome.Reason = "$($removal.ItemsFailed) item(s) could not be deleted; $('{0:N2}' -f $outcome.ReclaimedGB) GB reclaimed"
+		Write-Host "  $Path still exists after cleanup. Deleted $($removal.ItemsDeleted) file(s), failed on $($removal.ItemsFailed). Reclaimed $('{0:N2}' -f $outcome.ReclaimedGB) GB." -ForegroundColor Red
+		if ($removal.Error) { Write-Host "  Last error: $($removal.Error)" -ForegroundColor Red }
+	}
+	return $outcome
+}
+
+#endregion OEM Recovery Folder (C:\Recovery) Helpers
 
 #endregion Helper Functions
 
@@ -243,43 +1070,6 @@ Function Remove-DuplicateDrivers {
 	}
 }
 
-Function Remove-StaleProfiles {
-	$thresholdDays = 731 #Days
-	Write-Host "Checking for stale profiles to clean up"
-	# Get a list of user profiles
-	$profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$thresholdDays) } | Where-Object { $_.Loaded -eq $False } | Where-Object { $_.LocalPath -notmatch 'Remote Support|admin' }
-	If ($profiles) {
-		foreach ($profile in $profiles) {
-			$localPath = $profile.LocalPath
-			Write-Host "Assessing $localPath"
-			$directories = Get-ChildItem -Path $localPath -Directory
-			if ($directories.Count -gt 0) {
-				# Find the most recently modified directory
-				$mostRecentDir = $directories | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-				# Calculate the age in days
-				$ageInDays = (Get-Date) - $mostRecentDir.LastWriteTime
-				Write-Host "$($mostRecentDir.FullName) was most recently updated $([int]$ageInDays.TotalDays) days ago."
-				If ($ageInDays.TotalDays -gt 360) {
-					Write-Host "Deleting $localPath (Last modified: $($mostRecentDir.LastWriteTime))"
-					Write-Host "Deleting inactive profile: $($profile.LocalPath) (SID: $($profile.SID))"
-					$targetSID = $profile.SID
-					$targetPath = $profile.LocalPath
-					# Remove-CimInstance on Win32_UserProfile handles registry + files
-					Remove-CimInstance $profile -Verbose -Confirm:$false
-					Write-Host "Profile $targetSID removed via WMI."
-					# Fallback: force-remove leftover files if WMI didn't fully clean up
-					if (Test-Path $targetPath) {
-						Remove-PathForcefully -Path $targetPath
-						Write-Host "Cleaned up leftover files at $targetPath"
-					}
-				}
-			}
-		}
-	} Else {
-		Write-Host "No profiles older than $thresholdDays days found."
-	}
-}
-
 #endregion Existing Functions
 
 ########################################
@@ -345,6 +1135,20 @@ Write-StepStatus -StepName "Delete Windows upgrade remnants" -Start
 }
 Write-StepStatus -StepName "Delete Windows upgrade remnants"
 
+# --- Remove Dell SupportAssist (standing order; Dell Command Update is the replacement) ---
+# Runs before the C:\Recovery step so that removing it in this pass also clears the SupportAssist
+# blocker in front of that cleanup.
+Write-StepStatus -StepName "Remove Dell SupportAssist" -Start
+$SupportAssistResult = Invoke-DellSupportAssistRemoval
+Write-StepStatus -StepName "Remove Dell SupportAssist" -Decision $SupportAssistResult.Decision -Reason $SupportAssistResult.Reason
+
+# --- Delete C:\Recovery OEM push-button-reset folder when safe (1-20+ GB on OEM images) ---
+# This is the OEM extensibility folder on the OS volume, not the hidden WinRE partition. Machines
+# where WinRE or a BCD entry actually lives in C:\Recovery are detected and left untouched.
+Write-StepStatus -StepName "OEM Recovery folder (C:\Recovery)" -Start
+$RecoveryFolderResult = Invoke-OemRecoveryFolderCleanup
+Write-StepStatus -StepName "OEM Recovery folder (C:\Recovery)" -Decision $RecoveryFolderResult.Decision -Reason $RecoveryFolderResult.Reason
+
 # --- WinSxS cleanup via DISM (1-5+ GB) ---
 Write-StepStatus -StepName "WinSxS cleanup (DISM)" -Start
 Write-Host "Reducing the size of the WinSxS folder"
@@ -366,7 +1170,11 @@ Write-StepStatus -StepName "Disable Reserved Storage"
 # --- Remove stale user profiles (multi-GB per profile) ---
 Write-StepStatus -StepName "Remove stale user profiles" -Start
 If ((Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Caption) -notlike "Microsoft Windows Server*") {
-	Remove-StaleProfiles
+	If (Get-Command -Name Remove-StaleProfiles -ErrorAction SilentlyContinue) {
+		Remove-StaleProfiles -Days 730 -Confirm:$false
+	} Else {
+		Write-Host "Remove-StaleProfiles not found. Load the toolbox first: irm ps.mauletech.com | iex" -ForegroundColor Yellow
+	}
 }
 Write-StepStatus -StepName "Remove stale user profiles"
 
@@ -429,7 +1237,7 @@ Write-StepStatus -StepName "Temp folder cleanup" -Start
 }
 Write-StepStatus -StepName "Temp folder cleanup"
 
-# --- Browser caches (Chrome, Edge, Firefox, IE — combined 1-5 GB) ---
+# --- Browser caches (Chrome, Edge, Firefox, IE - combined 1-5 GB) ---
 Write-StepStatus -StepName "Browser cache cleanup" -Start
 
 # Age-based browser cache cleanup
@@ -886,7 +1694,7 @@ Enable-NTFSCompression -Path "$Env:SystemRoot\Help"
 Write-StepStatus -StepName "NTFS Compression"
 
 ########################################
-# PHASE 6: EMERGENCY — Windows Search Index (only if <10 GB free)
+# PHASE 6: EMERGENCY - Windows Search Index (only if <10 GB free)
 ########################################
 
 $currentFreeGB = Get-FreeSpaceGB
@@ -923,11 +1731,21 @@ Write-Host -ForegroundColor Green "`nFreed up: ${FreedGB} GB"
 
 ## Per-step summary
 Write-Host "`n--- Space Freed Per Step ---" -ForegroundColor Cyan
-$Script:StepLog | Where-Object { $_.FreedGB -ne 0 } | Sort-Object FreedGB -Descending | Format-Table -Property @{
+$Script:StepLog | Where-Object { $_.FreedGB -ne 0 -or $_.Decision } | Sort-Object FreedGB -Descending | Format-Table -Property @{
 	Name = 'Step'; Expression = { $_.Step }; Width = 45
 }, @{
 	Name = 'Freed (GB)'; Expression = { '{0:N2}' -f $_.FreedGB }; Width = 12
+}, @{
+	Name = 'Decision'; Expression = { $_.Decision }; Width = 10
 } | Out-String | Write-Host
+
+# Steps that made a go/no-go decision explain it here, where the reason is not truncated.
+ForEach ($DecidedStep in @($Script:StepLog | Where-Object { $_.Decision })) {
+	$DecisionColor = "Yellow"
+	if (@('Deleted', 'Removed', 'NotPresent') -contains $DecidedStep.Decision) { $DecisionColor = "Green" }
+	if (@('Partial', 'Failed') -contains $DecidedStep.Decision) { $DecisionColor = "Red" }
+	Write-Host "  $($DecidedStep.Step) -> $($DecidedStep.Decision): $($DecidedStep.Reason)" -ForegroundColor $DecisionColor
+}
 
 $totalFreed = [math]::Round(($Script:StepLog | Measure-Object -Property FreedGB -Sum).Sum, 2)
 Write-Host "Total freed across all steps: ${totalFreed} GB" -ForegroundColor Green
@@ -938,8 +1756,8 @@ Write-Host $env:COMPUTERNAME
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBn/HfevKqYHcMq
-# aHl0T/3m01DmEW3OYjzyEknQtujQ+aCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAf66jCV6dRQBmc
+# yK2kV0rUxKXn16Z84NfFTQ+kClp6mKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -1040,44 +1858,44 @@ Write-Host $env:COMPUTERNAME
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -1121,33 +1939,33 @@ Write-Host $env:COMPUTERNAME
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IKSnlTyVABr0kLWxr3il2D+IFQXHG9LdEjP3n8NzW1UKMA0GCSqGSIb3DQEBAQUA
-# BIICAHKL9R2xHC2e6sqHZSoHyq6pnhlgBw9VsjqlxKTJZ2BnG8naXy+ad0Sw3BFR
-# r5zWum4YmxxuORCnRx+V8J8lNEN8duzeISptCsjctwRYuK3bKgGXw14S8O0FVhpH
-# 1HnMRjQEO2Gx+RHNEfNKxuwQ+GzAMHrnPJzKXLC7KvJKG+SyxegVEOiQOtm1xEI3
-# wfPqQt70JC7PS3HeuwH85tIntnPfLl+zx4D0C8FEDNZIjTtuhjqspPEiugDt0/FH
-# m51YmGpjkeZs8SAIlcQ4rp2Gd02Yi6pvSpZizfktGw2iIEQEJi9TLZdHdfkvJg9r
-# 5FFcbW0OSFVD5OPiFWJVgPDkqrIni2MYwelwfsaL6vB3GSuKfbLO5jZv57sWQ5lR
-# 5M0GJVNQZiV5ufO7cEari+yL+aRFTPjQ6jPx6BUjKNY9ak+JuhV3gCrVcwmSCyjq
-# i5JIotct+m0cIGU/86QG0aiCRa+JtV/+l6ltYGH/wFJ/JlaRXRWi1bOQPEr7IOQZ
-# Xwbwm6WzBH1NUXOXNFVOr7ixfS4n+gTSMmn2X7DoEfnGpoNHqjAYmB0RShhzOB1w
-# 5Ej8adaHCf/NM02G4UEuMT533kyrn+Wqd7oEMKOW1IZoDi9kbl3u6fHFl1KN+hyg
-# A+t8mlEW5hMwZIc6j1/0QnKZ6kptBolV7n1fEYGZjffsRa9RoYIDJjCCAyIGCSqG
+# IH2tJhd0Sh+mOccZa/iEV5fjaIa1Jz+ii4QJWFNVsxHNMA0GCSqGSIb3DQEBAQUA
+# BIICAGNJTuqQ4HzvFaGimaKZlbIkLSVUgA6dkUme86vHSG7kAN1NPdGiQZsSHPZw
+# 0a3z7Tdw/FiYrJZpWPQm91HzaGwN1g594W3CP7h8SMzkkXY/kPAGHWq1MvnQuUN/
+# tx3Qp7WJofPwk01lq+chbGUzcZ4VsPR+7XM2qcC3wQIYCljkvXqFJyY1P+df4c+Y
+# tExTvMbU6Ls/4jRJNCESgcxeNoZW+UndUI+/uvRqBDciAbUfE+1skqlH59gkEN+u
+# 77wysPeJ2UPFnHVXPneAxjnWtNbblC5BF1AL0Os8foWilPmSFsUde+hpX4bLDQmJ
+# /qX4pSfE1YzIQSTq6UCmgF0Ij5/nx3jakMJ+z6YDy2F/D7++HgYIPN7czrvA4608
+# 44YRO5v6rq0H+kXE/iBLHtjDs33Je3QIu3frqkiSTeXqAwXu04anRXe/VvaSJ4IM
+# bdxsd3a6W284MHJXu6HkgA3ElNhOYmuu1G6X8sUt8wnkmENKZ/vNUkQeZYvgpkJa
+# KKcPBOA7XBOuQX+QRCWkih8/xC0UHMPObNsw1h5fZ5hGAOLrG/2WuK9GxHZvT1A+
+# k1lpj2821/PeXYtWfVVeS8Rpu9FKm39U2F3ExiH/NupSzU+IrZxMoa6go0uV3D5B
+# 3iTcvf2hwXl4i02ES5cEf72d1qqyR/lkA/6ZLJZJfI9n+/w3oYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0N1owLwYJKoZIhvcNAQkEMSIEIBuPrFcd
-# Uds6v1kf6kqic65jS1TyKEbKGAuDnA5j9rslMA0GCSqGSIb3DQEBAQUABIICAGlH
-# dCchrCSc0tKNzfzl8piDuBpbo90dfuWNjw5i851LPprl6qCzSqaDShdxFlMKA9p7
-# SrUZCbP0MqHsBD5HRxeJU7V0RAZT8XNASD9UJNncnhbG0uZSi1imj3MTi0T4Srid
-# gubaxZYTe6g2FhsaquOiwPKnQFG9dLJVIGUezOBp2FO6dX60Zta1ED1uQVxsAJI2
-# ZZJ7BBaOuLdvTPou9usGdJ54XuoLTFQC1SI5qTNoR2ZF9bGEldSiP3bGjWgdF6iP
-# mvvhFFm+47c2IhVJD5RNWPQwJlkmIYO8dH1vaxeoOL0qDYAtzxf6MZqPTVawdzkH
-# D5X8Oa7+krKVPk1Kc8tajWAYGIcOSzcrzyP28h97lMTncTkp/vku9cB5GjQzSk5p
-# g6XtwZUvkmoZLt7sD7omHUBdZSz6vOFsZgoo3XzjqFXHyuTliZG5DcoHPoeG/qIJ
-# 9BK3+xOGtTHO9qnab9+ItucySoRL8hQHxF+TtOYvqyuZOGdiroMKp08reuNa/8D3
-# EehrgsEIbL10+2GtmHPXnF5cG0lW5fGXrEAi9XIh4Pz/IXtfIO8GwoFS9TvV8TyI
-# LexAhj2nRZfedvhhjTNqwkFKVrmC7xSNG1RnhIx91+38/a0s7tXcXfzHHChND6NE
-# N/gspQHhQsGDxQ+4Oi0Or5Wvlf0Gan5FkucWqXr3
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgyMFowLwYJKoZIhvcNAQkEMSIEIFwkpww7
+# RtHMEdic/MBcpwTcx3af4pkroDquirW1I56cMA0GCSqGSIb3DQEBAQUABIICACX8
+# WseCcNXtcpJ2lH+Z9ExCTnP8/2EVpYxgBpv5d9waf+MvmZU3nIKvm7U7Cwl8fylw
+# xyBORG/CUHb3l4BKa6RRvo6bIQsvmCy9FEaPKogticDkpjYHTUaRDrNVUM1sCWyL
+# qTy24RnwdkIGzRr6y44bLU2MRCFU6HyJHoxn8C2vi1mmZHvV2U6tLDKZ0jrzo9Tt
+# 8kfVwGC2mgs5kiVOvqZWkht1qkH0+qcrEOODZXZiHAhHyOcXe5iK4jvzgIQou7hu
+# eAd04MgtbmswIdmXU090wNSvL1bvfny9Kitin5dQ1LiSWdUq5j7cD8xExJmCaa41
+# woHHxuTgfRLwKaG9r6j6YWuAJojTMJAX5fdiyvYFdWHIqPbBdLgyGG5nDvmN+76U
+# VINkUBWBs3son/DkuKy/46DqEGlSSi6URDX9zOckTiOANqoSWr/hUNMyj5CJuUll
+# 0Za1KOKwWrhD9IYsG7GgUqGTStPPfORwX4Xb4QlJf/R9bJk1g7oExMEyVSs0YWMF
+# vwx4lj4zbwGNkVDVnWmoRRiPQIL/xICt0e1n7715xqlvb3y05YzpQrrROtkhkIN4
+# 5Qda5m/iAHQg3g3gXv3qPxGBCKE7M+LFlbzOobXBbo+tWaru915FZ4ZDDWKmvpK3
+# Enb6bl8+ahy7tgna6fv3+xF9xb2KIKPrcZ6mi8Ml
 # SIG # End signature block

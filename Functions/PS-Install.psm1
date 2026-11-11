@@ -10,6 +10,9 @@ Function Install-Action1 {
 		The password to decrypt the Action1 site configuration file
 	.Notes
 		Use Protect-ConfigFile to encrypt an updated Action1.csv before uploading to BinCache.
+		Action1.csv columns: Code, Site, Url. Url is the full agent MSI download link
+		for that organization, copied from the Action1 console (Agents > Download),
+		since Action1 assigns each org its own regional download server.
 	#>
 
 	###Require -RunAsAdministrator
@@ -43,10 +46,10 @@ Function Install-Action1 {
 			$Silent = $True
 		}
 
-		if ([String]::IsNullOrEmpty(($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID)) {
+		if ([String]::IsNullOrEmpty(($SiteConfigs | Where-Object { $_.Code -eq $Code }).Url)) {
 			# Always display the available site codes before prompting
 			Write-Host "`nAvailable Site Codes:" -ForegroundColor Cyan
-			$SiteConfigs | Where-Object -Property GUID -ne "" | Select-Object Code, Site | Format-Table -AutoSize
+			$SiteConfigs | Where-Object -Property Url -ne "" | Select-Object Code, Site | Format-Table -AutoSize
 
 			# Ensure $Code is provided and valid
 			while ($null -eq $Code -or -not ($SiteConfigs | Where-Object { $_.Code -eq $Code })) {
@@ -58,9 +61,8 @@ Function Install-Action1 {
 		}
 
 		# Proceed with installation after validation
-		$MSIUrl = 'https://app.action1.com/agent/'
-		$GUID = ($SiteConfigs | Where-Object { $_.Code -eq $Code }).GUID
-		$InstallURL = $MSIUrl + $GUID + "/Windows/Action1agent($Code).msi"
+		$SiteConfig = $SiteConfigs | Where-Object { $_.Code -eq $Code }
+		$InstallURL = $SiteConfig.Url
 		$Action1Installer = Get-FileDownload -URL $InstallURL -SaveToFolder $ITFolder\Action1Patches
 		$msiPath = $Action1Installer[1]
 		$arguments = "/i `"$msiPath`" /quiet /norestart"
@@ -202,27 +204,6 @@ function Install-ClaudeCode {
 		Write-Host "[!] Installation failed: $_" -ForegroundColor Red
 		return $false
 	}
-}
-
-Function Install-ITS247Agent {
-	If ($SiteCode -and !$IAmJOB) {
-		Start-Job -Name "InstallAgent" -InitializationScript {
-			$progressPreference = 'silentlyContinue'
-			irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-		} -ScriptBlock {
-			$global:SiteCode = $using:SiteCode
-			$global:IAmJOB = $True
-			irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-			Install-ITS247Agent
-		} | Receive-Job -Wait #-AutoRemoveJob
-	} ElseIf (($SiteCode -and $IAmJOB) -or (!$SiteCode -and !$IAmJOB)) {
-		Write-Host "I'm running as a job!"
-		$progressPreference = 'silentlyContinue'
-		Set-ExecutionPolicy Bypass -Scope Process -Force
-		irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex
-		Invoke-WebRequest https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/ITS247Agent/Install_ITS247_Agent_MSI.txt -UseBasicParsing | Invoke-Expression
-	} ElseIf (!$SiteCode -and $IAmJOB) {Write-Warning "You can't run the installer as job without specifying the SiteCode Variable. You can't interact with a job."}
-
 }
 
 Function Install-NetExtender {
@@ -516,7 +497,8 @@ Function Install-ScreenConnect {
 	.Description
 		Installs ScreenConnect Remote Support Software from MauleTech BinCache
 	.Parameter Force
-		Installs ScreenConnect even if the service is already present.
+		Reinstalls ScreenConnect even if the MauleTech instance is already present.
+		Other ScreenConnect instances on the machine are ignored when deciding whether to install.
 	.NOTES
 		Downloads and installs the ScreenConnect client from:
 		https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi
@@ -528,17 +510,20 @@ Function Install-ScreenConnect {
 
 	if (-not $Global:ITFolder) { $Global:ITFolder = "$env:SystemDrive\IT" }
 
-	# Check if ScreenConnect is already installed by looking for the service
-	$ExistingService = Get-Service -Name "ScreenConnect Client*" -ErrorAction SilentlyContinue
+	# Only the MauleTech instance counts; other ScreenConnect instances may be installed on the machine
+	$InstanceId = 'f07df9e5f6734da4'
+	$ServiceName = "ScreenConnect Client ($InstanceId)"
+	$ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+	Write-Verbose "Looking for service '$ServiceName'. Found: $([bool]$ExistingService)"
 	If ($Force -or -not $ExistingService) {
 		If ($Force -and $ExistingService) {
-			Write-Host "Force flag specified. Installing ScreenConnect." -ForegroundColor Yellow
+			Write-Host "Force flag specified. Reinstalling ScreenConnect." -ForegroundColor Yellow
 		}
 		Write-Host "Installing ScreenConnect Remote Support Software." -ForegroundColor Green
 
 		# Direct URL to the ScreenConnect MSI
 		$InstallURL = 'https://github.com/MauleTech/BinCache/raw/refs/heads/main/ScreenConnect.ClientSetup%20(MauleTech).msi'
-		$InstallHash = '4FB543702793D708227598B1FBA36443DB5B60607818C60B1791C2E286E4B64E'
+		$InstallHash = 'B681C26C3CFB8764C2F061AECB4FD46428A83994A026F78D4D679B2585B5088A'
 
 		Try {
 			# Download the installer using Get-FileDownload from MauleTech/PWSH
@@ -560,7 +545,7 @@ Function Install-ScreenConnect {
 			Write-Host "Error during ScreenConnect installation: $_" -ForegroundColor Red
 		}
 	} Else {
-		Write-Host "ScreenConnect service is already installed." -ForegroundColor Green
+		Write-Host "ScreenConnect service '$ServiceName' is already installed." -ForegroundColor Green
 	}
 }
 
@@ -644,6 +629,21 @@ Function Install-SophosConnect {
 }
 
 Function Install-SophosDnsCert {
+    <#
+    .SYNOPSIS
+    Installs the Sophos root and SSL inspection CA certificates.
+    .DESCRIPTION
+    Installs the Sophos Internet Protection Root CA and the Sophos firewall SSL inspection
+    CA certificates (PHX and ABQ data centers) from OneOffs\Sophos_certificate.pem into the
+    LocalMachine Root store. Only missing certificates are installed unless -Force is used.
+    Also enables the Windows trust store in Firefox when Firefox is installed.
+    .PARAMETER Force
+    Reinstall all certificates in the PEM bundle even if they are already present.
+    .EXAMPLE
+    Install-SophosDnsCert
+    .EXAMPLE
+    Install-SophosDnsCert -Force
+    #>
     [CmdletBinding()]
     param(
         [switch]$Force
@@ -651,8 +651,9 @@ Function Install-SophosDnsCert {
 
     Write-Host "Checking Root Certificates"
     $expectedThumbprints = @(
-        "F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD"  # Sophos cert expiring 2036
-        "BCDD30059715B32E64B79DBC37688C60CEF4F965" #PHX DataCenter early 2026
+        "F415AEF803CE13AF11AD14FE5D38F9CF2D91C6CD" # Sophos Internet Protection Root CA, expires 2044
+        "BCDD30059715B32E64B79DBC37688C60CEF4F965" # PHX DataCenter SSL CA (CA_yxwlRPvOh3TSWki), expires 2036
+        "80521857332C512366DBD96B910ADA93E9A42DC6" # ABQ DataCenter SSL CA (CA_pQmJJzMk8nRoDQm), expires 2036
 		# Add more thumbprints here as needed
     )
 
@@ -1164,10 +1165,10 @@ Function Install-UmbrellaDNSasJob {
 		###Require -RunAsAdministrator
 	[cmdletbinding()]
 	param(
-		[string]$Code #Shortcode of the site you want to install, list available at https://github.com/MauleTech/PWSH/blob/master/Scripts/ITS247Agent/SiteAgentURLs.csv
+		[string]$Code #Shortcode of the site you want to install, list available at Scripts/Umbrella/UDNS-Client-Mapping.csv
 	)
 	$SiteConfigs = @()
-	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/master/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
+	$SiteConfigs = (Invoke-WebRequest -uri "https://raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/Scripts/Umbrella/UDNS-Client-Mapping.csv" -Headers @{"Cache-Control"="no-cache"} -UseBasicParsing).Content | convertfrom-csv -Delimiter ','
 	$MSIUrl = 'https://files.mauletech.com/Software/cisco-secure-client-win-5.1.9.113-predeploy-k9.zip?dl'
 	
 	Write-Host "Checking Status Indicator"
@@ -1463,131 +1464,484 @@ Function Install-UmbrellaDnsCert {
 	}
 }
 
+Function Install-WindowsMcpPrereqs {
+	<#
+	.SYNOPSIS
+		Installs the Windows-MCP prerequisites (Python 3.13+ and uv) for all users on this machine.
+	.DESCRIPTION
+		Python is installed machine-wide (C:\Program Files\Python313) with winget using --scope machine.
+		The Python folder and its Scripts folder are added to the Machine PATH if they are missing.
+
+		uv is installed to C:\Program Files\uv from the latest astral-sh/uv GitHub release for the
+		native OS architecture. The release zip is checked against the SHA256 file published with the
+		same release before uv.exe, uvx.exe and uvw.exe are extracted, and the folder is then added to
+		the Machine PATH. (The default uv installer is per-user only, and it does not verify its download.)
+		Because this is an unmanaged install, "uv self update" is disabled. Re-run with -Force to update uv.
+
+		Safe to re-run. Supports -WhatIf. Must run from an elevated 64-bit PowerShell session, either as an
+		administrator or as SYSTEM from an RMM. If winget is missing, Install-WinGet is tried first, but that
+		only works for a logged-on administrator, not for SYSTEM.
+	.PARAMETER PythonId
+		The winget package ID used to install Python. Default: Python.Python.3.13
+	.PARAMETER MinPython
+		The lowest machine-wide Python version that counts as already installed. Default: 3.13
+	.PARAMETER UvDir
+		The folder uv is installed to and added to the Machine PATH. Default: C:\Program Files\uv
+		Use an admin-only folder, because any folder on the Machine PATH is trusted by every user.
+	.PARAMETER Force
+		Reinstall uv from the latest release even if uv.exe is already in UvDir.
+	.EXAMPLE
+		Install-WindowsMcpPrereqs
+		Installs Python 3.13 and uv for all users, skipping anything already installed.
+	.EXAMPLE
+		Install-WindowsMcpPrereqs -WhatIf
+		Shows what would be installed and which PATH entries would be added without changing anything.
+	.EXAMPLE
+		Install-WindowsMcpPrereqs -Force -Verbose
+		Updates uv to the latest release with detailed logging.
+	.OUTPUTS
+		PSCustomObject with Python, PythonPath, Uv, UvPath and PathChanged properties.
+	.LINK
+		https://docs.astral.sh/uv/getting-started/installation/
+	.LINK
+		https://learn.microsoft.com/en-us/windows/package-manager/winget/returnCodes
+	#>
+	[CmdletBinding(SupportsShouldProcess)]
+	Param(
+		[ValidateNotNullOrEmpty()][string]$PythonId = 'Python.Python.3.13',
+		[version]$MinPython = '3.13',
+		[ValidateNotNullOrEmpty()][string]$UvDir = (Join-Path -Path $env:ProgramFiles -ChildPath 'uv'),
+		[switch]$Force
+	)
+
+	Function Get-WinGetPath {
+		$Cmd = Get-Command -Name winget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+		If ($Cmd) { Return $Cmd.Source }
+		# winget is not on PATH for SYSTEM / RMM sessions, so look in the App Installer package folder.
+		# Folder names look like Microsoft.DesktopAppInstaller_1.29.70.0_x64__8wekyb3d8bbwe, so sort by the parsed version.
+		$Hit = Get-ChildItem -Path "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+			Sort-Object -Descending -Property @{ Expression = {
+				$V = $null
+				If ([version]::TryParse(($_.Directory.Name -split '_')[1], [ref]$V)) { $V } Else { [version]'0.0' }
+			} } | Select-Object -First 1
+		If ($Hit) { Return $Hit.FullName }
+	}
+
+	Function Get-MachinePython {
+		Param([version]$Minimum)
+		$Root = 'HKLM:\SOFTWARE\Python\PythonCore'
+		If (-not (Test-Path -Path $Root)) { Return }
+		Get-ChildItem -Path $Root -ErrorAction SilentlyContinue | ForEach-Object {
+			# PEP 514 tags look like 3.13 or 3.13-arm64. Free-threaded tags (3.13t) do not parse and are skipped.
+			$Ver = $null
+			If ([version]::TryParse(($_.PSChildName -replace '-.*$', ''), [ref]$Ver) -and $Ver -ge $Minimum) {
+				$Ip = Get-ItemProperty -Path "$($_.PSPath)\InstallPath" -ErrorAction SilentlyContinue
+				# ExecutablePath is optional in PEP 514, so fall back to python.exe in the default value
+				$Exe = If ($Ip.ExecutablePath) { $Ip.ExecutablePath } ElseIf ($Ip.'(default)') { Join-Path -Path $Ip.'(default)' -ChildPath 'python.exe' }
+				If ($Exe -and (Test-Path -Path $Exe -PathType Leaf)) {
+					[pscustomobject]@{ Version = $Ver; Exe = $Exe; Dir = (Split-Path -Path $Exe -Parent) }
+				}
+			}
+		} | Sort-Object -Property Version -Descending | Select-Object -First 1
+	}
+
+	Function Add-MachinePath {
+		[CmdletBinding(SupportsShouldProcess)]
+		Param([Parameter(Mandatory = $true)][string]$Dir)
+		$Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+		# Read the raw value so %SystemRoot% style entries are preserved when writing it back
+		$Raw = (Get-Item -Path $Key).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+		$Parts = @($Raw -split ';' | Where-Object { $_ })
+		# Compare expanded values so an existing %ProgramFiles%\uv entry is not duplicated as C:\Program Files\uv
+		$Target = [Environment]::ExpandEnvironmentVariables($Dir).TrimEnd('\')
+		If ($Parts | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') -ieq $Target }) {
+			Write-Verbose "Already in Machine PATH: $Dir"
+			Return $false
+		}
+		If (-not $PSCmdlet.ShouldProcess($Dir, 'Add to Machine PATH')) { Return $false }
+		Set-ItemProperty -Path $Key -Name Path -Value (($Parts + $Dir) -join ';') -Type ExpandString -Confirm:$false -ErrorAction Stop
+		If (($env:Path -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $Target) { $env:Path = "$env:Path;$Dir" }
+		Write-Host "Added to Machine PATH: $Dir" -ForegroundColor Green
+		Return $true
+	}
+
+	Function Install-UvRelease {
+		Param([Parameter(Mandatory = $true)][string]$Destination)
+		# .NET method failures (network, locked files) are only statement-terminating by default; make them stop the install
+		$ErrorActionPreference = 'Stop'
+		# Use the native OS architecture; $env:PROCESSOR_ARCHITECTURE reports AMD64 inside x64 emulation on ARM64
+		$NativeArch = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
+		$Triple = Switch ($NativeArch) { 'AMD64' {'x86_64'} 'ARM64' {'aarch64'} 'x86' {'i686'} Default {$null} }
+		If (-not $Triple) { Throw "Unsupported processor architecture for uv: $NativeArch" }
+		$Asset = "uv-$Triple-pc-windows-msvc.zip"
+
+		# Resolve the latest tag first so the zip and its checksum come from the same release
+		$Request = [System.Net.WebRequest]::Create('https://github.com/astral-sh/uv/releases/latest')
+		$Response = $Request.GetResponse()
+		Try { $Tag = $Response.ResponseUri.Segments[-1] } Finally { $Response.Dispose() }
+		If ($Tag -notmatch '^\d+\.\d+\.\d+$') { Throw "Unexpected uv release tag: $Tag" }
+		$BaseUrl = "https://github.com/astral-sh/uv/releases/download/$Tag"
+
+		$TempFolder = Join-Path -Path $env:TEMP -ChildPath ('UvInstall_' + [guid]::NewGuid().ToString('N'))
+		$null = New-Item -Path $TempFolder -ItemType Directory -Force -Confirm:$false
+		$OldProgressPreference = $ProgressPreference
+		$ProgressPreference = 'SilentlyContinue'
+		Try {
+			$ZipPath = Join-Path -Path $TempFolder -ChildPath $Asset
+			$ShaPath = "$ZipPath.sha256"
+			Write-Host "Downloading uv $Tag ($Asset)" -ForegroundColor Cyan
+			Invoke-WebRequest -Uri "$BaseUrl/$Asset" -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
+			Invoke-WebRequest -Uri "$BaseUrl/$Asset.sha256" -OutFile $ShaPath -UseBasicParsing -ErrorAction Stop
+
+			If ((Get-Content -Path $ShaPath -Raw) -notmatch '^\s*([0-9a-fA-F]{64})\b') { Throw "Could not read the SHA256 checksum for $Asset" }
+			$Expected = $Matches[1]
+			$Actual = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash
+			If ($Actual -ne $Expected) { Throw "SHA256 mismatch for $Asset. Expected $Expected, got $Actual" }
+			Write-Verbose "SHA256 verified for ${Asset}: $Actual"
+
+			Add-Type -AssemblyName System.IO.Compression.FileSystem
+			$Zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+			Try {
+				$null = New-Item -Path $Destination -ItemType Directory -Force -Confirm:$false
+				ForEach ($Bin in 'uv.exe', 'uvx.exe', 'uvw.exe') {
+					# Match on the file name only and write to a fixed path, so zip entry paths cannot escape $Destination
+					$Entry = $Zip.Entries | Where-Object { $_.Name -ieq $Bin } | Select-Object -First 1
+					If (-not $Entry) {
+						If ($Bin -eq 'uv.exe') { Throw "uv.exe was not found in $Asset" }
+						Write-Verbose "$Bin was not found in $Asset, skipping it."
+						Continue
+					}
+					Try {
+						[System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, (Join-Path -Path $Destination -ChildPath $Bin), $true)
+					} Catch {
+						Throw "Could not write $Bin to $Destination. Close anything running uv or uvx (such as Claude Desktop) and try again. $($_.Exception.Message)"
+					}
+					Write-Verbose "Extracted $Bin to $Destination"
+				}
+			} Finally {
+				$Zip.Dispose()
+			}
+		} Finally {
+			$ProgressPreference = $OldProgressPreference
+			Remove-Item -Path $TempFolder -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+		}
+	}
+
+	$Principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+	If (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Throw 'Run this from an elevated PowerShell session.'
+	}
+	# Some RMM agents launch 32-bit PowerShell, which sees the 32-bit registry and Program Files (x86)
+	If ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+		Throw "Run this from 64-bit PowerShell. From a 32-bit host, use $env:SystemRoot\sysnative\WindowsPowerShell\v1.0\powershell.exe"
+	}
+	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+	$PathChanged = $false
+
+	# ---- Python (machine-wide) ----
+	$Py = Get-MachinePython -Minimum $MinPython
+	If ($Py) {
+		Write-Host "Python $($Py.Version) already installed machine-wide: $($Py.Dir)" -ForegroundColor Green
+	} ElseIf ($PSCmdlet.ShouldProcess($PythonId, 'winget install (scope machine)')) {
+		$WinGet = Get-WinGetPath
+		$IsSystem = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
+		If (-not $WinGet -and -not $IsSystem -and (Get-Command -Name Install-WinGet -ErrorAction SilentlyContinue)) {
+			Write-Host 'winget not found, trying Install-WinGet...' -ForegroundColor Yellow
+			Install-WinGet
+			$WinGet = Get-WinGetPath
+		}
+		If (-not $WinGet) { Throw 'winget is not available. Run Install-WinGet as a logged-on administrator first.' }
+
+		Write-Host "Installing $PythonId for all users..." -ForegroundColor Cyan
+		& $WinGet install --id $PythonId --exact --source winget --scope machine --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Host
+		# -1978335189 (0x8A15002B) = no applicable update, -1978335135 (0x8A150061) = package already installed
+		If ($LASTEXITCODE -notin 0, -1978335189, -1978335135) { Throw "winget exited with code $LASTEXITCODE" }
+
+		$Py = Get-MachinePython -Minimum $MinPython
+		If (-not $Py) {
+			Throw "Python $MinPython or newer was not found in HKLM after the install. If winget reported it as already installed, it may be a per-user install."
+		}
+		Write-Host "Python $($Py.Version) installed: $($Py.Dir)" -ForegroundColor Green
+	}
+	If ($Py) {
+		# The winget manifest passes PrependPath=1, but verify rather than assume
+		If (Add-MachinePath -Dir $Py.Dir) { $PathChanged = $true }
+		If (Add-MachinePath -Dir (Join-Path -Path $Py.Dir -ChildPath 'Scripts')) { $PathChanged = $true }
+	}
+
+	# ---- uv (machine-wide) ----
+	$UvExe = Join-Path -Path $UvDir -ChildPath 'uv.exe'
+	If ((Test-Path -Path $UvExe) -and -not $Force) {
+		Write-Host "uv already installed: $UvExe (use -Force to update)" -ForegroundColor Green
+	} ElseIf ($PSCmdlet.ShouldProcess($UvDir, 'Install uv from the latest GitHub release')) {
+		Install-UvRelease -Destination $UvDir
+		If (-not (Test-Path -Path $UvExe)) { Throw "uv.exe was not found in $UvDir after the install." }
+		Write-Host "uv installed: $UvExe" -ForegroundColor Green
+	}
+	If (Test-Path -Path $UvExe) {
+		If (Add-MachinePath -Dir $UvDir) { $PathChanged = $true }
+	}
+
+	# ---- Verify ----
+	$PyVer = If ($Py) { & $Py.Exe --version } Else { $null }
+	$UvVer = If (Test-Path -Path $UvExe) { & $UvExe --version } Else { $null }
+	If ($PathChanged) {
+		Write-Host 'Machine PATH changed. Users must sign out and back in (or restart Claude Desktop from a fresh session) to pick it up.' -ForegroundColor Yellow
+	}
+	[pscustomobject]@{
+		Python      = "$PyVer"
+		PythonPath  = If ($Py) { $Py.Exe } Else { $null }
+		Uv          = "$UvVer"
+		UvPath      = If (Test-Path -Path $UvExe) { $UvExe } Else { $null }
+		PathChanged = $PathChanged
+	}
+}
+
 Function Install-WinGet {
 	<#
-		.SYNOPSIS
-			Installs winget, Microsoft's answer to apt-get and choco.
-		.LINK
-			https://github.com/microsoft/winget-cli
-		.LINK
-			https://docs.microsoft.com/en-us/windows/package-manager/winget/
+	.SYNOPSIS
+		Installs or updates winget (App Installer) and the framework packages it depends on.
+	.DESCRIPTION
+		Looks up the latest winget-cli release on GitHub and reads its
+		DesktopAppInstaller_Dependencies.json to learn which framework packages that
+		release requires (as of v1.29: Microsoft.VCLibs.140.00,
+		Microsoft.VCLibs.140.00.UWPDesktop and Microsoft.WindowsAppRuntime.1.8).
+		Any dependency that is missing or older than required is installed from the
+		release's DesktopAppInstaller_Dependencies.zip for the native OS architecture,
+		then the App Installer msixbundle is installed.
+		When run elevated, App Installer is also provisioned for all users with the
+		release's license file. This is required on Windows Server and LTSC, where
+		there is no Store license and winget otherwise fails with
+		"No applicable app licenses found".
+		App Installer is a per-user AppX package, so this must run as the logged-on
+		desktop user. It cannot run as SYSTEM.
+	.PARAMETER Force
+		Reinstall the latest winget even if the installed version is already current.
+	.EXAMPLE
+		Install-WinGet
+		Installs winget if missing, or updates it if older than the latest GitHub release.
+	.EXAMPLE
+		Install-WinGet -Force -Verbose
+		Reinstalls the latest winget and any missing dependencies with detailed logging.
+	.LINK
+		https://github.com/microsoft/winget-cli
+	.LINK
+		https://learn.microsoft.com/en-us/windows/package-manager/winget/
 	#>
-	
-		$GetWinGet = {
-			$url = 'https://github.com/microsoft/winget-cli/releases/latest'
-			$request = [System.Net.WebRequest]::Create($url)
-			$response = $request.GetResponse()
-			$realTagUrl = $response.ResponseUri.OriginalString
-			$version = $realTagUrl.split('/')[-1].Trim('v')
-			#$version
-			$fileName = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
-			$realDownloadUrl = $realTagUrl.Replace('tag', 'download') + '/' + $fileName
-			Write-Host "Installing the latest version of winget from:`n $realDownloadUrl"
-			$DownloadLocation = $($env:temp)
-			Write-Host "Downloading Desktop App Installer"
-			If (-not (Get-Command -Name "Get-FileDownload" -ErrorAction SilentlyContinue)) {irm raw.githubusercontent.com/MauleTech/PWSH/refs/heads/main/LoadFunctions.txt | iex}
-			$DownloadFileInfo = Get-FileDownload -URL $realDownloadUrl -SaveToFolder $($env:temp)
-			$DownloadFilePath = $DownloadFileInfo[-1]
-			Add-AppxPackage -Path $DownloadFilePath -ForceApplicationShutdown -InstallAllResources -Verbose
-			#& $($Env:LOCALAPPDATA + "\Microsoft\WindowsApps\winget.exe") source reset w
-			#& $($Env:LOCALAPPDATA + "\Microsoft\WindowsApps\winget.exe") source add --name winget --arg https://winget.azureedge.net/cache --type Microsoft.PreIndexed.Package
-			Remove-Item -Path $DownloadFilePath -Force -ErrorAction SilentlyContinue
-		}
-	
-		$GetWinGetDependancies = {
-			Write-Host "Checking Dependancies"
-			## C++ Runtime framework packages for Desktop Bridge - https://docs.microsoft.com/en-us/troubleshoot/cpp/c-runtime-packages-desktop-bridge#how-to-install-and-update-desktop-framework-packages
-			## x86 version
-			$Installed_X86_VCLibs = Get-AppxPackage | Where-Object {$_.Name -Match "Microsoft.VCLibs.140.00.UWPDesktop" -and $_.Architecture -Match "X86"}
-			If (-not ($Installed_X86_VCLibs)) {
-				$DownloadURL = 'https://aka.ms/Microsoft.VCLibs.x86.14.00.Desktop.appx'
-				$DownloadLocation = "$env:TEMP\"
-				$LocalFilePath = Join-Path -Path $DownloadLocation -ChildPath "Microsoft.VCLibs.x86.14.00.Desktop.appx"
-				If (Test-Path $LocalFilePath) {Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue}
-				Write-Host "Downloading $DownloadURL"
-				$progressPreference = 'silentlyContinue'
-				Invoke-WebRequest -Uri $DownloadURL -OutFile $LocalFilePath
-				If ($PSVersionTable.PSEdition -eq "Core") {Import-module "Appx" -UseWindowsPowerShell}
-				Write-Host "Installing $LocalFilePath"
-				Add-AppxPackage -Path $LocalFilePath -ForceApplicationShutdown -InstallAllResources -Verbose
-				Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue
-			}
-			## x64 version
-			If ([Environment]::Is64BitOperatingSystem){
-				$Installed_X64_VCLibs = Get-AppxPackage | Where-Object {$_.Name -Match "Microsoft.VCLibs.140.00.UWPDesktop" -and $_.Architecture -Match "X64"}
-				If (-not ($Installed_X64_VCLibs)) {
-					$DownloadURL = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
-					$DownloadLocation = "$env:TEMP\"
-					$LocalFilePath = Join-Path -Path $DownloadLocation -ChildPath "Microsoft.VCLibs.x64.14.00.Desktop.appx"
-					If (Test-Path $LocalFilePath) {Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue}
-					Write-Host "Downloading $DownloadURL"
-					$progressPreference = 'silentlyContinue'
-					Invoke-WebRequest -Uri $DownloadURL -OutFile $LocalFilePath
-					If ($PSVersionTable.PSEdition -eq "Core") {Import-module "Appx" -UseWindowsPowerShell}
-					Write-Host "Installing $LocalFilePath"
-					Add-AppxPackage -Path $LocalFilePath -ForceApplicationShutdown -InstallAllResources -Verbose
-					Remove-Item -Path $LocalFilePath -Force -ErrorAction SilentlyContinue
-				}
-			}
-			#Microsoft.UI.Xaml
-			$Providers = (Get-PackageProvider).Name
-			If ($Providers -NotContains "Nuget") {
-				Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force -ErrorAction SilentlyContinue
-			}
-						# Check if running in the desktop version of PowerShell
-			if ($PSVersionTable.PSEdition -eq "Desktop" -and (Get-Command -Name "Register-PackageSource" -ErrorAction SilentlyContinue)) {
-				Register-PackageSource -Name nuget.org -Location https://www.nuget.org/api/v2 -ProviderName NuGet -Trusted -Force
-				Write-Host "Registered nuget.org package source for desktop PowerShell."
-			} elseif ($PSVersionTable.PSEdition -eq "Core" -and (Get-Command -Name "Register-PackageSource" -ErrorAction SilentlyContinue)) {
-				Register-PackageSource -Name nuget.org -Location https://api.nuget.org/v3/index.json -ProviderName NuGet -Trusted -Force
-				Write-Host "Registered nuget.org package source for PowerShell Core."
-			} else {
-				Write-Host "Register-PackageSource cmdlet not found. Ensure you are running this script in a compatible PowerShell environment."
-			}
+	[CmdletBinding()]
+	Param(
+		[switch]$Force
+	)
 
-			Install-Package -Name 'Microsoft.UI.Xaml' -ProviderName Nuget -Force
+	Function Resolve-WinGetExe {
+		Param([string]$WindowsApps)
+		$Path = Join-Path -Path $WindowsApps -ChildPath 'winget.exe'
+		If (Test-Path -Path $Path) { Return $Path }
+		(Get-Command -Name winget -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+	}
+
+	Function Get-InstalledWinGetVersion {
+		Param([string]$WinGetExe)
+		If (-not $WinGetExe) { Return }
+		Try {
+			$Output = & $WinGetExe --version 2>$null
+			If ("$Output" -match '(\d+\.\d+\.\d+)') { [version]$Matches[1] }
+		} Catch {
+			Write-Verbose "Unable to run winget: $($_.Exception.Message)"
 		}
-	
-		If ($(whoami) -eq "nt authority\system") {
-			Write-Error "Due to the AppX nature of Winget, you cannot run this as the system user"
-		} ElseIf (!(Get-process -Name Explorer -IncludeUserName | Where-Object -Property UserName -EQ $(whoami))){
-			Write-Error "Due to the AppX nature of Winget, you cannot install WinGet when running the command as a user that is not logged in"
+	}
+
+	Function Save-WinGetAsset {
+		Param([string]$Url, [string]$Folder)
+		$FileName = $Url.Split('/')[-1]
+		$Path = Join-Path -Path $Folder -ChildPath $FileName
+		Write-Host "Downloading $Url"
+		If (Get-Command -Name Get-FileDownload -ErrorAction SilentlyContinue) {
+			$null = Get-FileDownload -URL $Url -SaveToFolder $Folder -FileName $FileName
 		} Else {
-	# Install WinGet
-		If (Get-Command winget -ErrorAction SilentlyContinue) {
-			Write-Host "WinGet is already installed."
-			$WGVersion = winget -v
-			
-			$url = 'https://github.com/microsoft/winget-cli/releases/latest'
-			$request = [System.Net.WebRequest]::Create($url)
-			$response = $request.GetResponse()
-			$realTagUrl = $response.ResponseUri.OriginalString
-			$WGLatestLink = $realTagUrl.split('/')[-1].Trim('v')
-			
-			If ($WGVersion -match $WGLatestLink) {
-				Write-Host "The installed version $WGVersion is up to date."
-				winget source update
+			Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -ErrorAction Stop
+		}
+		If (-not (Test-Path -Path $Path)) { Throw "Download failed: $Url" }
+		$Path
+	}
+
+	Function Get-WinGetLicenseUrl {
+		Param([string]$ReleaseUrl, [string]$Tag)
+		# The license file name contains a GUID that changes every release, so look it up
+		Try {
+			$Release = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/winget-cli/releases/tags/$Tag" -UseBasicParsing -ErrorAction Stop
+			$Name = ($Release.assets | Where-Object { $_.name -match '^[0-9a-fA-F]{32}_License1\.xml$' } | Select-Object -First 1).name
+		} Catch {
+			Write-Verbose "GitHub API lookup of the license file failed: $($_.Exception.Message)"
+		}
+		If (-not $Name) {
+			Try {
+				$Html = (Invoke-WebRequest -Uri "https://github.com/microsoft/winget-cli/releases/expanded_assets/$Tag" -UseBasicParsing -ErrorAction Stop).Content
+				If ($Html -match '([0-9a-fA-F]{32}_License1\.xml)') { $Name = $Matches[1] }
+			} Catch {
+				Write-Verbose "GitHub release page lookup of the license file failed: $($_.Exception.Message)"
+			}
+		}
+		If ($Name) { "$ReleaseUrl/$Name" }
+	}
+
+	# App Installer is a per-user AppX package, so it must be registered by the logged-on desktop user
+	$Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+	If ($Identity.User.Value -eq 'S-1-5-18') {
+		Write-Error "Due to the AppX nature of WinGet, you cannot install it as the SYSTEM user. Run this as the logged-on user."
+		Return
+	}
+	# GetOwnerSid does not need elevation for the caller's own processes (Get-Process -IncludeUserName does)
+	$ExplorerOwnerSids = ForEach ($Explorer in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue)) {
+		$Owner = Invoke-CimMethod -InputObject $Explorer -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+		If ($Owner.ReturnValue -eq 0) { $Owner.Sid }
+	}
+	If (@($ExplorerOwnerSids) -notcontains $Identity.User.Value) {
+		Write-Error "Due to the AppX nature of WinGet, you cannot install it as a user ($($Identity.Name)) that is not logged in to the desktop."
+		Return
+	}
+
+	If ([Environment]::OSVersion.Version.Build -lt 17763) {
+		Write-Error "WinGet requires Windows 10 1809 (build 17763) or later."
+		Return
+	}
+
+	# Use the native OS architecture; $env:PROCESSOR_ARCHITECTURE reports AMD64 inside x64 emulation on ARM64
+	$NativeArch = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
+	$Arch = Switch ($NativeArch) { 'AMD64' {'x64'} 'ARM64' {'arm64'} 'x86' {'x86'} Default {$null} }
+	If (-not $Arch) {
+		Write-Error "Unsupported processor architecture: $NativeArch"
+		Return
+	}
+
+	$IsAdmin = ([System.Security.Principal.WindowsPrincipal]$Identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+
+	If ($PSVersionTable.PSEdition -eq 'Core') {
+		# The Appx module fails to load natively in some PowerShell 7 releases; use the Windows PowerShell compatibility session
+		Import-Module -Name Appx -UseWindowsPowerShell -WarningAction SilentlyContinue
+		If ($IsAdmin) { Import-Module -Name Dism -UseWindowsPowerShell -WarningAction SilentlyContinue }
+	}
+
+	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+
+	Write-Host -ForegroundColor Cyan "Checking the latest WinGet release on GitHub"
+	Try {
+		$Request = [System.Net.WebRequest]::Create('https://github.com/microsoft/winget-cli/releases/latest')
+		$Response = $Request.GetResponse()
+		Try { $Tag = $Response.ResponseUri.Segments[-1] } Finally { $Response.Dispose() }
+	} Catch {
+		Write-Error "Unable to determine the latest WinGet release: $($_.Exception.Message)"
+		Return
+	}
+	If ($Tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+		Write-Error "Unexpected WinGet release tag: $Tag"
+		Return
+	}
+	$LatestVersion = [version]$Matches[1]
+	$ReleaseUrl = "https://github.com/microsoft/winget-cli/releases/download/$Tag"
+
+	$WindowsApps = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Microsoft\WindowsApps'
+	$WinGetExe = Resolve-WinGetExe -WindowsApps $WindowsApps
+	$InstalledVersion = Get-InstalledWinGetVersion -WinGetExe $WinGetExe
+
+	If ($InstalledVersion -and $InstalledVersion -ge $LatestVersion -and -not $Force) {
+		Write-Host -ForegroundColor Green "WinGet $InstalledVersion is installed and up to date."
+		& $WinGetExe source update | Out-Host
+		Return
+	} ElseIf ($InstalledVersion) {
+		Write-Host -ForegroundColor Yellow "WinGet $InstalledVersion is installed. Installing $LatestVersion."
+	} Else {
+		Write-Host -ForegroundColor Yellow "WinGet is not installed. Installing $LatestVersion."
+	}
+
+	$TempFolder = Join-Path -Path $env:TEMP -ChildPath ('WinGetInstall_' + [guid]::NewGuid().ToString('N'))
+	$null = New-Item -Path $TempFolder -ItemType Directory -Force
+	$OldProgressPreference = $ProgressPreference
+	$ProgressPreference = 'SilentlyContinue'
+	Try {
+		# The release publishes the exact framework packages it needs, so read them instead of hardcoding
+		$DepJson = Save-WinGetAsset -Url "$ReleaseUrl/DesktopAppInstaller_Dependencies.json" -Folder $TempFolder
+		$Dependencies = @((Get-Content -Path $DepJson -Raw | ConvertFrom-Json).Dependencies)
+		If ($Dependencies.Count -eq 0) { Throw "DesktopAppInstaller_Dependencies.json did not list any dependencies." }
+
+		Write-Host -ForegroundColor Cyan "Checking dependencies for $Arch"
+		$Missing = @(ForEach ($Dep in $Dependencies) {
+			$Present = Get-AppxPackage -Name $Dep.Name | Where-Object { "$($_.Architecture)" -eq $Arch -and [version]"$($_.Version)" -ge [version]$Dep.Version }
+			If ($Present) {
+				Write-Verbose "$($Dep.Name) $($Dep.Version) ($Arch) is already installed."
 			} Else {
-				Write-Host "The installed version $WGVersion is out of date."
-				If ($PSVersionTable.PSEdition -eq "Core") {Powershell.exe -NonInteractive -Command '$GetWinGetDependancies;$GetWinGet'} Else {$GetWinGetDependancies | IEX ; $GetWinGet | IEX}
-				$WGVersion2 = winget -v
-				If ($WGVersion -notmatch $WGVersion2) {
-					Write-Host "Winget $WGVersion2 installed successfully"
-				} Else {
-					Write-Error "Winget did not install successfully"
+				Write-Host -ForegroundColor Yellow "Missing dependency: $($Dep.Name) $($Dep.Version) ($Arch)"
+				$Dep
+			}
+		})
+
+		$DepPaths = @()
+		If ($Missing.Count -gt 0) {
+			$DepZip = Save-WinGetAsset -Url "$ReleaseUrl/DesktopAppInstaller_Dependencies.zip" -Folder $TempFolder
+			Add-Type -AssemblyName System.IO.Compression.FileSystem
+			$Zip = [System.IO.Compression.ZipFile]::OpenRead($DepZip)
+			Try {
+				ForEach ($Dep in $Missing) {
+					$Entry = $Zip.Entries | Where-Object { $_.FullName -like "$Arch/$($Dep.Name)_*.appx" } | Select-Object -First 1
+					If (-not $Entry) { Throw "$($Dep.Name) for $Arch was not found in DesktopAppInstaller_Dependencies.zip" }
+					$AppxPath = Join-Path -Path $TempFolder -ChildPath $Entry.Name
+					[System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, $AppxPath, $true)
+					Write-Host "Installing $($Entry.Name)"
+					Add-AppxPackage -Path $AppxPath -ErrorAction Stop
+					$DepPaths += $AppxPath
 				}
-			}
-		} Else {
-			Write-Host "WinGet is not installed."
-			If ($PSVersionTable.PSEdition -eq "Core") {Powershell.exe -NonInteractive -Command $GetWinGetDependancies} Else {$GetWinGetDependancies | IEX}
-			If ($PSVersionTable.PSEdition -eq "Core") {Powershell.exe -NonInteractive -Command $GetWinGet} Else {$GetWinGet | IEX}
-			If (Get-Command winget -ErrorAction SilentlyContinue) {
-				$WGVersion = winget -v
-				Write-Host "Winget $WGVersion installed successfully"
-			} Else {
-				Write-Error "Winget did not install successfully"
+			} Finally {
+				$Zip.Dispose()
 			}
 		}
+
+		$Bundle = Save-WinGetAsset -Url "$ReleaseUrl/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -Folder $TempFolder
+
+		# Without a Store license (Windows Server, LTSC) winget fails with "No applicable app licenses found".
+		# Provisioning with the release's license file fixes that and makes winget available to all users.
+		If ($IsAdmin) {
+			$LicenseUrl = Get-WinGetLicenseUrl -ReleaseUrl $ReleaseUrl -Tag $Tag
+			If ($LicenseUrl) {
+				$License = Save-WinGetAsset -Url $LicenseUrl -Folder $TempFolder
+				Write-Host "Provisioning App Installer (WinGet $Tag) with its license for all users"
+				$ProvisionParams = @{ Online = $true; PackagePath = $Bundle; LicensePath = $License; ErrorAction = 'Stop' }
+				If ($DepPaths.Count -gt 0) { $ProvisionParams.DependencyPackagePath = $DepPaths }
+				Try {
+					$null = Add-AppxProvisionedPackage @ProvisionParams
+				} Catch {
+					Write-Host -ForegroundColor Yellow "Provisioning failed, continuing with a per-user install: $($_.Exception.Message)"
+				}
+			} Else {
+				Write-Host -ForegroundColor Yellow "Could not find the license file for $Tag. Continuing with a per-user install."
+			}
+		} Else {
+			Write-Verbose "Not elevated, so App Installer will not be provisioned with its license file."
+		}
+
+		Write-Host "Installing App Installer (WinGet $Tag) for $($Identity.Name)"
+		Add-AppxPackage -Path $Bundle -ForceApplicationShutdown -ErrorAction Stop
+	} Catch {
+		Write-Host -ForegroundColor Red "WinGet installation failed: $($_.Exception.Message)"
+		Write-Error $_
+		Return
+	} Finally {
+		$ProgressPreference = $OldProgressPreference
+		Remove-Item -Path $TempFolder -Recurse -Force -ErrorAction SilentlyContinue
+	}
+
+	# A first-time install may not have WindowsApps on this session's PATH yet
+	If (($env:Path -split ';') -notcontains $WindowsApps) { $env:Path = "$env:Path;$WindowsApps" }
+
+	$WinGetExe = Resolve-WinGetExe -WindowsApps $WindowsApps
+	$NewVersion = Get-InstalledWinGetVersion -WinGetExe $WinGetExe
+	If ($NewVersion -and $NewVersion -ge $LatestVersion) {
+		Write-Host -ForegroundColor Green "WinGet $NewVersion installed successfully."
+		& $WinGetExe source update | Out-Host
+	} Else {
+		If (-not $IsAdmin) {
+			Write-Host -ForegroundColor Yellow "If winget reports 'No applicable app licenses found' (common on Windows Server and LTSC), run Install-WinGet from an elevated PowerShell so it can provision the license."
+		}
+		Write-Error "WinGet did not install successfully. Detected version: $(If ($NewVersion) {$NewVersion} Else {'none'})"
 	}
 }
 
@@ -1754,8 +2108,8 @@ Function Install-Croc {
 # SIG # Begin signature block
 # MIIoCgYJKoZIhvcNAQcCoIIn+zCCJ/cCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCN/b8WCgwMuZC0
-# KGjIA44vedPpBEBCGiL049HCkj4lGqCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCADFOMqM8mOj0Tn
+# S2mhmg/1UXnINGIOPKpLxFlH32F1EKCCIRYwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -1856,44 +2210,44 @@ Function Install-Croc {
 # vw9vODRzW6AxnJll38F0cuJG7uEBYTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/D
 # Jbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHb
 # xtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAP
-# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC
-# 0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
+# vIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7b
+# ww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
 # RGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGlt
-# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAw
-# MFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
+# ZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAw
+# MFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lD
 # ZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1l
-# c3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
-# AgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA
-# 69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6w
-# W2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00
-# Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOM
-# A3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmot
-# uQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1O
-# pbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeH
-# VZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1r
-# oSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSURO
-# wnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW0
-# 0aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGV
-# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM
-# 6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
+# c3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy
+# 24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJ
+# CcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7
+# pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtkl
+# TJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/wh
+# ITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/
+# ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDAMDtozNgLctkG
+# D1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nk
+# ddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3Znq
+# MqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvf
+# pklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGV
+# MIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN
+# 4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMC
 # B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQG
 # CCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKG
 # UWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
 # bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSg
 # UqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRU
 # aW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAI
-# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcE
-# ua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/Ym
-# RDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8
-# AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/E
-# ABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQ
-# VTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gV
-# utDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85
-# EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hg
-# gt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJ
-# gKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLv
-# UxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7P
-# OGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzCCBzMwggUboAMCAQICEA2lFIZwJJS8
+# BgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1S
+# Ct+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT
+# 12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uw
+# n+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9
+# d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy
+# 0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0
+# YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb
+# 6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7
+# LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/Jgw
+# tKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKS
+# XjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATl
+# WJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzCCBzMwggUboAMCAQICEA2lFIZwJJS8
 # c3wtEmMVlPEwDQYJKoZIhvcNAQELBQAwWjELMAkGA1UEBhMCTFYxGTAXBgNVBAoT
 # EEVuVmVycyBHcm91cCBTSUExMDAuBgNVBAMTJ0dvR2V0U1NMIEc0IENTIFJTQTQw
 # OTYgU0hBMjU2IDIwMjIgQ0EtMTAeFw0yNjAzMDIwMDAwMDBaFw0yNzA2MDMyMzU5
@@ -1937,33 +2291,33 @@ Function Install-Croc {
 # MjAyMiBDQS0xAhANpRSGcCSUvHN8LRJjFZTxMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IMN+ZxZoTHEY0jW53cu/ErIUshrbR8yLcJ6gVI6mjWKZMA0GCSqGSIb3DQEBAQUA
-# BIICABsYHTpSm2ZErzrrr3VoRxlPK0tpDyfMWjblFwxeF59JW5LbFzVi0v8B0gKX
-# L5xfmWG9MRYn/jD1FLwfkfDF5181sROXoy8ptUcL3iVBp8dcVZQzs3ESc7kkYF3r
-# 8+SfHpFLugNq76mSg9j9QhkS5kM4Z3vw53cHq2f+ydJLwvL+AiwEVyv7BnJWjdLm
-# lDEvXZRgaOrKKPZ4Gl6bOFkcoPzFM2y8/QjokGByp4zfg1OLh6Wah/U5d5V6RRTn
-# adH3CKasZcqyEg0a8Jn19xOcNYDKSL0hj4eFn9b5geTxcDPfnQen1eUDGPivovOP
-# BY6Y9JOTebovgnX8prRQ+aiJjL0Ycs+lqwxs+jOrbc/LebF7fmBMzYYvM2Y01kb9
-# cgOgrSq7irvQpITgt/OaNZBKzw0mIW/wEr293Wh5/eUIaz/FIWAxtHsw6lUwBquf
-# JIwVcZjfdGN7TLMIciTg/vmM1Z7YR5Vdlbo5vck0LHU7JBxJ/VqGabx2gAtkZBQ9
-# dXffATzlySx4NYe/Vu8zdXy201Qyk6UfyLsCkz//nwQ56wwBbGkJNj/EIOTr7t9I
-# 7wxl7HNG2wZSNOr/UIBrL6AJNLqK3DbAuoZ1PUcDAkcalu8ueDQ3pt3tVUDh3gWz
-# kWTe1Msiehg+Qh2PkX5Znx1fnTF6AnFZMr1rjl73E/Ig122IoYIDJjCCAyIGCSqG
+# IFhY62R7C/vm4Y4nPXslxTlLI8rT12bL7HyMXGKnZamJMA0GCSqGSIb3DQEBAQUA
+# BIICABwGFuC+VYhRHQJnF39+POzhBWY99mcwSXbuIWulbw2im7Ytz/Q2UHrnoLR9
+# 16iq5i2bgbKcMdhReWxvESH5t3Yha+NU8r6Os1CLNab3tI709YQJ1AjjzbVKpKpg
+# GuNuF1BYZ+O9pSiOiKYgUmw6zGBBgPWXR3aXCHZFg2Qm4jzw+qfcECzahWj74FH5
+# LVpQct9ozuseyFHgjK+/LuRR4yq1bmEdWXfGVkOitTwiKK5bd6ch8VoaaVKCY9Ja
+# 86dB+g9ctS9/JJeB5A+W4Ke76McGAqbzXBN4yIite6MAwP56b73xR6Syb9BRJSVD
+# +QwnoCiEaXgZ9W/cbFh8iceEXUZvlJr0QzQEoqLkfUnEHkztykPOuJyQgb58miXs
+# L/SLk+4yQNrFa5FNxRJ3GVonC58T5/26Y5RrNI8VFhUvd0lYpFaEBz1FOLRLob8H
+# 5ueznDDSjWwsOBMwUt2nBCVJyjeoLBW1GLcY6hOr4MQAK4vnfDAPddGdu1AIMOZP
+# gFp3V51RgZpqE7gkJwFlWRZcGv14oZaJqjCqqx/ITeA8roky3y0RSBYjsMJwRLSz
+# o9agDSsulCGjBChzltvTKc64EOrII1LBCsM4WIar9/xHZw/+HuNLJYkNzXjW1Q3V
+# ox+HPot4yciInQuM4tS8WnjSlXM6R9RpGb21/jYGR2g7Y9BioYIDJjCCAyIGCSqG
 # SIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRp
 # Z2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVT
-# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0
-# aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
-# KoZIhvcNAQkFMQ8XDTI2MDUyOTE4Mzc0NFowLwYJKoZIhvcNAQkEMSIEIAkTnntv
-# wAB1wdiWbN+1t3rm0YZd5kjjAtyxly0yKkWAMA0GCSqGSIb3DQEBAQUABIICAAUE
-# MIU9pcGlEnZt9/x1mXxTL/zQclfmWaoclShL6Cg/JCLvTYOj3IBl9ScatuMsO8NQ
-# Mj+h9ClV8gh5cVqt5y/+xTuOHfHNn48RlWl3imzBaOCNWr28zH/NHYE6Hp6sAu7N
-# qtPyWzRHyNCeUXpnwZ6BScDZ0Cw8EDdFKlauTyrtOqtuxuvmIwwRFUXfLSin5G8F
-# amuQxdkNZGNpnvcvmM8nm7yi/5VWGrMtzdvEw24tWEU14h3O4Xgnid51TBlkfsqX
-# oAStOkYJzM9drxq6X5QcF6A50iTL6Fpv4VE43CkKP1iB/cpbj3MprUwVLEVfLZF/
-# 6CV8gpiokujrqiogLV3GHaHIhqaan7JC1lyapz6792QhI0nZBtmtqW6VYUlgN/V/
-# K4de7l2PhK+5QAeFKKPqV+MIWoob4REMTXSeO91Q1sOJ3qcOEgW1VkzbchRsYm5r
-# uQTEfvjIfmlC0zBg4P08rPIzCUtNREitry9mJPlt4mE0fGT5BTrbuqEanNIW/cUM
-# un5L1qwSEQR0J8piDnNtNmi0euR0tLYf+BKdbbyFUHeqzZMJRYU6GChycSVF0ulG
-# NWOZXnk6Qth2CL6vYUrBNA0C+tB57+0magiZ6oYGOPELuvCkVw7dOqkZt/6HlHcw
-# bOd5pgVraJHQYNOT/Oeuumia/mZPdmCYR1xIiwOB
+# dGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIY
+# NTANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJ
+# KoZIhvcNAQkFMQ8XDTI2MTExMDE3MzgxOFowLwYJKoZIhvcNAQkEMSIEIPiF9mwN
+# D6UsJnaV+A0Oy/UIxqiJxtVqTrUT/tqefnmHMA0GCSqGSIb3DQEBAQUABIICAC2K
+# +bk741FZ+BUcKJci0uSLipbGEZabkVsi1uwuYLkz7cdxdSUpwM/5BPtHKWnAo8VR
+# eCzHdf2djUTqEjbnPMQHcr9FAga9XZr3UTUHg+xfzFVCqukQeA/0UvfoA7OfNxl6
+# V1unkd653zyV8ct3b3CiDH+zUSsngHii5kGWkZPQeTNwuA2twH8pLAaofMeaW9fh
+# XpSlkSmeFYdiXL6x6P3ACKe0wTgAXtUXXRzybhHs0zGTJt/F3GnTbklznJ3+N0J5
+# 0oBSgnKMIvVyMCW+FjfDm6eUCkk22tVJhKg9u8IB8Gv60Btmtf5EZfzrKHOFyjKp
+# 5RYg6wZQgFQfwwe29jOode5uZ5wLvQyEUD7DgEd3bkCiKxvgivaioNsoVJtQR9zb
+# rWKWSbmWlCT9cfYu60xiL0zYtD70nMllctd5S1B9J8Exl3vnuP8/BT98yrqk53EM
+# LXUVU9JitjWWvaFKpXsFyBqwN6q8V+U96B6RltKZfosrOCBBzqeOdGvEYo7P4S4D
+# 6ViaUObbXVyWSrYHkfET4S+pJMRPiIT+wFBDP2zyFL4t3JCYK2IG6JmMsMWduROb
+# nY8YUtWGxEIrVaglFsBxSwc6kEwYK1+9rEWW/bQ9gVrjYeDlxEXT5EDsjcVY92CZ
+# EmtqeiFkdKd+QkhoYlwjjV9T6/qgk8m4/aAMX94i
 # SIG # End signature block

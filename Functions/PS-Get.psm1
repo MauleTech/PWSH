@@ -697,6 +697,1468 @@ function Get-ComputerEntraStatus {
 	return [PSCustomObject]$statusObject
 }
 
+function Get-ComputerLifecycleAgeBasis {
+	<#
+	.SYNOPSIS
+		Picks the date a computer's age is measured from and names the source.
+	.DESCRIPTION
+		Pure function with no system calls. Reads the raw facts produced by
+		Get-ComputerLifecycleData and returns the best available start date.
+		A supplied PurchaseDate wins, then a manufacturer ShipDate. If neither
+		is present, the earliest of the BIOS release date and the Windows
+		install dates is used and flagged as an estimate. BIOS updates and
+		reimaging move those dates forward, so an estimate can understate age.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.PARAMETER AsOf
+		Date to measure against. Dates after this are ignored. Defaults to now.
+	.EXAMPLE
+		Get-ComputerLifecycleAgeBasis -Data (Get-ComputerLifecycleData)
+		Returns Date, Basis (for example BiosReleaseDate) and IsEstimate.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data,
+		[datetime]$AsOf = (Get-Date)
+	)
+
+	$result = [pscustomobject]@{ Date = $null; Basis = 'Unknown'; IsEstimate = $false }
+	try {
+		if ($null -eq $Data) { return $result }
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$styles = [System.Globalization.DateTimeStyles]::None
+		$floor = New-Object System.DateTime 1995, 1, 1
+		$candidates = @(
+			@{ Property = 'PurchaseDate'; Basis = 'PurchaseDate'; IsEstimate = $false },
+			@{ Property = 'ShipDate'; Basis = 'ShipDate'; IsEstimate = $false },
+			@{ Property = 'BiosReleaseDate'; Basis = 'BiosReleaseDate'; IsEstimate = $true },
+			@{ Property = 'EarliestOSInstallDate'; Basis = 'OSInstallDate'; IsEstimate = $true },
+			@{ Property = 'OSInstallDate'; Basis = 'OSInstallDate'; IsEstimate = $true }
+		)
+		foreach ($candidate in $candidates) {
+			$raw = $Data.($candidate.Property)
+			if ($null -eq $raw -or "$raw" -eq '') { continue }
+			$parsed = [datetime]::MinValue
+			if (-not [datetime]::TryParse([string]$raw, $inv, $styles, [ref]$parsed)) { continue }
+			if ($parsed -lt $floor -or $parsed -gt $AsOf) { continue }
+			if (-not $candidate.IsEstimate) {
+				$result.Date = $parsed
+				$result.Basis = $candidate.Basis
+				$result.IsEstimate = $false
+				break
+			}
+			# Estimates: keep the earliest date seen, it is the best evidence of first use.
+			if ($null -eq $result.Date -or $parsed -lt $result.Date) {
+				$result.Date = $parsed
+				$result.Basis = $candidate.Basis
+				$result.IsEstimate = $true
+			}
+		}
+	} catch {
+		Write-Verbose "Age basis could not be determined: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleAssessment {
+	<#
+	.SYNOPSIS
+		Suggests a lifecycle outcome for one or more Windows computers.
+	.DESCRIPTION
+		Public entry point for the hardware lifecycle flowchart. For each computer
+		it gathers raw facts (Get-ComputerLifecycleData), runs every check, and
+		returns one flat object with SuggestedOutcome: Replace now, Plan to
+		replace, Keep, or Needs review.
+
+		Hard fails (any one means Replace now): over 5 years old, fails Windows 11
+		requirements, under 16 GB RAM, hard disk boot drive, OS drive under 200 GB
+		or under 20 percent free, failing disk health, repeat tickets.
+		Soft flags (any one means Plan to replace): 4 or more years old, or out
+		of warranty. Anything that could not be assessed gives Needs review. Keep
+		is never returned on missing data.
+
+		Ticket history, purchase date and warranty end date are not stored on the
+		computer. Supply them with the parameters below, or as RepeatTicketCount,
+		PurchaseDate and WarrantyEndDate properties on the piped objects. Dell
+		warranty and ship dates are looked up with Get-DellWarranty when its API
+		credentials are configured on the machine running the assessment.
+	.PARAMETER ComputerName
+		Computers to assess. Defaults to the local computer. Remote computers are
+		collected with Invoke-Command (WinRM).
+	.PARAMETER Credential
+		Credential for remote collection. Prompt for it with Get-Credential.
+	.PARAMETER InputObject
+		Output of Get-ComputerLifecycleData, as objects or as JSON text (for
+		example the JSON an RMM returned). Accepts pipeline input.
+	.PARAMETER RepeatTicketCount
+		Number of repeat tickets logged against the computer. Use 0 when there are
+		none. Applies to every computer in this call.
+	.PARAMETER RepeatTicketThreshold
+		Ticket count that counts as a hard fail. Default 3.
+	.PARAMETER PurchaseDate
+		Known purchase date. Applies to every computer in this call.
+	.PARAMETER WarrantyEndDate
+		Known warranty end date. Applies to every computer in this call.
+	.PARAMETER SkipWarrantyLookup
+		Do not call the Dell warranty API.
+	.EXAMPLE
+		Get-ComputerLifecycleAssessment -RepeatTicketCount 0
+		Assesses the local computer, stating that it has no repeat tickets.
+	.EXAMPLE
+		Get-ComputerLifecycleAssessment -ComputerName PC01, PC02 -RepeatTicketCount 0 | Export-Csv .\Lifecycle.csv -NoTypeInformation
+		Collects two computers over WinRM and writes one row per computer.
+	.EXAMPLE
+		Get-Content .\rmm-output.json | Get-ComputerLifecycleAssessment
+		Assesses JSON captured from: Get-ComputerLifecycleData | ConvertTo-Json -Compress
+	.EXAMPLE
+		Get-ComputerLifecycleAssessment -PurchaseDate '2022-03-15' -WarrantyEndDate '2025-03-15' -RepeatTicketCount 1 -Verbose
+		Supplies the facts that are not on the machine and logs every check.
+	#>
+	[CmdletBinding(DefaultParameterSetName = 'ComputerName')]
+	param(
+		[Parameter(ParameterSetName = 'ComputerName', Position = 0)]
+		[string[]]$ComputerName = @($env:COMPUTERNAME),
+
+		[Parameter(ParameterSetName = 'ComputerName')]
+		[System.Management.Automation.PSCredential]$Credential,
+
+		[Parameter(ParameterSetName = 'InputObject', Mandatory = $true, ValueFromPipeline = $true)]
+		[AllowNull()]
+		[AllowEmptyCollection()]
+		[object[]]$InputObject,
+
+		[ValidateRange(0, 100000)]
+		[int]$RepeatTicketCount,
+
+		[ValidateRange(1, 100000)]
+		[int]$RepeatTicketThreshold = 3,
+
+		[datetime]$PurchaseDate,
+
+		[datetime]$WarrantyEndDate,
+
+		[switch]$SkipWarrantyLookup
+	)
+
+	begin {
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$checkNames = @('Age', 'Windows11', 'Memory', 'BootDrive', 'OSDrive', 'Health', 'RepeatTickets', 'Warranty')
+		$knownFacts = @('CollectedAt', 'CpuName', 'Manufacturer', 'SerialNumber', 'MemoryInstalledGB', 'OSDriveSizeGB', 'BiosReleaseDate')
+		$jsonBuffer = New-Object 'System.Collections.Generic.List[string]'
+
+		# Facts supplied on the command line override whatever the input object carries.
+		$overrides = @{}
+		if ($PSBoundParameters.ContainsKey('RepeatTicketCount')) { $overrides['RepeatTicketCount'] = $RepeatTicketCount }
+		if ($PSBoundParameters.ContainsKey('PurchaseDate')) { $overrides['PurchaseDate'] = $PurchaseDate.ToString('yyyy-MM-dd', $inv) }
+		if ($PSBoundParameters.ContainsKey('WarrantyEndDate')) { $overrides['WarrantyEndDate'] = $WarrantyEndDate.ToString('yyyy-MM-dd', $inv) }
+
+		function Get-AssessmentRow {
+			param(
+				[object]$Facts,
+				[string]$Name,
+				[string]$Failure
+			)
+			$now = Get-Date
+			$data = [ordered]@{}
+			try {
+				if ($Facts -is [System.Collections.IDictionary]) {
+					foreach ($key in $Facts.Keys) { $data["$key"] = $Facts[$key] }
+				} elseif ($null -ne $Facts) {
+					foreach ($property in $Facts.PSObject.Properties) { $data[$property.Name] = $property.Value }
+				}
+			} catch {
+				$Failure = "Input could not be read: $($_.Exception.Message)"
+			}
+			if (-not $Failure) {
+				if ($null -eq $Facts) {
+					$Failure = 'No lifecycle data was supplied.'
+				} elseif (@($knownFacts | Where-Object { $data.Contains($_) }).Count -eq 0) {
+					$Failure = 'Input is not Get-ComputerLifecycleData output.'
+				}
+			}
+			foreach ($key in $overrides.Keys) { $data[$key] = $overrides[$key] }
+			if (-not "$($data['ComputerName'])") {
+				if ("$($data['PSComputerName'])") { $data['ComputerName'] = "$($data['PSComputerName'])" } else { $data['ComputerName'] = $Name }
+			}
+
+			if (-not $Failure -and -not $SkipWarrantyLookup) {
+				$needWarranty = -not "$($data['WarrantyEndDate'])"
+				$needShipDate = (-not "$($data['PurchaseDate'])") -and (-not "$($data['ShipDate'])")
+				if ($needWarranty -or $needShipDate) {
+					$warranty = Get-ComputerLifecycleWarrantyInfo -Manufacturer "$($data['Manufacturer'])" -SerialNumber "$($data['SerialNumber'])"
+					if ($needWarranty -and $warranty.WarrantyEndDate) { $data['WarrantyEndDate'] = $warranty.WarrantyEndDate }
+					if ($needShipDate -and $warranty.ShipDate) { $data['ShipDate'] = $warranty.ShipDate }
+					if ($warranty.Note) { $data['WarrantyLookupNote'] = $warranty.Note }
+				}
+			}
+
+			$dataObject = [pscustomobject]$data
+			$checks = @(
+				(Get-ComputerLifecycleCheckAge -Data $dataObject -AsOf $now),
+				(Get-ComputerLifecycleCheckWindows11 -Data $dataObject),
+				(Get-ComputerLifecycleCheckMemory -Data $dataObject),
+				(Get-ComputerLifecycleCheckBootDrive -Data $dataObject),
+				(Get-ComputerLifecycleCheckOSDrive -Data $dataObject),
+				(Get-ComputerLifecycleCheckHealth -Data $dataObject),
+				(Get-ComputerLifecycleCheckRepeatTickets -Data $dataObject -Threshold $RepeatTicketThreshold),
+				(Get-ComputerLifecycleCheckWarranty -Data $dataObject -AsOf $now)
+			)
+			foreach ($check in $checks) {
+				Write-Verbose ("{0} {1}: {2} - {3}" -f $data['ComputerName'], $check.Name, $check.Status, $check.Detail)
+			}
+
+			$outcome = Get-ComputerLifecycleOutcome -CheckResult $checks -RequiredCheck $checkNames
+			$suggested = $outcome.SuggestedOutcome
+			$reasons = @($outcome.Reasons)
+			if ($Failure) {
+				# No usable facts: never let this fall through to anything but a review.
+				$suggested = 'Needs review'
+				$reasons = @("Data collection failed: $Failure")
+			}
+
+			$basis = Get-ComputerLifecycleAgeBasis -Data $dataObject -AsOf $now
+			$ageBasis = $basis.Basis
+			if ($basis.IsEstimate) { $ageBasis = "$ageBasis (estimate)" }
+
+			$row = [ordered]@{
+				ComputerName     = $data['ComputerName']
+				Manufacturer     = $data['Manufacturer']
+				Model            = $data['Model']
+				Motherboard      = (Get-ComputerLifecycleIdentity -Data $dataObject).Motherboard
+				SerialNumber     = $data['SerialNumber']
+				SuggestedOutcome = $suggested
+				Reasons          = ($reasons -join ' | ')
+				AgeBasis         = $ageBasis
+			}
+			foreach ($checkName in $checkNames) {
+				$check = $checks | Where-Object { $_.Name -eq $checkName } | Select-Object -First 1
+				$row["${checkName}Value"] = $check.Value
+				$row["${checkName}Status"] = $check.Status
+			}
+			$row['CollectedAt'] = $data['CollectedAt']
+			Write-Verbose ("{0}: {1} ({2})" -f $row['ComputerName'], $suggested, $row['Reasons'])
+			[pscustomobject]$row
+		}
+	}
+
+	process {
+		if ($PSCmdlet.ParameterSetName -eq 'InputObject') {
+			if ($null -eq $InputObject) {
+				Get-AssessmentRow -Facts $null -Name 'Unknown'
+				return
+			}
+			foreach ($item in $InputObject) {
+				if ($item -is [string]) {
+					# JSON text can arrive whole or line by line; parse it once in the end block.
+					$jsonBuffer.Add($item)
+				} else {
+					Get-AssessmentRow -Facts $item -Name 'Unknown'
+				}
+			}
+			return
+		}
+
+		$localNames = @('.', 'localhost', "$env:COMPUTERNAME")
+		$remoteNames = @($ComputerName | Where-Object { "$_".Trim() -and ($localNames -notcontains "$_".Trim()) } | ForEach-Object { "$_".Trim() })
+		$remoteData = @{}
+		$remoteErrors = @{}
+		if ($remoteNames.Count -gt 0) {
+			Write-Verbose "Collecting lifecycle data from: $($remoteNames -join ', ')"
+			$invokeParams = @{
+				ComputerName  = $remoteNames
+				ScriptBlock   = ${function:Get-ComputerLifecycleData}
+				ErrorAction   = 'SilentlyContinue'
+				ErrorVariable = 'remoteFailures'
+			}
+			if ($Credential) { $invokeParams['Credential'] = $Credential }
+			try {
+				foreach ($remoteResult in @(Invoke-Command @invokeParams)) {
+					if ($null -ne $remoteResult) { $remoteData["$($remoteResult.PSComputerName)"] = $remoteResult }
+				}
+				foreach ($remoteFailure in @($remoteFailures)) {
+					$target = "$($remoteFailure.TargetObject)"
+					if ($target) { $remoteErrors[$target] = ("$($remoteFailure.Exception.Message)" -replace '\s+', ' ').Trim() }
+				}
+			} catch {
+				$message = ("$($_.Exception.Message)" -replace '\s+', ' ').Trim()
+				foreach ($remoteName in $remoteNames) { $remoteErrors[$remoteName] = $message }
+			}
+		}
+
+		foreach ($name in $ComputerName) {
+			$target = "$name".Trim()
+			if (-not $target) { continue }
+			if ($localNames -contains $target) {
+				Write-Verbose 'Collecting lifecycle data from the local computer.'
+				$localData = $null
+				$localFailure = ''
+				try { $localData = Get-ComputerLifecycleData } catch { $localFailure = "$($_.Exception.Message)" }
+				if ($localFailure) {
+					Get-AssessmentRow -Facts $null -Name "$env:COMPUTERNAME" -Failure $localFailure
+				} else {
+					Get-AssessmentRow -Facts $localData -Name "$env:COMPUTERNAME"
+				}
+			} elseif ($remoteData.ContainsKey($target)) {
+				Get-AssessmentRow -Facts $remoteData[$target] -Name $target
+			} else {
+				$failure = 'No data was returned by the remote computer.'
+				if ($remoteErrors.ContainsKey($target)) { $failure = $remoteErrors[$target] }
+				Write-Warning "Lifecycle data could not be collected from ${target}: $failure"
+				Get-AssessmentRow -Facts $null -Name $target -Failure $failure
+			}
+		}
+	}
+
+	end {
+		if ($jsonBuffer.Count -eq 0) { return }
+		$parsed = $null
+		$parseFailure = ''
+		try {
+			$parsed = ConvertFrom-Json -InputObject ($jsonBuffer -join "`n") -ErrorAction Stop
+		} catch {
+			$parseFailure = "Input text is not valid JSON: $($_.Exception.Message)"
+		}
+		if ($parseFailure) {
+			Get-AssessmentRow -Facts $null -Name 'Unknown' -Failure $parseFailure
+			return
+		}
+		foreach ($item in @($parsed)) {
+			Get-AssessmentRow -Facts $item -Name 'Unknown'
+		}
+	}
+}
+
+function Get-ComputerLifecycleCheckAge {
+	<#
+	.SYNOPSIS
+		Lifecycle check: how old the computer is.
+	.DESCRIPTION
+		Pure function with no system calls. Fail when the computer is over 5 years
+		old, Warn at 4 years or more, otherwise Pass. Unknown when no usable date
+		exists. The date used comes from Get-ComputerLifecycleAgeBasis. When that
+		date is an estimate, Detail includes the serial number so the purchase
+		date can be looked up.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.PARAMETER AsOf
+		Date to measure age against. Defaults to now.
+	.PARAMETER ReplaceAfterYears
+		Age above which the check fails. Default 5.
+	.PARAMETER PlanAfterYears
+		Age at or above which the check warns. Default 4.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckAge -Data (Get-ComputerLifecycleData)
+		Returns Name, Status, Value (age in years) and Detail.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data,
+		[datetime]$AsOf = (Get-Date),
+		[double]$ReplaceAfterYears = 5,
+		[double]$PlanAfterYears = 4
+	)
+
+	$result = [pscustomobject]@{ Name = 'Age'; Status = 'Unknown'; Value = $null; Detail = 'No purchase, ship, BIOS, or Windows install date is available.' }
+	try {
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$basis = Get-ComputerLifecycleAgeBasis -Data $Data -AsOf $AsOf
+		if ($null -ne $basis.Date) {
+			$years = ($AsOf - $basis.Date).TotalDays / 365.25
+			$text = $years.ToString('0.0', $inv)
+			$source = "$($basis.Basis) $($basis.Date.ToString('yyyy-MM-dd', $inv))"
+			if ($basis.IsEstimate) {
+				$source = "$source, an estimate"
+				$serial = (Get-ComputerLifecycleIdentity -Data $Data).SerialNumber
+				if ($serial) { $source = "$source; look up serial number $serial for the purchase date" }
+			}
+			$result.Value = [math]::Round($years, 1)
+			if ($years -gt $ReplaceAfterYears) {
+				$result.Status = 'Fail'
+				$result.Detail = "$text years old (over $ReplaceAfterYears), based on $source"
+			} elseif ($years -ge $PlanAfterYears) {
+				$result.Status = 'Warn'
+				$result.Detail = "$text years old ($PlanAfterYears or more), based on $source"
+			} else {
+				$result.Status = 'Pass'
+				$result.Detail = "$text years old, based on $source"
+			}
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "Age check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckBootDrive {
+	<#
+	.SYNOPSIS
+		Lifecycle check: whether the boot drive is a hard disk.
+	.DESCRIPTION
+		Pure function with no system calls. Fail when the disk holding Windows is
+		a spinning hard disk, Pass when it is solid state (SSD, SCM or any NVMe
+		disk), Unknown when the media type is not reported (common behind RAID
+		controllers and in virtual machines).
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckBootDrive -Data (Get-ComputerLifecycleData)
+		Returns Name, Status, Value (for example "SSD (NVMe)") and Detail.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data
+	)
+
+	$result = [pscustomobject]@{ Name = 'BootDrive'; Status = 'Unknown'; Value = $null; Detail = 'Boot disk media type was not collected.' }
+	try {
+		$media = "$($Data.BootDiskMediaType)".Trim()
+		$bus = "$($Data.BootDiskBusType)".Trim()
+		$model = "$($Data.BootDiskModel)".Trim()
+		$label = $model
+		if (-not $label) { $label = 'Boot disk' }
+		if ($media -or $bus) { $result.Value = ("$media ($bus)").Trim() }
+		if ($media -eq 'HDD') {
+			$result.Status = 'Fail'
+			$result.Detail = "$label is a hard disk (HDD)"
+		} elseif ($media -eq 'SSD' -or $media -eq 'SCM') {
+			$result.Status = 'Pass'
+			$result.Detail = "$label is solid state ($media)"
+		} elseif ($bus -eq 'NVMe') {
+			$result.Status = 'Pass'
+			$result.Detail = "$label is an NVMe solid state disk"
+		} else {
+			$collectionError = @($Data.CollectionErrors) -like 'BootDisk:*' | Select-Object -First 1
+			if (-not $collectionError) { $collectionError = @($Data.CollectionErrors) -like 'Disks:*' | Select-Object -First 1 }
+			if ($collectionError) {
+				$result.Detail = "Boot disk media type was not collected ($collectionError)"
+			} elseif ($media -or $bus) {
+				$result.Detail = "$label does not report whether it is SSD or HDD (media '$media', bus '$bus')"
+			}
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "Boot drive check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckCpu {
+	<#
+	.SYNOPSIS
+		Lifecycle check: whether the CPU is Intel 8th gen / AMD Ryzen 2000 or newer.
+	.DESCRIPTION
+		Pure function with no system calls. Parses the processor name. Fail for
+		Intel Core older than 8th gen, AMD Ryzen 1000 series and pre-Ryzen AMD,
+		Core 2 and Xeon E3/E5/E7. Pass for Intel Core 8th gen and newer, Core
+		Ultra, AMD Ryzen 2000 series and newer, and Snapdragon X. Unknown for
+		anything else (Pentium, Celeron, Athlon, other Xeon, virtual CPUs), which
+		should be checked against the Microsoft supported processor list.
+		Used by Get-ComputerLifecycleCheckWindows11.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData. Only CpuName is read.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckCpu -Data ([pscustomobject]@{ CpuName = 'Intel(R) Core(TM) i5-7200U CPU @ 2.50GHz' })
+		Returns Status Fail with Value "Intel Core gen 7".
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data
+	)
+
+	$result = [pscustomobject]@{ Name = 'Cpu'; Status = 'Unknown'; Value = $null; Detail = 'CPU name was not collected.' }
+	try {
+		$name = ("$($Data.CpuName)" -replace '\s+', ' ').Trim()
+		if (-not $name) {
+			$collectionError = @($Data.CollectionErrors) -like 'Cpu:*' | Select-Object -First 1
+			if ($collectionError) { $result.Detail = "CPU name was not collected ($collectionError)" }
+			return $result
+		}
+
+		$status = 'Unknown'
+		$family = ''
+		$generation = $null
+		if ($name -match 'Core\(TM\) Ultra|Core Ultra') {
+			$status = 'Pass'
+			$family = 'Intel Core Ultra'
+		} elseif ($name -match '\b[im][3579]-(\d)Y\d{2}') {
+			# Low power Y-series, for example m3-7Y30 or i5-7Y54
+			$generation = [int]$Matches[1]
+		} elseif ($name -match '\b[im][3579]-(\d{3,5})') {
+			$digits = $Matches[1]
+			if ($digits.Length -eq 5) {
+				$generation = [int]$digits.Substring(0, 2)
+			} elseif ($digits.Length -eq 4 -and $digits.Substring(0, 1) -eq '1') {
+				# 10th gen and newer four digit models: 1035G1, 1135G7, 1235U, 1335U
+				$generation = [int]$digits.Substring(0, 2)
+			} elseif ($digits.Length -eq 4) {
+				$generation = [int]$digits.Substring(0, 1)
+			} else {
+				$generation = 1
+			}
+		} elseif ($name -match 'Core\(TM\) i[357] CPU') {
+			# First generation naming, for example "Core(TM) i7 CPU 920"
+			$generation = 1
+		} elseif ($name -match '\bi3-N\d{3}') {
+			$status = 'Pass'
+			$family = 'Intel Core i3 N-series'
+		} elseif ($name -match 'Core\(TM\) [3579] \d{3}[A-Z]{0,2}\b') {
+			$status = 'Pass'
+			$family = 'Intel Core Series 1 or newer'
+		} elseif ($name -match 'Intel\(R\) (Processor )?N\d{2,3}\b') {
+			$status = 'Pass'
+			$family = 'Intel N-series'
+		} elseif ($name -match 'Xeon.*\bE[357]-\d{4}') {
+			$status = 'Fail'
+			$family = 'Intel Xeon E3/E5/E7'
+		} elseif ($name -match 'Core\(TM\) ?2|Core2') {
+			$status = 'Fail'
+			$family = 'Intel Core 2'
+		} elseif ($name -match 'Ryzen AI') {
+			$status = 'Pass'
+			$family = 'AMD Ryzen AI'
+		} elseif ($name -match 'Ryzen(?: Threadripper)?(?: PRO)?(?: [3579])?(?: PRO)? (\d{3,4})(?!\d)') {
+			$model = [int]$Matches[1]
+			if ($model -lt 1000) {
+				# Three digit models (for example Ryzen 5 220) are the 2025 naming scheme
+				$status = 'Pass'
+				$family = "AMD Ryzen $([int]([math]::Floor($model / 100)) * 100) series"
+			} else {
+				$family = "AMD Ryzen $([int]([math]::Floor($model / 1000)) * 1000) series"
+				if ($model -ge 2000) { $status = 'Pass' } else { $status = 'Fail' }
+			}
+		} elseif ($name -match '\bAMD (PRO )?(FX|A\d{1,2}-|E\d-|Phenom|Sempron|Opteron|Turion)') {
+			$status = 'Fail'
+			$family = 'AMD pre-Ryzen'
+		} elseif ($name -match 'Snapdragon\(R\) X\b') {
+			$status = 'Pass'
+			$family = 'Qualcomm Snapdragon X'
+		}
+
+		if ($null -ne $generation) {
+			$family = "Intel Core gen $generation"
+			if ($generation -ge 8) { $status = 'Pass' } else { $status = 'Fail' }
+		}
+
+		$result.Status = $status
+		if ($status -eq 'Pass') {
+			$result.Value = $family
+			$result.Detail = "$name ($family) meets the Intel 8th gen / AMD Ryzen 2000 minimum"
+		} elseif ($status -eq 'Fail') {
+			$result.Value = $family
+			$result.Detail = "$name ($family) is older than the Intel 8th gen / AMD Ryzen 2000 minimum"
+		} else {
+			$result.Value = $name
+			$result.Detail = "$name is not a recognized Intel Core or AMD Ryzen model; check it against the Microsoft Windows 11 supported processor list"
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "CPU check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckHealth {
+	<#
+	.SYNOPSIS
+		Lifecycle check: whether the computer reports failing disk hardware.
+	.DESCRIPTION
+		Pure function with no system calls. Fail when SMART predicts a disk
+		failure or any internal physical disk reports Warning or Unhealthy. Pass
+		when every internal disk reports Healthy. Unknown when disk health was not
+		collected. USB and iSCSI disks are ignored. Repeat tickets are judged
+		separately by Get-ComputerLifecycleCheckRepeatTickets.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckHealth -Data (Get-ComputerLifecycleData)
+		Returns Name, Status, Value (Healthy or Failing) and Detail.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data
+	)
+
+	$result = [pscustomobject]@{ Name = 'Health'; Status = 'Unknown'; Value = $null; Detail = 'Disk health was not collected.' }
+	try {
+		$names = @($Data.PhysicalDiskName | Where-Object { $null -ne $_ })
+		$buses = @($Data.PhysicalDiskBusType | Where-Object { $null -ne $_ })
+		$states = @($Data.PhysicalDiskHealthStatus | Where-Object { $null -ne $_ })
+		$problems = @()
+		$healthy = 0
+		$unreported = 0
+		for ($i = 0; $i -lt $states.Count; $i++) {
+			$bus = ''
+			if ($i -lt $buses.Count) { $bus = "$($buses[$i])" }
+			if ($bus -eq 'USB' -or $bus -eq 'iSCSI') { continue }
+			$diskName = "Disk $i"
+			if ($i -lt $names.Count -and "$($names[$i])") { $diskName = "$($names[$i])" }
+			$state = "$($states[$i])"
+			if ($state -eq 'Healthy') {
+				$healthy++
+			} elseif ($state -eq 'Warning' -or $state -eq 'Unhealthy') {
+				$problems += "$diskName reports $state"
+			} else {
+				$unreported++
+			}
+		}
+		if ($Data.SmartPredictFailure -eq $true) { $problems += 'SMART predicts a disk failure' }
+
+		if ($problems.Count -gt 0) {
+			$result.Status = 'Fail'
+			$result.Value = 'Failing'
+			$result.Detail = $problems -join '; '
+		} elseif ($healthy -gt 0 -and $unreported -eq 0) {
+			$result.Status = 'Pass'
+			$result.Value = 'Healthy'
+			$result.Detail = "$healthy internal disk(s) report Healthy"
+		} elseif ($healthy -eq 0 -and $unreported -eq 0 -and $null -ne $Data.SmartPredictFailure -and $Data.SmartPredictFailure -eq $false) {
+			$result.Status = 'Pass'
+			$result.Value = 'Healthy'
+			$result.Detail = 'SMART predicts no disk failure'
+		} else {
+			$collectionError = @($Data.CollectionErrors) -like 'Disks:*' | Select-Object -First 1
+			if ($collectionError) {
+				$result.Detail = "Disk health was not collected ($collectionError)"
+			} elseif ($unreported -gt 0) {
+				$result.Detail = "$unreported internal disk(s) do not report a health status"
+			}
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "Health check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckMemory {
+	<#
+	.SYNOPSIS
+		Lifecycle check: whether enough RAM is installed.
+	.DESCRIPTION
+		Pure function with no system calls. Fail when installed RAM is under
+		16 GB, otherwise Pass. Uses the installed module capacity. If that was not
+		reported, falls back to the memory Windows can use, rounded to the nearest
+		GB. Unknown when neither is available.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.PARAMETER MinimumGB
+		Smallest acceptable amount of RAM in GB. Default 16.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckMemory -Data (Get-ComputerLifecycleData)
+		Returns Name, Status, Value (GB) and Detail.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data,
+		[double]$MinimumGB = 16
+	)
+
+	$result = [pscustomobject]@{ Name = 'Memory'; Status = 'Unknown'; Value = $null; Detail = 'Installed memory was not collected.' }
+	try {
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$float = [System.Globalization.NumberStyles]::Float
+		$installed = 0.0
+		$visible = 0.0
+		$hasInstalled = ($null -ne $Data.MemoryInstalledGB) -and [double]::TryParse("$($Data.MemoryInstalledGB)", $float, $inv, [ref]$installed) -and ($installed -gt 0)
+		$hasVisible = ($null -ne $Data.MemoryVisibleGB) -and [double]::TryParse("$($Data.MemoryVisibleGB)", $float, $inv, [ref]$visible) -and ($visible -gt 0)
+		$gb = $null
+		$kind = ''
+		if ($hasInstalled) {
+			$gb = [math]::Round($installed, 1)
+			$kind = 'installed'
+		} elseif ($hasVisible) {
+			$gb = [math]::Round($visible)
+			$kind = 'usable (installed size not reported)'
+		}
+		if ($null -ne $gb) {
+			$result.Value = $gb
+			if ($gb -lt $MinimumGB) {
+				$result.Status = 'Fail'
+				$result.Detail = "$gb GB RAM $kind (under $MinimumGB GB)"
+			} else {
+				$result.Status = 'Pass'
+				$result.Detail = "$gb GB RAM $kind"
+			}
+		} else {
+			$collectionError = @($Data.CollectionErrors) -like 'Memory:*' | Select-Object -First 1
+			if ($collectionError) { $result.Detail = "Installed memory was not collected ($collectionError)" }
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "Memory check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckOSDrive {
+	<#
+	.SYNOPSIS
+		Lifecycle check: size and free space of the Windows drive.
+	.DESCRIPTION
+		Pure function with no system calls. Fail when the OS volume is under
+		200 GB in total or has under 20 percent free, otherwise Pass. Unknown when
+		the size or free space was not collected.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.PARAMETER MinimumSizeGB
+		Smallest acceptable OS volume size in GB. Default 200.
+	.PARAMETER MinimumFreePercent
+		Smallest acceptable free space as a percentage. Default 20.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckOSDrive -Data (Get-ComputerLifecycleData)
+		Returns Name, Status, Value (for example "237 GB, 41% free") and Detail.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data,
+		[double]$MinimumSizeGB = 200,
+		[double]$MinimumFreePercent = 20
+	)
+
+	$result = [pscustomobject]@{ Name = 'OSDrive'; Status = 'Unknown'; Value = $null; Detail = 'OS drive size was not collected.' }
+	try {
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$float = [System.Globalization.NumberStyles]::Float
+		$size = 0.0
+		$free = 0.0
+		$hasSize = ($null -ne $Data.OSDriveSizeGB) -and [double]::TryParse("$($Data.OSDriveSizeGB)", $float, $inv, [ref]$size) -and ($size -gt 0)
+		$hasFree = ($null -ne $Data.OSDriveFreeGB) -and [double]::TryParse("$($Data.OSDriveFreeGB)", $float, $inv, [ref]$free) -and ($free -ge 0)
+		$drive = "$($Data.OSDrive)".Trim()
+		if (-not $drive) { $drive = 'OS drive' }
+		if (-not $hasSize) {
+			$collectionError = @($Data.CollectionErrors) -like 'OSDrive:*' | Select-Object -First 1
+			if ($collectionError) { $result.Detail = "OS drive size was not collected ($collectionError)" }
+			return $result
+		}
+
+		$sizeText = [math]::Round($size).ToString($inv)
+		$problems = @()
+		if ($size -lt $MinimumSizeGB) { $problems += "$drive is $sizeText GB in total (under $MinimumSizeGB GB)" }
+		if ($hasFree) {
+			$percent = ($free / $size) * 100
+			$percentText = [math]::Round($percent).ToString($inv)
+			$result.Value = "$sizeText GB, $percentText% free"
+			if ($percent -lt $MinimumFreePercent) { $problems += "$drive has $percentText% free (under $MinimumFreePercent%)" }
+		} else {
+			$result.Value = "$sizeText GB"
+		}
+
+		if ($problems.Count -gt 0) {
+			$result.Status = 'Fail'
+			$result.Detail = $problems -join '; '
+		} elseif ($hasFree) {
+			$result.Status = 'Pass'
+			$result.Detail = "$drive is $($result.Value)"
+		} else {
+			$result.Detail = "$drive free space was not collected"
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "OS drive check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckRepeatTickets {
+	<#
+	.SYNOPSIS
+		Lifecycle check: whether the computer has repeat tickets.
+	.DESCRIPTION
+		Pure function with no system calls. Ticket history lives in the PSA, not on
+		the computer, so the count must be supplied as the RepeatTicketCount fact.
+		Fail when the count reaches the threshold, Pass below it, Unknown when no
+		count was supplied.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData with RepeatTicketCount set.
+	.PARAMETER Threshold
+		Ticket count that counts as a hard fail. Default 3.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckRepeatTickets -Data ([pscustomobject]@{ RepeatTicketCount = 4 })
+		Returns Status Fail because 4 tickets meets the default threshold of 3.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data,
+		[int]$Threshold = 3
+	)
+
+	$result = [pscustomobject]@{ Name = 'RepeatTickets'; Status = 'Unknown'; Value = $null; Detail = 'Ticket history was not supplied (use -RepeatTicketCount, 0 if there are none).' }
+	try {
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$float = [System.Globalization.NumberStyles]::Float
+		$count = 0.0
+		$hasCount = ($null -ne $Data.RepeatTicketCount) -and [double]::TryParse("$($Data.RepeatTicketCount)", $float, $inv, [ref]$count) -and ($count -ge 0)
+		if ($hasCount) {
+			$tickets = [int][math]::Floor($count)
+			$result.Value = $tickets
+			if ($tickets -ge $Threshold) {
+				$result.Status = 'Fail'
+				$result.Detail = "$tickets repeat tickets ($Threshold or more)"
+			} else {
+				$result.Status = 'Pass'
+				$result.Detail = "$tickets repeat tickets (under $Threshold)"
+			}
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "Repeat ticket check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckWarranty {
+	<#
+	.SYNOPSIS
+		Lifecycle check: whether the computer is still under warranty.
+	.DESCRIPTION
+		Pure function with no system calls. Warn when the warranty end date has
+		passed, Pass when it has not, Unknown when no end date is known. This is a
+		soft flag: it can suggest Plan to replace but never Replace now.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData with WarrantyEndDate set.
+	.PARAMETER AsOf
+		Date to compare the warranty end date against. Defaults to now.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckWarranty -Data ([pscustomobject]@{ WarrantyEndDate = '2024-06-30' })
+		Returns Status Warn because the warranty has ended.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data,
+		[datetime]$AsOf = (Get-Date)
+	)
+
+	$result = [pscustomobject]@{ Name = 'Warranty'; Status = 'Unknown'; Value = $null; Detail = 'Warranty end date is not known (use -WarrantyEndDate).' }
+	try {
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$raw = $Data.WarrantyEndDate
+		$end = [datetime]::MinValue
+		if ($null -ne $raw -and "$raw" -ne '' -and [datetime]::TryParse([string]$raw, $inv, [System.Globalization.DateTimeStyles]::None, [ref]$end)) {
+			$endText = $end.ToString('yyyy-MM-dd', $inv)
+			$result.Value = $endText
+			if ($end.Date -lt $AsOf.Date) {
+				$result.Status = 'Warn'
+				$result.Detail = "Out of warranty since $endText"
+			} else {
+				$result.Status = 'Pass'
+				$result.Detail = "In warranty until $endText"
+			}
+		} elseif ("$($Data.WarrantyLookupNote)") {
+			$result.Detail = "Warranty end date is not known. $($Data.WarrantyLookupNote)"
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "Warranty check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleCheckWindows11 {
+	<#
+	.SYNOPSIS
+		Lifecycle check: whether the hardware meets Windows 11 requirements.
+	.DESCRIPTION
+		Pure function with no system calls. Combines three findings: CPU
+		generation (Get-ComputerLifecycleCheckCpu), TPM 2.0, and UEFI with Secure
+		Boot.
+
+		Fail when the hardware cannot meet the requirement: CPU older than Intel
+		8th gen / AMD Ryzen 2000, or a TPM older than 2.0. Unknown when the state
+		is a firmware setting that can usually be fixed: no TPM detected, Secure
+		Boot turned off, or booted in legacy BIOS mode. Those need a technician to
+		look, not a replacement, so Detail also names the motherboard (or the
+		computer model when the board is not reported) to research. Pass when all
+		three are satisfied.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.EXAMPLE
+		Get-ComputerLifecycleCheckWindows11 -Data (Get-ComputerLifecycleData)
+		Returns Name, Status, Value (a one line summary) and Detail.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data
+	)
+
+	$result = [pscustomobject]@{ Name = 'Windows11'; Status = 'Unknown'; Value = $null; Detail = 'No data was supplied.' }
+	try {
+		if ($null -eq $Data) { return $result }
+		$failures = @()
+		$unknowns = @()
+		$summary = @()
+		$firmwareReview = $false
+
+		$cpu = Get-ComputerLifecycleCheckCpu -Data $Data
+		if ($cpu.Value) { $summary += "CPU: $($cpu.Value)" } else { $summary += 'CPU: unknown' }
+		if ($cpu.Status -eq 'Fail') {
+			$failures += $cpu.Detail
+		} elseif ($cpu.Status -ne 'Pass') {
+			$unknowns += $cpu.Detail
+		}
+
+		$tpmVersion = ("$($Data.TpmSpecVersion)" -split ',')[0].Trim()
+		if ($Data.TpmPresent -eq $true -and $tpmVersion -match '^2\.') {
+			$summary += 'TPM 2.0'
+		} elseif ($Data.TpmPresent -eq $true -and $tpmVersion) {
+			$summary += "TPM $tpmVersion"
+			$failures += "TPM is version $tpmVersion (2.0 required)"
+		} elseif ($Data.TpmPresent -eq $true) {
+			$summary += 'TPM version unknown'
+			$unknowns += 'A TPM is present but its version was not reported'
+		} elseif ($null -ne $Data.TpmPresent -and $Data.TpmPresent -eq $false) {
+			$summary += 'TPM not detected'
+			$unknowns += 'No TPM detected; it may be absent or turned off in firmware (enable PTT/fTPM and re-run)'
+			$firmwareReview = $true
+		} else {
+			$summary += 'TPM unknown'
+			$collectionError = @($Data.CollectionErrors) -like 'Tpm:*' | Select-Object -First 1
+			if ($collectionError) { $unknowns += "TPM state was not collected ($collectionError); run elevated" } else { $unknowns += 'TPM state was not collected' }
+		}
+
+		$firmware = "$($Data.FirmwareType)".Trim()
+		if ($Data.SecureBootEnabled -eq $true) {
+			$summary += 'UEFI, Secure Boot on'
+		} elseif ($firmware -eq 'UEFI' -and $null -ne $Data.SecureBootEnabled) {
+			$summary += 'UEFI, Secure Boot off'
+			$unknowns += 'Secure Boot is turned off; enable it in firmware and re-run'
+			$firmwareReview = $true
+		} elseif ($firmware -eq 'UEFI') {
+			$summary += 'UEFI, Secure Boot unknown'
+			$unknowns += 'Secure Boot state was not collected'
+		} elseif ($firmware -eq 'BIOS') {
+			$summary += 'Legacy BIOS boot'
+			$unknowns += 'Booted in legacy BIOS mode; switch to UEFI with Secure Boot if the hardware supports it, then re-run'
+			$firmwareReview = $true
+		} else {
+			$summary += 'Firmware unknown'
+			$unknowns += 'Firmware type (UEFI or BIOS) was not collected'
+		}
+
+		$result.Value = $summary -join '; '
+		if ($failures.Count -gt 0) {
+			$result.Status = 'Fail'
+			$result.Detail = $failures -join '; '
+		} elseif ($unknowns.Count -gt 0) {
+			$result.Status = 'Unknown'
+			$result.Detail = $unknowns -join '; '
+			if ($firmwareReview) {
+				# Name the board (or the computer model) so the technician can research the firmware setting
+				$identity = Get-ComputerLifecycleIdentity -Data $Data
+				if ($identity.Motherboard -and $identity.ComputerModel) {
+					$lookup = "Research firmware settings for motherboard $($identity.Motherboard) (computer model $($identity.ComputerModel))"
+				} elseif ($identity.Motherboard) {
+					$lookup = "Research firmware settings for motherboard $($identity.Motherboard)"
+				} elseif ($identity.ComputerModel) {
+					$lookup = "Research firmware settings for computer model $($identity.ComputerModel) (motherboard model not reported)"
+				} else {
+					$lookup = 'Motherboard and computer model were not reported'
+				}
+				$result.Detail = "$($result.Detail); $lookup"
+			}
+		} else {
+			$result.Status = 'Pass'
+			$result.Detail = 'Meets the Windows 11 CPU, TPM 2.0 and UEFI Secure Boot requirements'
+		}
+	} catch {
+		$result.Status = 'Unknown'
+		$result.Detail = "Windows 11 check error: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleData {
+	<#
+	.SYNOPSIS
+		Collects the raw facts used for a hardware lifecycle assessment.
+	.DESCRIPTION
+		Runs on the local computer and returns one flat object of facts with no
+		judgment: identity, age evidence, CPU, TPM, firmware, memory, OS volume,
+		boot disk and disk health. Each group of facts is collected independently.
+		A group that fails leaves its properties empty and adds a line to
+		CollectionErrors, so the function never throws.
+
+		It is self-contained (no other PWSH functions, no extra modules) so it can
+		be sent through an RMM or Invoke-Command. Every value is a string, number,
+		boolean or array of strings, so it survives ConvertTo-Json at the default
+		depth and PowerShell remoting. Run it elevated (RMM agents already are):
+		TPM and SMART details need administrator rights.
+
+		PurchaseDate, ShipDate, WarrantyEndDate and RepeatTicketCount are not on
+		the machine. They are returned empty for the caller to fill in.
+	.EXAMPLE
+		Get-ComputerLifecycleData
+		Returns the facts for the local computer.
+	.EXAMPLE
+		irm ps.mauletech.com | iex; Get-ComputerLifecycleData | ConvertTo-Json -Compress
+		RMM usage (ScreenConnect, Action1). Feed the JSON to Get-ComputerLifecycleAssessment.
+	.EXAMPLE
+		Invoke-Command -ComputerName PC01 -ScriptBlock ${function:Get-ComputerLifecycleData}
+		Collects the facts from a remote computer over WinRM.
+	#>
+	[CmdletBinding()]
+	param()
+
+	$inv = [System.Globalization.CultureInfo]::InvariantCulture
+	$collectionErrors = New-Object 'System.Collections.Generic.List[string]'
+	$facts = [ordered]@{
+		ComputerName             = "$env:COMPUTERNAME"
+		CollectedAt              = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss', $inv)
+		Manufacturer             = $null
+		Model                    = $null
+		SerialNumber             = $null
+		BaseBoardManufacturer    = $null
+		BaseBoardProduct         = $null
+		OSCaption                = $null
+		OSBuildNumber            = $null
+		BiosReleaseDate          = $null
+		OSInstallDate            = $null
+		EarliestOSInstallDate    = $null
+		PurchaseDate             = $null
+		ShipDate                 = $null
+		WarrantyEndDate          = $null
+		RepeatTicketCount        = $null
+		CpuName                  = $null
+		CpuManufacturer          = $null
+		TpmPresent               = $null
+		TpmSpecVersion           = $null
+		FirmwareType             = $null
+		SecureBootEnabled        = $null
+		MemoryInstalledGB        = $null
+		MemoryVisibleGB          = $null
+		OSDrive                  = $null
+		OSDriveSizeGB            = $null
+		OSDriveFreeGB            = $null
+		BootDiskModel            = $null
+		BootDiskMediaType        = $null
+		BootDiskBusType          = $null
+		PhysicalDiskName         = @()
+		PhysicalDiskBusType      = @()
+		PhysicalDiskHealthStatus = @()
+		SmartPredictFailure      = $null
+		CollectionErrors         = @()
+	}
+
+	# Identity and usable memory
+	try {
+		$system = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+		$facts.Manufacturer = "$($system.Manufacturer)".Trim()
+		$facts.Model = "$($system.Model)".Trim()
+		if ($system.TotalPhysicalMemory) { $facts.MemoryVisibleGB = [math]::Round($system.TotalPhysicalMemory / 1GB, 2) }
+	} catch {
+		$collectionErrors.Add("System: $($_.Exception.Message)")
+	}
+
+	try {
+		$bios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop
+		$facts.SerialNumber = "$($bios.SerialNumber)".Trim()
+		if ($bios.ReleaseDate) { $facts.BiosReleaseDate = ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd', $inv) }
+	} catch {
+		$collectionErrors.Add("Bios: $($_.Exception.Message)")
+	}
+
+	# Motherboard, so a technician can research firmware settings
+	try {
+		$baseBoard = Get-CimInstance -ClassName Win32_BaseBoard -ErrorAction Stop | Select-Object -First 1
+		$facts.BaseBoardManufacturer = "$($baseBoard.Manufacturer)".Trim()
+		$facts.BaseBoardProduct = "$($baseBoard.Product)".Trim()
+	} catch {
+		$collectionErrors.Add("BaseBoard: $($_.Exception.Message)")
+	}
+
+	# Operating system and install dates
+	$systemDrive = "$env:SystemDrive"
+	$installDates = @()
+	try {
+		$os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+		$facts.OSCaption = "$($os.Caption)".Trim()
+		$facts.OSBuildNumber = "$($os.BuildNumber)"
+		if ("$($os.SystemDrive)" -match '^[A-Za-z]:$') { $systemDrive = "$($os.SystemDrive)" }
+		if ($os.InstallDate) {
+			$installDates += [datetime]$os.InstallDate
+			$facts.OSInstallDate = ([datetime]$os.InstallDate).ToString('yyyy-MM-dd', $inv)
+		}
+	} catch {
+		$collectionErrors.Add("OS: $($_.Exception.Message)")
+	}
+
+	# Feature upgrades reset InstallDate. Earlier installs are kept under "Source OS" keys.
+	try {
+		$epoch = New-Object System.DateTime 1970, 1, 1, 0, 0, 0, ([System.DateTimeKind]::Utc)
+		$sourceKeys = @(Get-ChildItem -Path 'HKLM:\SYSTEM\Setup' -ErrorAction Stop | Where-Object { $_.PSChildName -like 'Source OS*' })
+		foreach ($sourceKey in $sourceKeys) {
+			$seconds = (Get-ItemProperty -Path $sourceKey.PSPath -Name InstallDate -ErrorAction SilentlyContinue).InstallDate
+			if ($seconds) { $installDates += $epoch.AddSeconds([double]$seconds).ToLocalTime() }
+		}
+	} catch {
+		$collectionErrors.Add("InstallHistory: $($_.Exception.Message)")
+	}
+	if ($installDates.Count -gt 0) {
+		$facts.EarliestOSInstallDate = ($installDates | Sort-Object | Select-Object -First 1).ToString('yyyy-MM-dd', $inv)
+	}
+
+	# Processor
+	try {
+		$processor = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1
+		$facts.CpuName = ("$($processor.Name)" -replace '\s+', ' ').Trim()
+		$facts.CpuManufacturer = "$($processor.Manufacturer)".Trim()
+	} catch {
+		$collectionErrors.Add("Cpu: $($_.Exception.Message)")
+	}
+
+	# TPM. Win32_Tpm.SpecVersion is the authoritative 1.2 vs 2.0 source (same approach as
+	# Update-WindowsTo11) but needs elevation, so fall back to the TPM device name.
+	try {
+		$tpm = Get-CimInstance -Namespace 'root\cimv2\security\microsofttpm' -ClassName Win32_Tpm -ErrorAction Stop | Select-Object -First 1
+		if ($tpm) {
+			$facts.TpmPresent = $true
+			$facts.TpmSpecVersion = "$($tpm.SpecVersion)".Trim()
+		} else {
+			$facts.TpmPresent = $false
+		}
+	} catch {
+		$tpmError = "$($_.Exception.Message)".Trim()
+		try {
+			$tpmDevice = Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPClass='SecurityDevices'" -ErrorAction Stop |
+				Where-Object { "$($_.Name)" -match 'Trusted Platform Module\s+\d+\.\d+' } | Select-Object -First 1
+			if ($tpmDevice -and "$($tpmDevice.Name)" -match 'Trusted Platform Module\s+(\d+\.\d+)') {
+				$facts.TpmPresent = $true
+				$facts.TpmSpecVersion = $Matches[1]
+			} else {
+				$collectionErrors.Add("Tpm: $tpmError")
+			}
+		} catch {
+			$collectionErrors.Add("Tpm: $tpmError")
+		}
+	}
+
+	# Which disk holds the OS volume (used for the firmware fallback and the boot disk facts)
+	$bootDiskNumber = $null
+	try {
+		$partition = Get-Partition -DriveLetter $systemDrive.Substring(0, 1) -ErrorAction Stop | Select-Object -First 1
+		$bootDiskNumber = $partition.DiskNumber
+	} catch {
+		$collectionErrors.Add("BootDisk: $($_.Exception.Message)")
+	}
+
+	# Firmware type: registry value, then the firmware_type environment variable, then the
+	# boot disk partition style (Windows only boots from GPT in UEFI mode). Not every
+	# Windows build has the registry value.
+	try {
+		$firmwareType = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
+		if ($firmwareType -eq 2 -or "$env:firmware_type" -eq 'UEFI') {
+			$facts.FirmwareType = 'UEFI'
+		} elseif ($firmwareType -eq 1 -or "$env:firmware_type" -eq 'Legacy' -or "$env:firmware_type" -eq 'BIOS') {
+			$facts.FirmwareType = 'BIOS'
+		} elseif ($null -ne $bootDiskNumber) {
+			$partitionStyle = "$((Get-Disk -Number $bootDiskNumber -ErrorAction Stop).PartitionStyle)"
+			if ($partitionStyle -eq 'GPT') { $facts.FirmwareType = 'UEFI' } elseif ($partitionStyle -eq 'MBR') { $facts.FirmwareType = 'BIOS' }
+		}
+		if (-not $facts.FirmwareType) { $collectionErrors.Add('Firmware: Firmware type (UEFI or BIOS) could not be determined.') }
+	} catch {
+		$collectionErrors.Add("Firmware: $($_.Exception.Message)")
+	}
+
+	# Secure Boot (registry first: it works without elevation)
+	try {
+		$secureBoot = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -Name UEFISecureBootEnabled -ErrorAction Stop).UEFISecureBootEnabled
+		$facts.SecureBootEnabled = ($secureBoot -eq 1)
+	} catch {
+		try {
+			$facts.SecureBootEnabled = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
+		} catch {
+			if ($facts.FirmwareType -eq 'BIOS') {
+				$facts.SecureBootEnabled = $false
+			} else {
+				$collectionErrors.Add("SecureBoot: $($_.Exception.Message)")
+			}
+		}
+	}
+
+	# Installed memory (sum of the modules, not what Windows can use)
+	try {
+		$modules = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop)
+		$capacity = ($modules | Measure-Object -Property Capacity -Sum).Sum
+		if ($capacity -gt 0) { $facts.MemoryInstalledGB = [math]::Round($capacity / 1GB, 2) }
+	} catch {
+		$collectionErrors.Add("Memory: $($_.Exception.Message)")
+	}
+
+	# OS volume size and free space
+	try {
+		if ($systemDrive -notmatch '^[A-Za-z]:$') { throw "System drive '$systemDrive' is not a drive letter." }
+		$facts.OSDrive = $systemDrive.ToUpperInvariant()
+		$volume = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$systemDrive'" -ErrorAction Stop
+		if ($volume.Size) {
+			$facts.OSDriveSizeGB = [math]::Round($volume.Size / 1GB, 2)
+			$facts.OSDriveFreeGB = [math]::Round($volume.FreeSpace / 1GB, 2)
+		}
+	} catch {
+		$collectionErrors.Add("OSDrive: $($_.Exception.Message)")
+	}
+
+	# Physical disks, and the one that holds the OS volume
+	try {
+		$disks = @(Get-PhysicalDisk -ErrorAction Stop)
+		$facts.PhysicalDiskName = @($disks | ForEach-Object { "$($_.FriendlyName)".Trim() })
+		$facts.PhysicalDiskBusType = @($disks | ForEach-Object { "$($_.BusType)" })
+		$facts.PhysicalDiskHealthStatus = @($disks | ForEach-Object { "$($_.HealthStatus)" })
+		if ($null -ne $bootDiskNumber) {
+			$bootDisk = $disks | Where-Object { "$($_.DeviceId)" -eq "$bootDiskNumber" } | Select-Object -First 1
+			if ($bootDisk) {
+				$facts.BootDiskModel = "$($bootDisk.FriendlyName)".Trim()
+				$facts.BootDiskMediaType = "$($bootDisk.MediaType)"
+				$facts.BootDiskBusType = "$($bootDisk.BusType)"
+			} else {
+				$collectionErrors.Add("BootDisk: No physical disk matches disk number $bootDiskNumber (RAID or Storage Spaces).")
+			}
+		}
+	} catch {
+		$collectionErrors.Add("Disks: $($_.Exception.Message)")
+	}
+
+	# SMART failure prediction (needs elevation; many NVMe disks do not expose it)
+	try {
+		$predictions = @(Get-CimInstance -Namespace 'root\wmi' -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
+		if ($predictions.Count -gt 0) {
+			$facts.SmartPredictFailure = (@($predictions | Where-Object { $_.PredictFailure }).Count -gt 0)
+		}
+	} catch {
+		$collectionErrors.Add("Smart: $($_.Exception.Message)")
+	}
+
+	$facts.CollectionErrors = @($collectionErrors | ForEach-Object { ("$_" -replace '\s+', ' ').Trim() })
+	foreach ($collectionError in $facts.CollectionErrors) { Write-Verbose "Collection issue - $collectionError" }
+	return [pscustomobject]$facts
+}
+
+function Get-ComputerLifecycleIdentity {
+	<#
+	.SYNOPSIS
+		Returns the model, motherboard and serial number a technician can look up.
+	.DESCRIPTION
+		Pure function with no system calls. Cleans the identity facts from
+		Get-ComputerLifecycleData. Firmware placeholder text such as
+		"To be filled by O.E.M." or "Default string" is treated as not reported.
+		LookupModel is the motherboard when it is reported, otherwise the computer
+		model, and LookupSource says which one it is.
+	.PARAMETER Data
+		Raw facts object from Get-ComputerLifecycleData.
+	.EXAMPLE
+		Get-ComputerLifecycleIdentity -Data (Get-ComputerLifecycleData)
+		Returns ComputerModel, Motherboard, SerialNumber, LookupModel and LookupSource.
+	#>
+	[CmdletBinding()]
+	param(
+		[psobject]$Data
+	)
+
+	$result = [pscustomobject]@{ ComputerModel = ''; Motherboard = ''; SerialNumber = ''; LookupModel = ''; LookupSource = 'Unknown' }
+	try {
+		$placeholder = '^(default string|to be filled by o\.?e\.?m\.?|system (product name|manufacturer|serial number|version)|base ?board( product| manufacturer| serial number)?|not (applicable|specified|available)|n/?a|none|unknown|invalid|o\.?e\.?m\.?|x+|0+|1234567890?)$'
+		$values = @{}
+		foreach ($property in @('Manufacturer', 'Model', 'SerialNumber', 'BaseBoardManufacturer', 'BaseBoardProduct')) {
+			$text = ("$($Data.$property)" -replace '\s+', ' ').Trim()
+			if ($text -match $placeholder) { $text = '' }
+			$values[$property] = $text
+		}
+
+		$result.SerialNumber = $values['SerialNumber']
+		if ($values['Model']) {
+			$result.ComputerModel = $values['Model']
+			# Avoid "Dell Inc. Dell ..." style repeats when the model already names the maker
+			$maker = ($values['Manufacturer'] -split ' ')[0]
+			if ($maker -and $values['Model'] -notlike "$maker*") { $result.ComputerModel = "$($values['Manufacturer']) $($values['Model'])" }
+		}
+		if ($values['BaseBoardProduct']) {
+			$result.Motherboard = ("$($values['BaseBoardManufacturer']) $($values['BaseBoardProduct'])").Trim()
+		}
+
+		if ($result.Motherboard) {
+			$result.LookupModel = $result.Motherboard
+			$result.LookupSource = 'Motherboard'
+		} elseif ($result.ComputerModel) {
+			$result.LookupModel = $result.ComputerModel
+			$result.LookupSource = 'ComputerModel'
+		}
+	} catch {
+		Write-Verbose "Identity could not be determined: $($_.Exception.Message)"
+	}
+	return $result
+}
+
+function Get-ComputerLifecycleOutcome {
+	<#
+	.SYNOPSIS
+		Turns lifecycle check results into a suggested outcome.
+	.DESCRIPTION
+		Pure function with no system calls. Every result is considered; it does
+		not stop at the first failure.
+
+		1. Any Fail gives "Replace now".
+		2. Otherwise any Unknown on a hard check gives "Needs review".
+		3. Otherwise any Warn gives "Plan to replace" (budget within 12 months).
+		4. Otherwise any remaining Unknown gives "Needs review".
+		5. Otherwise "Keep" (re-check next year).
+
+		A required check with no result, and any status that is not Fail, Warn,
+		Pass or Unknown, is treated as Unknown, so Keep is never returned on
+		missing data.
+	.PARAMETER CheckResult
+		Check results, each with Name, Status (Fail, Warn, Pass, Unknown), Value
+		and Detail. Accepts pipeline input.
+	.PARAMETER RequiredCheck
+		Names of the checks that must be present. Defaults to the eight standard
+		checks.
+	.PARAMETER SoftCheck
+		Names of checks that are soft flags only. An Unknown soft check does not
+		block "Plan to replace" when another check already warns. Default Warranty.
+	.EXAMPLE
+		Get-ComputerLifecycleOutcome -CheckResult $checks
+		Returns SuggestedOutcome, Reasons and UnassessedChecks.
+	.EXAMPLE
+		$checks | Get-ComputerLifecycleOutcome -RequiredCheck Age, Memory
+		Judges a custom set of checks from the pipeline.
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(ValueFromPipeline = $true)]
+		[AllowNull()]
+		[AllowEmptyCollection()]
+		[psobject[]]$CheckResult,
+
+		[string[]]$RequiredCheck = @('Age', 'Windows11', 'Memory', 'BootDrive', 'OSDrive', 'Health', 'RepeatTickets', 'Warranty'),
+
+		[string[]]$SoftCheck = @('Warranty')
+	)
+
+	begin {
+		$results = New-Object 'System.Collections.Generic.List[object]'
+	}
+
+	process {
+		foreach ($item in $CheckResult) {
+			if ($null -eq $item) { continue }
+			$name = "$($item.Name)".Trim()
+			if (-not $name) { $name = 'Unnamed check' }
+			$detail = "$($item.Detail)".Trim()
+			$status = 'Unknown'
+			switch ("$($item.Status)".Trim()) {
+				'Fail' { $status = 'Fail' }
+				'Warn' { $status = 'Warn' }
+				'Pass' { $status = 'Pass' }
+				'Unknown' { $status = 'Unknown' }
+				default { $detail = "Unrecognized status '$($item.Status)'. $detail".Trim() }
+			}
+			if (-not $detail) { $detail = "No detail was given" }
+			$results.Add([pscustomobject]@{ Name = $name; Status = $status; Detail = $detail })
+		}
+	}
+
+	end {
+		foreach ($required in $RequiredCheck) {
+			if (@($results | Where-Object { $_.Name -eq $required }).Count -eq 0) {
+				$results.Add([pscustomobject]@{ Name = $required; Status = 'Unknown'; Detail = 'No result was supplied for this check' })
+			}
+		}
+
+		$fails = @($results | Where-Object { $_.Status -eq 'Fail' })
+		$warns = @($results | Where-Object { $_.Status -eq 'Warn' })
+		$unknowns = @($results | Where-Object { $_.Status -eq 'Unknown' })
+		$hardUnknowns = @($unknowns | Where-Object { $SoftCheck -notcontains $_.Name })
+		$unknownReasons = @($unknowns | ForEach-Object { "Not assessed - $($_.Name): $($_.Detail)" })
+		$warnReasons = @($warns | ForEach-Object { "$($_.Name): $($_.Detail)" })
+
+		if ($fails.Count -gt 0) {
+			$outcome = 'Replace now'
+			$reasons = @($fails | ForEach-Object { "$($_.Name): $($_.Detail)" })
+		} elseif ($hardUnknowns.Count -gt 0) {
+			$outcome = 'Needs review'
+			$reasons = $unknownReasons + $warnReasons
+		} elseif ($warns.Count -gt 0) {
+			$outcome = 'Plan to replace'
+			$reasons = $warnReasons
+		} elseif ($unknowns.Count -gt 0) {
+			$outcome = 'Needs review'
+			$reasons = $unknownReasons
+		} else {
+			$outcome = 'Keep'
+			$reasons = @('All checks passed; re-check next year')
+		}
+
+		[pscustomobject]@{
+			SuggestedOutcome = $outcome
+			Reasons          = [string[]]@($reasons)
+			UnassessedChecks = [string[]]@($unknowns | ForEach-Object { $_.Name })
+		}
+	}
+}
+
+function Get-ComputerLifecycleWarrantyInfo {
+	<#
+	.SYNOPSIS
+		Looks up the warranty end date and ship date for a computer.
+	.DESCRIPTION
+		Reuses Get-DellWarranty for Dell and Alienware service tags. Runs on the
+		machine doing the assessment, not on the computer being assessed, because
+		that is where the Dell API credentials (DellKey.txt and DellSec.txt) live.
+		Never throws: when no lookup is possible the dates are empty and Note says
+		why. Other manufacturers have no lookup; supply the dates yourself.
+	.PARAMETER Manufacturer
+		Manufacturer as reported by the computer, for example "Dell Inc.".
+	.PARAMETER SerialNumber
+		Serial number or Dell service tag.
+	.EXAMPLE
+		Get-ComputerLifecycleWarrantyInfo -Manufacturer 'Dell Inc.' -SerialNumber '1234ABC'
+		Returns WarrantyEndDate, ShipDate, Source and Note.
+	#>
+	[CmdletBinding()]
+	param(
+		[string]$Manufacturer,
+		[string]$SerialNumber
+	)
+
+	$result = [pscustomobject]@{ WarrantyEndDate = $null; ShipDate = $null; Source = $null; Note = $null }
+	try {
+		$inv = [System.Globalization.CultureInfo]::InvariantCulture
+		$tag = "$SerialNumber".Trim()
+		if ("$Manufacturer" -notmatch 'Dell|Alienware') {
+			$result.Note = "No automatic warranty lookup for manufacturer '$("$Manufacturer".Trim())'; supply WarrantyEndDate."
+			return $result
+		}
+		# The tag is placed in a request URL by Get-DellWarranty, so only pass a well formed one.
+		if ($tag -notmatch '^[A-Za-z0-9]{5,7}$') {
+			$result.Note = 'Serial number is not a valid Dell service tag; supply WarrantyEndDate.'
+			return $result
+		}
+		if (-not (Get-Command -Name Get-DellWarranty -ErrorAction SilentlyContinue)) {
+			$result.Note = 'Get-DellWarranty is not loaded; supply WarrantyEndDate.'
+			return $result
+		}
+		# Get-DellWarranty uses Break when its credential files are missing, which would
+		# stop the caller's pipeline, so check for them before calling it.
+		$keyFolder = Join-Path -Path "$env:APPDATA" -ChildPath 'Microsoft\Windows\PowerShell'
+		$hasKeys = (Test-Path -Path (Join-Path -Path $keyFolder -ChildPath 'DellKey.txt')) -and (Test-Path -Path (Join-Path -Path $keyFolder -ChildPath 'DellSec.txt'))
+		if (-not $hasKeys) {
+			$result.Note = 'Dell API credentials (DellKey.txt and DellSec.txt) are not set up on this machine; supply WarrantyEndDate.'
+			return $result
+		}
+
+		Write-Verbose "Looking up Dell warranty for service tag $tag"
+		$warranty = Get-DellWarranty -ServiceTags $tag -ReturnObject 6>$null | Select-Object -First 1
+		if ($warranty -and $warranty.WarrantyEndDate) {
+			$result.WarrantyEndDate = ([datetime]$warranty.WarrantyEndDate).ToString('yyyy-MM-dd', $inv)
+			if ($warranty.OriginalShipDate) { $result.ShipDate = ([datetime]$warranty.OriginalShipDate).ToString('yyyy-MM-dd', $inv) }
+			$result.Source = 'Get-DellWarranty'
+		} else {
+			$result.Note = "Dell returned no warranty for service tag $tag."
+		}
+	} catch {
+		$result.Note = "Dell warranty lookup failed: $(("$($_.Exception.Message)" -replace '\s+', ' ').Trim())"
+	}
+	return $result
+}
+
 function Get-DatacenterLocation {
 	<#
 	.SYNOPSIS

@@ -34,6 +34,8 @@ Enable-SSL #Enables SSL Permanently
   Add-ChromeShortcut
   Add-FileFolderShortcut
   Add-IEShortcut
+  Add-RDPCertificate
+  Add-RDPShortcut
   Add-WebShortcut
 
 [Backup]
@@ -47,12 +49,17 @@ Enable-SSL #Enables SSL Permanently
   Connect-O365Exchange
   Connect-O365Sharepoint
   Connect-O365SharepointPNP
+  Connect-SophosConnect
   Connect-Wifi
 
 [Convert]
 ---------
   Convert-ComputerFleetReport
   Convert-ToSharedMailbox
+
+[ConvertTo]
+-----------
+  ConvertTo-EncodedCommand
 
 [Debug]
 -------
@@ -64,6 +71,7 @@ Enable-SSL #Enables SSL Permanently
 [Disable]
 ---------
   Disable-DailyReboot
+  Disable-EdgeOOBE
   Disable-FastStartup
   Disable-LocalPasswordExpiration
   Disable-Sleep
@@ -74,37 +82,66 @@ Enable-SSL #Enables SSL Permanently
   Disconnect-AllUsers
   Disconnect-NetExtender
   Disconnect-O365Exchange
+  Disconnect-SophosConnect
 
 [Enable]
 --------
   Enable-DellSecureBoot
+  Enable-DellTPM
   Enable-DellWakeUpInMorning
   Enable-O365AuditLog
   Enable-Onedrive
+  Enable-RDP
+  Enable-RemoteManagement
   Enable-Sleep
   Enable-SSL
   Enable-WakeOnLAN
 
 [Expand]
 --------
+  Expand-SystemPartition
   Expand-Terminal
 
 [Export]
 --------
   Export-365AllDistributionGroups
   Export-365DistributionGroup
+  Export-ExchangeDistributionList
   Export-LDAPSCertificate
   Export-UsersOneDrive
+
+[Find]
+------
+  Find-CrocExe
 
 [Get]
 -----
   Get-ADLockedAccount
-  Get-DecryptedConfig
   Get-ADStaleComputers
   Get-ADStaleUsers
   Get-ADUserPassExpirations
+  Get-ADUsersPasswordExpiring
   Get-BitLockerKey
+  Get-ClaudeCodeStatus
   Get-ComputerEntraStatus
+  Get-ComputerLifecycleAgeBasis
+  Get-ComputerLifecycleAssessment
+  Get-ComputerLifecycleCheckAge
+  Get-ComputerLifecycleCheckBootDrive
+  Get-ComputerLifecycleCheckCpu
+  Get-ComputerLifecycleCheckHealth
+  Get-ComputerLifecycleCheckMemory
+  Get-ComputerLifecycleCheckOSDrive
+  Get-ComputerLifecycleCheckRepeatTickets
+  Get-ComputerLifecycleCheckWarranty
+  Get-ComputerLifecycleCheckWindows11
+  Get-ComputerLifecycleData
+  Get-ComputerLifecycleIdentity
+  Get-ComputerLifecycleOutcome
+  Get-ComputerLifecycleWarrantyInfo
+  Get-CrocPath
+  Get-DatacenterLocation
+  Get-DecryptedConfig
   Get-DellWarranty
   Get-DiskUsage
   Get-DomainInfo
@@ -116,13 +153,17 @@ Enable-SSL #Enables SSL Permanently
   Get-ListeningPorts
   Get-LoginHistory
   Get-NetExtenderStatus
+  Get-NTPOffset
   Get-PSWinGetUpdatablePackages
   Get-RandomPassword
   Get-SharedMailboxRestoreRequest
   Get-SonicwallInterfaceIP
+  Get-SophosConnectStatus
   Get-ThunderBolt
   Get-UserMailboxAccess
   Get-UserProfileSpace
+  Get-VMByFQDN
+  Get-VMHostName
   Get-VSSWriter
 
 [Import]
@@ -136,6 +177,8 @@ Enable-SSL #Enables SSL Permanently
   Install-Action1
   Install-AppDefaults
   Install-Choco
+  Install-ClaudeCode
+  Install-Croc
   Install-ITS247Agent
   Install-NetExtender
   Install-NiniteApps
@@ -144,8 +187,10 @@ Enable-SSL #Enables SSL Permanently
   Install-O365
   Install-O365ProofPointConnectors
   Install-ScreenConnect
+  Install-SophosConnect
   Install-SophosDnsCert
   Install-SophosEndpoint
+  Install-SSLInspectionCert
   Install-UmbrellaDns
   Install-UmbrellaDNSasJob
   Install-UmbrellaDnsCert
@@ -155,29 +200,47 @@ Enable-SSL #Enables SSL Permanently
 
 [Invoke]
 --------
+  Invoke-BPARemediation
+  Invoke-DHCPRemediation
+  Invoke-DNSRemediation
   Invoke-IPv4NetworkScan
   Invoke-NDDCScan
+  Invoke-OneDriveFreeUpSpace
+  Invoke-SMBRemediation
+  Invoke-ValidatedDownload
   Invoke-Win10Decrap
+  Invoke-WinGetInstall
 
 [Join]
 ------
   Join-Domain
 
-[Protect]
----------
-  Protect-ConfigFile
-  Unprotect-ConfigFile
+[New]
+-----
+  New-BPAResultObject
+  New-CrocCode
 
 [Optimize]
 ----------
   Optimize-Powershell
 
+[Protect]
+---------
+  Protect-ConfigFile
+
+[Receive]
+---------
+  Receive-Item
+
 [Remove]
 --------
   Remove-ADStaleComputers
+  Remove-ClaudeCode
   Remove-DuplicateFiles
   Remove-ITS247InstallFolder
+  Remove-OrphanedInstallerFiles
   Remove-PathForcefully
+  Remove-PpkgInstallFolder
   Remove-StaleObjects
 
 [Rename]
@@ -186,12 +249,17 @@ Enable-SSL #Enables SSL Permanently
 
 [Repair]
 --------
+  Repair-DomainTrust
+  Repair-ExchangeDAGCopies
+  Repair-NTPConfiguration
   Repair-O365AppIssues
+  Repair-RemoteWMI
   Repair-Volumes
   Repair-Windows
 
 [Restart]
 ---------
+  Restart-ComputerSafely
   Restart-VSSWriter
 
 [Restore]
@@ -200,11 +268,13 @@ Enable-SSL #Enables SSL Permanently
 
 [Send]
 ------
+  Send-Item
   Send-WakeOnLan
 
 [Set]
 -----
   Set-AutoLogon
+  Set-ChocolateySources
   Set-ComputerLanguage
   Set-DailyReboot
   Set-DailyRebootDelay
@@ -212,6 +282,7 @@ Enable-SSL #Enables SSL Permanently
   Set-MountainTime
   Set-NumLock
   Set-PsSpeak
+  Set-RDPSignature
   Set-RunOnceScript
   Set-ServerRebootScriptPassword
   Set-WeeklyReboot
@@ -219,26 +290,36 @@ Enable-SSL #Enables SSL Permanently
 [Start]
 -------
   Start-BackstageBrowser
+  Start-ClaudeCode
   Start-CleanupOfSystemDrive
   Start-ImperialMarch
   Start-PPKGLog
+  Start-PSTaskManager
   Start-PSWinGet
   Start-ServerMaintenance
+
+[Stop]
+------
+  Stop-StuckService
 
 [Uninstall]
 -----------
   Uninstall-Application
   Uninstall-UmbrellaDNS
 
+[Unprotect]
+-----------
+  Unprotect-ConfigFile
+
 [Update]
 --------
+  Update-ClaudeCode
   Update-DattoAgent
   Update-DellPackages
   Update-DellServer
   Update-DnsServerRootHints
   Update-Edge
   Update-Everything
-  Update-ITFunctions
   Update-ITS247Agent
   Update-NiniteApps
   Update-NTPDateTime
@@ -254,7 +335,7 @@ Enable-SSL #Enables SSL Permanently
   Update-WindowTitle
 
 
-#This list can be updated with "Get-Command -Module PS-* | Select Name"
+#This list can be updated with "Get-ITFunctions"
 ```
 ### For more information on a function, type:
 ```powershell 

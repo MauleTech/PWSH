@@ -25,7 +25,7 @@ This runs `LoadFunctions.txt` which bootstraps Git, clones the repo, and dynamic
 - **claude-code-review.yml** -- Automated code review on PRs.
 - **claude.yml** -- Responds to `@claude` mentions on issues/PRs.
 
-There is no test framework (no Pester). All commits must be code reviewed for quality. Code signing and PR review are the quality gates.
+There is no test framework for most of the repo. The one exception is `Tests/ComputerLifecycle.Tests.ps1` (the `Get-ComputerLifecycle*` functions), run with `Invoke-Pester .\Tests\ComputerLifecycle.Tests.ps1`. It is written to run on the Pester 3.4 built into Windows as well as Pester 5, so it throws instead of using `Should`. All commits must be code reviewed for quality. Code signing and PR review are the quality gates.
 
 ## Conventions
 
